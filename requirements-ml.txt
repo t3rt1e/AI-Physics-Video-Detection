@@ -1,0 +1,13 @@
+# Optional extras. None of these are trained; all run pretrained or in the cloud.
+
+# Gemini object ID + plain-English reasons, and Veo for the AI twin (cloud, needs GEMINI_API_KEY)
+google-genai>=1.30
+
+# Depth Pro second ruler (downloads apple/DepthPro-hf, ~2 GB). For the RTX 5070 Ti,
+# install torch from https://pytorch.org with CUDA 12.8 or newer FIRST; older
+# builds don't support 50-series cards.
+torch
+transformers>=4.50
+
+# SAM 2 tracker for cluttered clips (weights download on first use):
+#   pip install "git+https://github.com/facebookresearch/sam2.git"

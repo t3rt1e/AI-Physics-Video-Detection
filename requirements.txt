@@ -1,0 +1,10 @@
+# Core: everything the live demo needs. CPU only, no model downloads.
+numpy>=1.24
+opencv-python>=4.8
+av>=14            # PyAV: exact frame timestamps, capture-rate tags, H.264/VP8 encoding
+scipy>=1.10
+fastapi>=0.110
+starlette>=0.40   # range requests, so the browser can seek videos
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
+pyserial>=3.5
