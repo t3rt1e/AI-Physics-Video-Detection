@@ -36,6 +36,54 @@ class Scene:
     y0: float = 70.0               # rest position, ball centre (px)
     floor_y: float | None = None   # ball centre at contact (px); None = no floor
     seed: int = 0
+    main_ball: bool = True         # draw the main ball (False: only `bodies`)
+    bodies: tuple = ()             # more falling objects (Body), each with its own motion
+
+
+@dataclass
+class Body:
+    """Another falling object: a ball, a flat rigid shape that tumbles, or a
+    lumpy 3D shape made of spheres that tumbles about any axis.
+
+    For a box, the outline is a size_m x width_m rectangle. cm_offset moves
+    the centre of mass along the long side, as a fraction of its length (a
+    hammer's heavy head): the outline's centre then circles the true
+    parabola as it spins. For "spheres", `spheres` lists (x, y, z, r) in
+    meters; the centre of mass is the volume-weighted centre of the spheres
+    (overlaps ignored), and the body turns about `axis` (x right, y down,
+    z toward the camera) at omega. The body's (x0, y0) is where its centre
+    of mass starts, in px.
+    """
+    kind: str = "ball"                  # "ball", "box" or "spheres"
+    size_m: float = 0.067               # ball diameter, or box length
+    width_m: float = 0.03               # box width
+    bgr: tuple = (60, 200, 230)
+    head_bgr: tuple | None = None       # box: colour of the heavy end, if different
+    x0: float = 300.0
+    y0: float = 80.0
+    motion: "Motion | None" = None
+    omega: float = 0.0                  # spin after release, rad/s
+    angle0: float = 0.0                 # long side's angle at release, rad
+    cm_offset: float = 0.0
+    spheres: tuple = ()                 # "spheres": ((x, y, z, r), ...) in m
+    sphere_bgr: tuple = ()              # a colour per sphere (default: bgr)
+    axis: tuple = (0.0, 0.0, 1.0)       # "spheres": rotation axis
+
+
+def _rot(axis, ang):
+    """Rotation matrix about a unit axis (Rodrigues)."""
+    k = np.asarray(axis, float)
+    k = k / np.linalg.norm(k)
+    K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+    return np.eye(3) + np.sin(ang) * K + (1 - np.cos(ang)) * (K @ K)
+
+
+def sphere_body(b) -> tuple[np.ndarray, np.ndarray]:
+    """(centres relative to the centre of mass (n x 3, m), radii (n,))."""
+    S = np.asarray(b.spheres, float).reshape(-1, 4)
+    w = S[:, 3] ** 3
+    cm = (S[:, :3] * w[:, None]).sum(0) / w.sum()
+    return S[:, :3] - cm, S[:, 3]
 
 
 @dataclass
@@ -149,10 +197,19 @@ def _backdrop(sc: Scene, rng) -> np.ndarray:
     img = np.full((h, w, 3), sc.bg_level, np.float32)
     img += np.linspace(0, 10, h, dtype=np.float32)[:, None, None]
     if sc.texture:
+        # Keep the static shapes out of the falling objects' columns: a
+        # bright patch behind an object pulls its brightness centre.
+        lanes = [(sc.x0 if sc.x0 is not None else w / 2, 90.0)]
+        for b in sc.bodies:
+            lanes.append((b.x0, 0.5 * max(b.size_m, b.width_m) * sc.px_per_m + 60.0))
         for _ in range(14):
             cx, cy = int(rng.uniform(0, w)), int(rng.uniform(0, h))
-            if abs(cx - (sc.x0 or w / 2)) < 90:
-                cx = int(cx + 220 * np.sign(cx - w / 2 + 1e-3))
+            for _try in range(20):
+                if not any(abs(cx + 30 - lx) < r + 30 for lx, r in lanes):
+                    break
+                cx = int(rng.uniform(0, w))
+            else:
+                continue
             col = tuple(float(c) for c in rng.uniform(40, 120, 3))
             cv2.rectangle(img, (cx, cy), (cx + int(rng.uniform(15, 60)),
                                           cy + int(rng.uniform(15, 60))), col, -1)
@@ -184,7 +241,7 @@ def render_frame(t_frame: float, m: Motion, sc: Scene, bg: np.ndarray, rng, *,
     c0 = int(max(np.floor(px.min() - R - 3), 0))
     c1 = int(min(np.ceil(px.max() + R + 3), w - 1))
     img = bg.copy()
-    if r1 > r0 and c1 > c0:
+    if r1 > r0 and c1 > c0 and sc.main_ball:
         rr = rows[r0:r1 + 1].astype(np.float64) + 0.5
         cc = np.arange(c0, c1 + 1, dtype=np.float64) + 0.5
         cov = np.zeros((len(rr), len(cc)))
@@ -220,6 +277,8 @@ def render_frame(t_frame: float, m: Motion, sc: Scene, bg: np.ndarray, rng, *,
             ball = np.asarray(sc.ball_bgr, np.float32)[None, None, :] * lum[:, :, None]
         reg = img[r0:r1 + 1, c0:c1 + 1]
         img[r0:r1 + 1, c0:c1 + 1] = reg * (1 - cov[:, :, None]) + ball * cov[:, :, None]
+    for b in sc.bodies:
+        _draw_body(img, b, t_frame, exposure, sc, subsamples=max(6, subsamples // 2))
     if m.hand:
         _draw_hand(img, t_frame, m, sc)
     if sc.psf_sigma > 0:
@@ -232,6 +291,106 @@ def render_frame(t_frame: float, m: Motion, sc: Scene, bg: np.ndarray, rng, *,
         img = cv2.warpAffine(img, A, (w, h), borderMode=cv2.BORDER_REPLICATE)
     img += rng.normal(0, sc.noise, img.shape).astype(np.float32)
     return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def _body_scene(b: Body, sc: Scene) -> Scene:
+    from dataclasses import replace
+    return replace(sc, x0=b.x0, y0=b.y0, ball_d_m=b.size_m, bodies=(), main_ball=True)
+
+
+def body_state(b: Body, sc: Scene, t):
+    """Centre of mass (x, y) in px and long-side angle at times t."""
+    m = b.motion or Motion()
+    bs = _body_scene(b, sc)
+    x, y = _trajectory(m, bs, np.asarray(t, float))
+    ang = b.angle0 + b.omega * np.clip(np.asarray(t, float) - m.t_release, 0, None)
+    return x, y, ang
+
+
+def _draw_body(img, b: Body, t_frame: float, exposure: float, sc: Scene, subsamples: int = 8):
+    """Exposure-integrated body, drawn at 4x and averaged down (anti-aliased)."""
+    ss = 4
+    ts = t_frame + exposure * (np.arange(subsamples) + 0.5) / subsamples
+    cx, cy, ang = body_state(b, sc, ts)
+    ppm = sc.px_per_m
+    L = b.size_m * ppm
+    W = (b.width_m if b.kind == "box" else b.size_m) * ppm
+    reach = 0.5 * np.hypot(L, W) + abs(b.cm_offset) * L + 3
+    if b.kind == "spheres":
+        P3, rad = sphere_body(b)
+        reach = float(np.max(np.linalg.norm(P3, axis=1) + rad)) * ppm + 3
+    h, w = img.shape[:2]
+    x0 = int(max(np.floor(cx.min() - reach), 0))
+    x1 = int(min(np.ceil(cx.max() + reach), w - 1))
+    y0 = int(max(np.floor(cy.min() - reach), 0))
+    y1 = int(min(np.ceil(cy.max() + reach), h - 1))
+    if x1 <= x0 or y1 <= y0:
+        return
+    Hs, Ws = (y1 - y0 + 1) * ss, (x1 - x0 + 1) * ss
+    cov = np.zeros((Hs, Ws), np.float32)
+    col = np.zeros((Hs, Ws, 3), np.float32)
+    base = np.asarray(b.bgr, np.float32)
+    head = np.asarray(b.head_bgr if b.head_bgr is not None else b.bgr, np.float32)
+    yy, xx = np.mgrid[0:Hs, 0:Ws].astype(np.float32)
+    cov_s = np.zeros((Hs, Ws), np.float32)           # one subsample of a "spheres" body
+    col_s = np.zeros((Hs, Ws, 3), np.float32)
+    for px, py, a in zip(cx, cy, ang):
+        ox, oy = (px - x0) * ss, (py - y0) * ss
+        if b.kind == "spheres":
+            Rm = _rot(b.axis, a)
+            Q = P3 @ Rm.T                                   # turned about the centre of mass
+            cols = b.sphere_bgr or (b.bgr,) * len(rad)
+            for i in np.argsort(Q[:, 2]):                   # far ones first
+                R_ = rad[i] * ppm * ss
+                qx, qy = ox + Q[i, 0] * ppm * ss, oy + Q[i, 1] * ppm * ss
+                r2 = ((xx + 0.5 - qx) ** 2 + (yy + 0.5 - qy) ** 2) / (R_ * R_)
+                inside = r2 <= 1.0
+                shade = 1.0 - sc.shading + sc.shading * np.sqrt(np.clip(1.0 - r2, 0, 1))
+                newc = shade[:, :, None] * np.asarray(cols[i], np.float32)
+                # This sphere covers whatever was drawn behind it in this subsample.
+                layer = inside & (cov_s < 1)
+                col_s[inside] = newc[inside]
+                cov_s[layer] = 1.0
+            cov += cov_s
+            col += col_s * cov_s[:, :, None]
+            cov_s[:] = 0
+            col_s[:] = 0
+            continue
+        if b.kind == "ball":
+            R = 0.5 * L * ss
+            r2 = ((xx + 0.5 - ox) ** 2 + (yy + 0.5 - oy) ** 2) / (R * R)
+            inside = r2 <= 1.0
+            shade = 1.0 - sc.shading + sc.shading * np.sqrt(np.clip(1.0 - r2, 0, 1))
+            cov += inside
+            col += (inside * shade)[:, :, None] * base
+            continue
+        c, s_ = np.cos(a), np.sin(a)
+        # Outline in the body frame (centre of mass at 0), then the heavy end.
+        sh_ = -b.cm_offset * L
+        pts = np.array([[sh_ - L / 2, -W / 2], [sh_ + L / 2, -W / 2],
+                        [sh_ + L / 2, W / 2], [sh_ - L / 2, W / 2]])
+        Rm = np.array([[c, -s_], [s_, c]])
+        P = (pts @ Rm.T) * ss + [ox, oy]
+        mk = np.zeros((Hs, Ws), np.uint8)
+        cv2.fillPoly(mk, [np.round((P - 0.5) * 16).astype(np.int32)], 1, cv2.LINE_8, 4)
+        m_ = mk.astype(np.float32)
+        cov += m_
+        if b.head_bgr is not None:
+            hp = np.array([[sh_ + L / 6, -W / 2], [sh_ + L / 2, -W / 2],
+                           [sh_ + L / 2, W / 2], [sh_ + L / 6, W / 2]])
+            hk = np.zeros((Hs, Ws), np.uint8)
+            hq = (hp @ Rm.T) * ss + [ox, oy]
+            cv2.fillPoly(hk, [np.round((hq - 0.5) * 16).astype(np.int32)], 1, cv2.LINE_8, 4)
+            hm = hk.astype(np.float32)
+            col += (m_ - hm)[:, :, None] * base + hm[:, :, None] * head
+        else:
+            col += m_[:, :, None] * base
+    n = float(len(ts))
+    cov_d = cv2.resize(cov, (x1 - x0 + 1, y1 - y0 + 1), interpolation=cv2.INTER_AREA) / n
+    col_d = cv2.resize(col, (x1 - x0 + 1, y1 - y0 + 1), interpolation=cv2.INTER_AREA) / n
+    colour = col_d / np.maximum(cov_d, 1e-6)[:, :, None]
+    reg = img[y0:y1 + 1, x0:x1 + 1]
+    img[y0:y1 + 1, x0:x1 + 1] = reg * (1 - cov_d[:, :, None]) + colour * cov_d[:, :, None]
 
 
 def _shake(t: float, amp: float, seed: int) -> tuple[float, float]:

@@ -32,13 +32,19 @@ def _fmt_g(g, sig):
 
 
 def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_EARTH,
-           tracking_ok=True, rs_rel=0.0, drag=None, falls=True) -> dict:
+           tracking_ok=True, rs_rel=0.0, drag=None, falls=True, light=None,
+           geom_rel=0.0) -> dict:
     """falls: the tracked object moves down a good distance and is still moving
-    down at the end of its flight (False for a hand pulling away)."""
+    down at the end of its flight (False for a hand pulling away).
+    light: the object's name when air drag rules its fall (a feather, a
+    balloon, a sheet of paper): then falling slowly or at a steady speed is
+    what a real one does, not a sign of AI.
+    geom_rel: relative error from the camera model (its focal length and
+    angle), which matters when the camera looks down or up at the fall."""
     reasons: list[str] = []
     out = {"verdict": "UNSURE", "confidence": 0.0, "headline": "", "reasons": reasons,
            "g": None, "sigma": None, "g_naive": None, "g_ref": g_ref, "ratio": None,
-           "k": 1.0, "tol": None, "stage": None}
+           "k": 1.0, "tol": None, "stage": None, "camera_rel": float(geom_rel or 0.0)}
 
     fails = [t for t in tests if t["status"] == "fail"]
     warns = [t for t in tests if t["status"] == "warn"]
@@ -78,7 +84,14 @@ def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_
         reasons.append(wrong_thing)
         return out
 
+    drag_rules = (f"Air drag rules a {light}'s fall: a real one drifts down slowly, so its fall "
+                  "can't show gravity. Try something heavier and more compact.") if light else None
     if not fails and (a_px <= 0 or a_px < 2.0 * a_sigma):
+        if a_px > -2.0 * a_sigma and light:
+            out["stage"] = "physics: air drag rules"
+            out["headline"] = "Can't tell: it floats down, as a real one would."
+            reasons.append(drag_rules)
+            return out
         if a_px > -2.0 * a_sigma:
             # Moves down a good distance at a steady speed: a dropped object can't.
             out.update(verdict="AI", confidence=0.6, stage="physics: no acceleration")
@@ -110,7 +123,8 @@ def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_
     g = g_naive * k * k * drag_f
     fit_rel = abs(a_sigma / a_px) if a_px else 1.0
     rel = float(np.sqrt(scale["rel_sigma"] ** 2 + fit_rel**2 + (2 * k_rel) ** 2
-                        + (0.5 * rs_rel) ** 2 + (0.3 * (drag_f - 1)) ** 2 + 0.01**2))
+                        + (0.5 * rs_rel) ** 2 + (0.3 * (drag_f - 1)) ** 2 + 0.01**2
+                        + float(geom_rel or 0.0) ** 2))
     sigma = abs(g) * rel
     spread = C.Z_TOL * rel
     tol = max(C.TOL_REL, spread)
@@ -133,12 +147,13 @@ def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_
         reasons.extend(t["summary"] for t in warns)
         return out
 
+    far = False
     if spread > C.MAX_SPREAD:
         # Too uncertain to confirm gravity, but a far-off value can still be called.
-        if ratio * (1 + spread) < 1 - C.TOL_REL:
-            pass  # clearly too slow even at the top of the error bar: fall through to AI
-        elif ratio * (1 - spread) > 1 + C.TOL_REL:
-            pass  # clearly too fast even at the bottom: fall through
+        if ratio * (1 + spread) < 1 - C.TOL_REL or ratio * (1 - spread) > 1 + C.TOL_REL:
+            far = True   # clearly off even at the near end of the error bar
+            tol = C.TOL_REL
+            out["tol"] = tol
         else:
             out["stage"] = "measurement: too uncertain"
             out["headline"] = f"Can't tell: g = {gtxt} is too uncertain to call."
@@ -146,7 +161,7 @@ def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_
                            "in the frame, or only a few frames of the fall were tracked.")
             return out
 
-    if abs(ratio - 1) <= tol:
+    if abs(ratio - 1) <= tol and not far:
         out["stage"] = "ok"
         if k >= 1.5:
             out.update(verdict="SLOWMO", confidence=float(min(0.97, clock["confidence"])))
@@ -172,6 +187,12 @@ def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_
         reasons.extend(t["summary"] for t in warns)
         return out
 
+    if ratio < 1 - tol and light:
+        out["stage"] = "physics: air drag rules"
+        out["headline"] = f"Can't tell: it falls at {gtxt}, slower than gravity, as a real one would."
+        reasons.append(drag_rules)
+        return out
+
     if ratio < 1 - tol:
         k_needed = float(np.sqrt(1 / ratio))
         if weak_k and abs(g * weak_k**2 / g_ref - 1) <= tol:
@@ -182,7 +203,9 @@ def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_
             reasons.append(f"As played it falls at {gtxt}. A {weak_k:.0f}x slow-down, hinted "
                            f"by {clock.get('weak_source')}, would make it exactly Earth's g.")
             return out
-        conf = float(np.clip(0.6 + (1 - tol - ratio) * 1.5, 0.6, 0.98))
+        # Judged at the top of the error bar when the bar is wide.
+        r_hi = ratio * (1 + spread) if far else ratio
+        conf = float(np.clip(0.6 + (1 - tol - r_hi) * 1.5, 0.6, 0.98))
         out.update(verdict="AI", confidence=conf, stage="physics: g too low")
         out["headline"] = f"Falls at {pct:.0f}% of Earth's gravity ({gtxt}): too slow to be real."
         reasons.append(f"Measured g = {gtxt}; Earth's is {g_ref:.2f}.")
@@ -207,4 +230,102 @@ def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_
                    f"(it would need to be {1 / ratio:.2f}x its assumed size).")
     if drag_line:
         reasons.append(drag_line)
+    return out
+
+
+def _obj_name(o, cap=False) -> str:
+    s = f"object {o['n']}" + (f" ({o['label']})" if o.get("label") else "")
+    return s[0].upper() + s[1:] if cap else s
+
+
+def _short(v) -> str:
+    if v.get("g") is not None and v.get("sigma") is not None:
+        return f"{v['verdict']}, g = {_fmt_g(v['g'], v['sigma'])}"
+    return f"{v['verdict']}, {v.get('headline', '').rstrip('.')}"
+
+
+def combine_objects(objs: list[dict], cross: list | None = None) -> dict:
+    """One verdict for a clip with several falling objects.
+
+    objs: per object, primary first: {"n", "label", "verdict", "named" (Galileo
+    knows what it is), "strong" (you said what it is)}.
+
+    The primary object (the one you named or clicked, else the best-tracked
+    fall) decides. The others:
+      * stand in when the primary can't be measured (no ruler, too
+        uncertain) and one of them can, if Galileo knows what it is;
+      * overturn a REAL call only when you named them yourself and they
+        clearly disagree: a guessed size, or a ball that grazes a wall, can
+        make one object read wrong in a real clip;
+      * otherwise add their numbers to the reasons, and lower the confidence
+        when they disagree.
+    """
+    prim = objs[0]
+    v1 = prim["verdict"]
+    if len(objs) == 1:
+        return v1
+    dec = ("REAL", "SLOWMO", "AI")
+
+    def real(v):
+        return v["verdict"] in ("REAL", "SLOWMO")
+
+    out = {**v1, "reasons": list(v1.get("reasons", [])), "from_object": prim["n"]}
+    lines = []
+    if v1["verdict"] in dec:
+        strong_clash = None
+        agree = 0
+        for o in objs[1:]:
+            v = o["verdict"]
+            if v["verdict"] not in dec:
+                lines.append(f"{_obj_name(o, True)}: {v.get('headline', '').rstrip('.')}.")
+                continue
+            if real(v) == real(v1):
+                agree += 1
+                lines.append(f"{_obj_name(o, True)} agrees: {_short(v)}.")
+                continue
+            lines.append(f"{_obj_name(o, True)} disagrees: {_short(v)}.")
+            if o.get("strong") and strong_clash is None:
+                strong_clash = o
+            else:
+                out["confidence"] = float(out.get("confidence", 0)) * 0.8
+        if strong_clash is not None and real(v1):
+            o = strong_clash
+            v = o["verdict"]
+            out = {**v, "reasons": list(v.get("reasons", [])), "from_object": o["n"],
+                   "confidence": float(min(v.get("confidence", 0.6), 0.75))}
+            out["headline"] = f"{_obj_name(o, True)}: {v['headline']}"
+            out["reasons"].insert(0, f"{_obj_name(prim, True)} falls like a real object "
+                                  f"({_short(v1)}) but {_obj_name(o)} doesn't, and in one "
+                                  "real scene both would.")
+        elif strong_clash is not None:
+            out["confidence"] = float(out.get("confidence", 0)) * 0.8
+        elif agree:
+            out["confidence"] = float(min(0.98, out.get("confidence", 0) + 0.03 * agree))
+    else:
+        cands = [o for o in objs[1:] if o["verdict"]["verdict"] in dec and o.get("named")]
+
+        def rank(o):
+            v = o["verdict"]
+            scale_free = v["verdict"] == "AI" and str(v.get("stage", "")).endswith("failed")
+            return (scale_free, bool(o.get("strong")), float(v.get("confidence", 0)))
+        if cands:
+            o = max(cands, key=rank)
+            v = o["verdict"]
+            out = {**v, "reasons": list(v.get("reasons", [])), "from_object": o["n"]}
+            out["headline"] = f"{_obj_name(o, True)}: {v['headline']}"
+            out["confidence"] = float(v.get("confidence", 0)) * (1.0 if o.get("strong") else 0.9)
+            lines.append(f"{_obj_name(prim, True)} couldn't be measured: "
+                         f"{v1.get('headline', '').rstrip('.')}.")
+            for q in objs[1:]:
+                if q is o:
+                    continue
+                lines.append(f"{_obj_name(q, True)}: {_short(q['verdict'])}.")
+        else:
+            for q in objs[1:]:
+                lines.append(f"{_obj_name(q, True)}: {_short(q['verdict'])}.")
+    out["reasons"].extend(lines)
+    for t in cross or []:
+        if t.get("name") == "Equal falls" and t.get("status") == "warn" \
+                and t["summary"] not in out["reasons"]:
+            out["reasons"].append(t["summary"])
     return out

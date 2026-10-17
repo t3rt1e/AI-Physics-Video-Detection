@@ -235,6 +235,18 @@ def split_flights(t, x, y, gdir=(0.0, 1.0), *, min_pts=5, max_gap_s=0.2,
                 b = lo + int(np.argmax(uu[lo:hi + 1]))
                 if not bounces or b > bounces[-1] + 1:
                     bounces.append(b)
+        # A bounce is where the object is lowest. A tracking hiccup near the
+        # top of a hop (the blob meeting something on the wall for a few
+        # frames) can also turn down-then-up there; that isn't one.
+        keep = []
+        for j, b in enumerate(bounces):
+            a0 = bounces[j - 1] if j > 0 else 0
+            b1 = bounces[j + 1] if j + 1 < len(bounces) else len(uu) - 1
+            seg = uu[a0:b1 + 1]
+            span = float(np.ptp(seg)) if len(seg) else 0.0
+            if uu[b] >= float(np.max(seg)) - max(0.25 * span, 2.0 * eps):
+                keep.append(b)
+        bounces = keep
         cuts = [0] + bounces + [len(idx) - 1]
         for j in range(len(cuts) - 1):
             a, b = cuts[j], cuts[j + 1]
@@ -298,6 +310,7 @@ class JointFit:
     notes: list[str] = field(default_factory=list)
     used: list[int] = field(default_factory=list)   # flights that went into a_px
     excluded: tuple = ()                            # flights left out of a_px (e.g. a throw)
+    rcoord: np.ndarray | None = None                # sensor readout coordinate per point
 
 
 def _fit_all(flights, t, x, y, w0, alpha, r, rc, fixed=None):
@@ -310,7 +323,7 @@ def _fit_all(flights, t, x, y, w0, alpha, r, rc, fixed=None):
 
 
 def fit_flights(t, x, y, w0, flights, *, fps, n_px_axis, rs_axis="y",
-                rs_mode="auto", gdir=(0.0, 1.0), exclude=()) -> JointFit:
+                rs_mode="auto", gdir=(0.0, 1.0), exclude=(), r=None) -> JointFit:
     """Fit every flight; optionally estimate one rolling-shutter alpha for all.
 
     The rolling-shutter term can only be as large as one full frame of
@@ -318,12 +331,14 @@ def fit_flights(t, x, y, w0, flights, *, fps, n_px_axis, rs_axis="y",
     arbitrary trajectory. It is kept only if it clearly improves the fit.
     exclude: positions in `flights` to leave out of the combined a_px (they
     are still fitted, e.g. a thrown first flight when bounces measure g).
+    r: where each point sits along the sensor's readout direction, when x, y
+    aren't the sensor's own pixels (a levelled view); default y (or x).
     """
     t = np.asarray(t, float)
     x = np.asarray(x, float)
     y = np.asarray(y, float)
     w0 = np.asarray(w0, float)
-    r = y if rs_axis == "y" else x
+    r = np.asarray(r, float) if r is not None else (y if rs_axis == "y" else x)
     rc = float(n_px_axis) / 2.0
     alpha_max = 1.0 / (max(fps, 1e-6) * max(n_px_axis, 1.0))
 
@@ -374,7 +389,7 @@ def fit_flights(t, x, y, w0, flights, *, fps, n_px_axis, rs_axis="y",
         out.append(FlightResult(idx=np.asarray(idx), fit=f, a_along=a, a_sigma=s,
                                 duration=float(t[idx][-1] - t[idx][0])))
     jf = JointFit(flights=out, alpha=alpha, alpha_max=alpha_max, rs_axis=rs_axis,
-                  rs_significance=signif, gdir=g, notes=notes, excluded=tuple(exclude))
+                  rs_significance=signif, gdir=g, notes=notes, excluded=tuple(exclude), rcoord=r)
     _combine(jf)
     return jf
 
@@ -389,7 +404,11 @@ def _combine(jf: JointFit):
     cand = [j for j, f in enumerate(jf.flights) if j not in jf.excluded and len(f.idx) >= 6]
     if not cand:
         cand = list(range(len(jf.flights)))
-    jf.main = int(max(cand, key=lambda j: len(jf.flights[j].idx)))
+    # The main flight is the longest real fall: a stretch with no clear
+    # downward acceleration (a ball rolling across the floor at the end) is
+    # no free flight, however long it is.
+    falling = [j for j in cand if jf.flights[j].a_along > 3 * jf.flights[j].a_sigma > 0]
+    jf.main = int(max(falling or cand, key=lambda j: len(jf.flights[j].idx)))
     m = jf.flights[jf.main]
     vals, wts, used = [], [], []
     for j, f in enumerate(jf.flights):

@@ -78,6 +78,7 @@
   <p class="overlay-key" hidden>
     <span class="key key-clip"></span> tracked ball
     <span class="key key-earth"></span> where Earth's gravity would have it
+    <span class="key-more" hidden><span class="key key-other"></span> other falling objects, numbered</span>
   </p>
   <p class="message" role="status" hidden></p>
   <div class="result" hidden>
@@ -104,6 +105,11 @@
         </figure>
       </div>
     </div>
+    <table class="objects" hidden>
+      <caption>Falling objects</caption>
+      <thead><tr><th scope="col">#</th><th scope="col">Object</th><th scope="col">g (m/s²)</th><th scope="col">Result</th></tr></thead>
+      <tbody></tbody>
+    </table>
     <table class="tests">
       <caption>Checks that slow motion and scale can't fool</caption>
       <thead><tr><th scope="col">Check</th><th scope="col">Result</th><th scope="col">What Galileo saw</th></tr></thead>

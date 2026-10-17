@@ -3,10 +3,14 @@
 # Gemini object ID + plain-English reasons, and Veo for the AI twin (cloud, needs GEMINI_API_KEY)
 google-genai>=1.30
 
-# Depth Pro second ruler (downloads apple/DepthPro-hf, ~2 GB). For the RTX 5070 Ti,
-# install torch from https://pytorch.org with CUDA 12.8 or newer FIRST; older
-# builds don't support 50-series cards.
+# CLIP names falling objects offline (downloads openai/clip-vit-base-patch32 once,
+# ~600 MB; runs on the CPU), and Depth Pro is a second ruler (downloads
+# apple/DepthPro-hf, ~2 GB). For the RTX 5070 Ti, install torch from
+# https://pytorch.org with CUDA 12.8 or newer FIRST; older builds don't support
+# 50-series cards. The CPU build is enough for CLIP. Depth Pro also needs
+# torchvision.
 torch
+torchvision
 transformers>=4.50
 
 # SAM 2 tracker for cluttered clips (weights download on first use):

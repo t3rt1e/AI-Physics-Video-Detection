@@ -36,7 +36,7 @@ def parabola_check(t, x, y, w0, jf: JointFit, drag_corrected: bool = False) -> d
         return _result(name, "skip", f"Only {n} frames in the fall; need 12 to split it in half.")
     h = n // 2
     parts = [idx[: h + 1], idx[h:]]
-    r = np.asarray(y if jf.rs_axis == "y" else x, float)
+    r = np.asarray(jf.rcoord if jf.rcoord is not None else (y if jf.rs_axis == "y" else x), float)
     accs = []
     for p in parts:
         f = robust_fit_2d(t[p], x[p], y[p], w0[p], alpha=jf.alpha, r=r[p], rc=fl.fit.rc)
@@ -110,8 +110,19 @@ def bounce_check(t, jf: JointFit, frame_dt: float) -> dict:
         vb = np.polyval(np.polyder(pb[::-1]), tb - tb0)
         if not (va > 0 and vb < 0):
             continue  # not a bounce (coming in down, going out up): a gap or a glitch
+        # A bounce comes in at the hop's top speed; a split near the top of a
+        # hop (a tracking hiccup) comes in at almost none.
+        tt_a = t[a.idx] - ta0
+        v_max = float(np.max(np.abs(np.polyval(np.polyder(pa[::-1]), tt_a)))) if len(tt_a) else 0.0
+        if va < 0.25 * v_max:
+            continue
         e = -vb / va
-        compare = j not in excluded and (j + 1) not in excluded and a.a_along != 0
+        # Same g on both hops: only between hops measured well enough to say
+        # (a stub of a hop, cut off by the end of the clip, can't).
+        a_big = max(abs(a.a_along), abs(b.a_along))
+        precise = all(np.isfinite(h.a_sigma) and h.a_sigma < 0.1 * a_big
+                      and t[h.idx[-1]] - t[h.idx[0]] >= 0.15 for h in (a, b))
+        compare = j not in excluded and (j + 1) not in excluded and a.a_along != 0 and precise
         pairs.append({"t_bounce": float(tb), "v_in": float(va), "v_out": float(vb),
                       "restitution": float(e),
                       "a_ratio": float(b.a_along / a.a_along) if compare else float("nan"),
@@ -167,6 +178,63 @@ def equal_falls_check(a_main: tuple[float, float], others: list[tuple[float, flo
                        f"Two falling objects accelerate differently ({r:.2f}x). Fine if one is "
                        "much closer to the camera; otherwise a red flag.", **detail)
     return _result(name, "pass", f"Falling objects keep pace ({r:.2f}x).", **detail)
+
+
+def equal_falls_check_g(objs: list[dict]) -> dict:
+    """Everything in one scene falls with one g. Compares each object's g (in
+    m/s^2, each through its own ruler and air-drag correction, so distance
+    from the camera doesn't matter) with the first one's.
+
+    objs: [{"n", "label", "g", "sigma"}]; objects without a ruler are left out.
+    Never fails on its own: a wrong guess at an object's size looks the same.
+    """
+    name = "Equal falls"
+    with_g = [o for o in objs if o.get("g") is not None and o.get("sigma")]
+    if len(with_g) < 2:
+        return _result(name, "skip", "Fewer than two objects with a known size, so their falls "
+                       "can't be compared.")
+    ref = with_g[0]
+    worst = None
+    for o in with_g[1:]:
+        r = o["g"] / ref["g"] if ref["g"] else float("inf")
+        z = (o["g"] - ref["g"]) / max(np.hypot(o["sigma"], ref["sigma"]), 1e-9)
+        if worst is None or abs(np.log(max(r, 1e-9))) > abs(np.log(max(worst[1], 1e-9))):
+            worst = (o, r, z)
+    o, r, z = worst
+
+    def nm(q):
+        return f"object {q['n']}" + (f" ({q['label']})" if q.get("label") else "")
+    detail = {"ratio": float(r), "z": float(z), "objects": [q["n"] for q in with_g]}
+    if (r < 0.8 or r > 1.25) and abs(z) > 3:
+        return _result(name, "warn",
+                       f"{nm(o).capitalize()} falls at {o['g']:.1f} m/s^2 but {nm(ref)} at "
+                       f"{ref['g']:.1f}. In one scene they should match, unless a size is "
+                       "wrong.".replace("m/s^2", "m/s²"), **detail)
+    spread = max(abs(q["g"] / ref["g"] - 1) for q in with_g[1:]) * 100
+    return _result(name, "pass", f"All {len(with_g)} objects fall with the same g (within "
+                   f"{spread:.0f}%).", **detail)
+
+
+def vertical_check(ang: float, s_ang: float) -> dict:
+    """A real fall speeds up straight down: along the room's own uprights.
+
+    ang: degrees between the way the fall accelerates (in the picture, at
+    its centre) and the way the room's vertical lines run there; s_ang its
+    error. A generated clip can drop things at a slant; a real one can't.
+    Small angles are within what a slightly bent line or the fit allows.
+    """
+    name = "Falls straight down"
+    detail = {"angle_deg": float(ang), "sigma_deg": float(s_ang)}
+    if abs(ang) > 25 and abs(ang) > 5 * s_ang:
+        return _result(name, "fail",
+                       f"It speeds up {abs(ang):.0f}° away from the room's vertical. Real gravity "
+                       "pulls straight down.", **detail)
+    if abs(ang) > 8 and abs(ang) > 3 * s_ang:
+        return _result(name, "warn",
+                       f"It speeds up {abs(ang):.0f}° away from the room's vertical (a bent lens, "
+                       "or a sign of generated motion).", **detail)
+    return _result(name, "pass", f"It speeds up along the room's vertical (within "
+                   f"{max(abs(ang), s_ang):.0f}°).", **detail)
 
 
 def release_check(jf: JointFit, rest_xy, diam_px, thrown: bool = False) -> dict:

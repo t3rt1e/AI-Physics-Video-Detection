@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import math
+
 import cv2
 import numpy as np
 
@@ -24,12 +26,19 @@ except Exception:  # pragma: no cover
 @dataclass
 class Det:
     f: int            # index into the analysed frame list
-    x: float          # working px
+    x: float          # working px (brightness-weighted centre)
     y: float
     d: float          # width across the motion direction, working px
     area: float
     elong: float
     contrast: float
+    ax: float = float("nan")   # area centroid of the silhouette: the centre of mass
+    ay: float = float("nan")   # of a uniform flat object, whatever its shape
+    tx: float = float("nan")   # thickness-weighted centroid: each pixel counts by its
+    ty: float = float("nan")   # depth into the outline, a stand-in for how thick it is
+    shadow: bool = False       # looks like a shadow (the backdrop, only darker)
+    hull: np.ndarray | None = None   # silhouette outline (convex hull), working px
+    col: np.ndarray | None = None    # mean colour (BGR), to keep two objects apart
 
 
 @dataclass
@@ -37,6 +46,7 @@ class Track:
     dets: list = field(default_factory=list)
     score: float = 0.0
     kind: str = "moving"
+    falls: bool = False        # has at least one clean flight that speeds up downward
 
     @property
     def f(self):
@@ -57,6 +67,50 @@ class Track:
     @property
     def area(self):
         return np.array([d.area for d in self.dets], float)
+
+    @property
+    def ax(self):
+        return np.array([d.ax if np.isfinite(d.ax) else d.x for d in self.dets], float)
+
+    @property
+    def ay(self):
+        return np.array([d.ay if np.isfinite(d.ay) else d.y for d in self.dets], float)
+
+    @property
+    def tx(self):
+        return np.array([d.tx if np.isfinite(d.tx) else d.x for d in self.dets], float)
+
+    @property
+    def ty(self):
+        return np.array([d.ty if np.isfinite(d.ty) else d.y for d in self.dets], float)
+
+    @property
+    def shadow_frac(self) -> float:
+        return float(np.mean([d.shadow for d in self.dets])) if self.dets else 0.0
+
+    def extent_across(self, times) -> np.ndarray:
+        """Outline length across the direction of motion, per detection (px).
+
+        Motion blur stretches a blob along its path, never across it, so this
+        is blur-free. A tumbling stick or phone shows its full length across
+        the path whenever its long side lines up that way.
+        """
+        n = len(self.dets)
+        out = np.full(n, np.nan)
+        for j, dt_ in enumerate(self.dets):
+            if dt_.hull is None or len(dt_.hull) < 3:
+                continue
+            a = self.dets[max(j - 1, 0)]
+            b = self.dets[min(j + 1, n - 1)]
+            vx, vy = b.x - a.x, b.y - a.y
+            sp = float(np.hypot(vx, vy))
+            if sp < 1e-6:
+                ext = [np.ptp(dt_.hull[:, 0]), np.ptp(dt_.hull[:, 1])]
+                out[j] = float(max(ext)) + 1.0
+                continue
+            e = np.array([-vy / sp, vx / sp])
+            out[j] = float(np.ptp(dt_.hull @ e)) + 1.0
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -164,55 +218,103 @@ def measure_width(frame, bg, x, y, d_guess, axis=None) -> float:
     if fr.ndim == 3:
         # Video stores colour at half resolution (4:2:0), so colour edges are
         # soft and read wide. Measure on brightness, which keeps full
-        # resolution, unless the ball barely differs from the backdrop in it.
+        # resolution, unless the ball barely differs from the backdrop in it,
+        # or only part of it does (a yellow ball half in front of a pale wall,
+        # half in front of a dark shelf: brightness sees half a ball).
         Dl = cv2.absdiff(cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY), cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY))
         Dc = np.max(cv2.absdiff(fr, bgr), axis=2)
-        Dr = Dl if float(Dl.max()) >= max(25.0, 0.35 * float(Dc.max())) else Dc
+        # The ball's own shadow on the wall or floor right beside it is the
+        # backdrop, only darker: every colour channel drops by about the same
+        # factor. It is no part of the ball, so it doesn't count.
+        # A grey ball (steel) or a grey panel looks like that too, so only
+        # shadow-like pixels outside the outline of the clearly coloured part
+        # are dropped, and only when there is a clearly coloured part.
+        rat = (fr.astype(np.float32) + 4.0) / (bgr.astype(np.float32) + 4.0)
+        rmean = rat.mean(axis=2)
+        shadow = ((rmean < 0.93) & (rmean > 0.25)
+                  & (np.abs(rat - rmean[:, :, None]).max(axis=2) < 0.06 + 0.1 * (1 - rmean)))
+        if shadow.any():
+            Dcb0 = cv2.GaussianBlur(Dc.astype(np.float32), (3, 3), 0)
+            lit = (Dcb0 > float(np.median(Dcb0)) + 0.35 * (float(Dcb0.max()) - float(np.median(Dcb0))))
+            body = lit & ~shadow
+            if body.sum() >= max(12, 0.3 * lit.sum()):
+                ys_, xs_ = np.nonzero(body)
+                hull0 = cv2.convexHull(np.column_stack([xs_, ys_]).astype(np.int32))
+                inside = np.zeros(shadow.shape, np.uint8)
+                cv2.fillConvexPoly(inside, hull0, 1)
+                inside = cv2.dilate(inside, np.ones((3, 3), np.uint8)) > 0
+                drop = shadow & ~inside
+                Dl = np.where(drop, 0, Dl).astype(Dl.dtype)
+                Dc = np.where(drop, 0, Dc).astype(Dc.dtype)
+        use_l = float(Dl.max()) >= max(25.0, 0.35 * float(Dc.max()))
+        partial = False
+        if use_l:
+            yy0, xx0 = np.mgrid[ya:yb, xa:xb]
+            near0 = (xx0 - x) ** 2 + (yy0 - y) ** 2 <= (0.75 * max(d_guess, 4.0)) ** 2
+            Dcb = cv2.GaussianBlur(Dc.astype(np.float64), (3, 3), 0)
+            Dlb = cv2.GaussianBlur(Dl.astype(np.float64), (3, 3), 0)
+            mc, pc = float(np.median(Dcb)), float(Dcb[near0].max()) if near0.any() else 0.0
+            ml, pl = float(np.median(Dlb)), float(Dlb[near0].max()) if near0.any() else 0.0
+            col = near0 & (Dcb > mc + 0.35 * (pc - mc))
+            lum = near0 & (Dlb > ml + 0.35 * (pl - ml))
+            partial = bool(col.sum() >= 12 and (lum & col).sum() < 0.85 * col.sum())
+        # Brightness seeing only part of the ball reads it small: colour then.
+        maps = [Dl if (use_l and not partial) else Dc]
     else:
-        Dr = cv2.absdiff(fr, bgr)
-        Dc = None
-    Dr = Dr.astype(np.float64)
-    Db = cv2.GaussianBlur(Dr, (3, 3), 0)
-    med = float(np.median(Db))
-    pk = float(Db.max())
-    if pk - med < 8:
-        return float("nan")
-    core = (Db > med + 0.25 * (pk - med)).astype(np.uint8)
-    n, lab, st, cen = cv2.connectedComponentsWithStats(core, connectivity=8)
-    if n < 2:
-        return float("nan")
+        maps = [cv2.absdiff(fr, bgr)]
+        Dc = Dl = None
     yy, xx = np.mgrid[ya:yb, xa:xb]
     # Every piece of the blob near the expected spot. A multi-coloured ball (a
     # volleyball's panels) differs from the backdrop by a different amount in
     # each panel and can come apart into several pieces; keeping only the
     # nearest piece measured half a volleyball.
     near = (xx - x) ** 2 + (yy - y) ** 2 <= (0.6 * max(d_guess, 4.0)) ** 2
-    ids = np.unique(lab[near & (lab > 0)])
-    if len(ids) == 0:
-        ids = np.array([1 + int(np.argmin([np.hypot(cen[i][0] + xa - x, cen[i][1] + ya - y)
-                                           for i in range(1, n)]))])
-    comp = np.isin(lab, ids)
-    cm = cv2.dilate(comp.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
-    cm[(lab > 0) & ~comp] = 0
-    sel = cm > 0
-    Dm, Xm, Ym = Dr[sel], xx[sel].astype(np.float64), yy[sel].astype(np.float64)
-    wts = np.clip(Dm - med, 0, None)
-    if wts.sum() <= 0:
+
+    def model_width(Dr):
+        Dr = Dr.astype(np.float64)
+        Db = cv2.GaussianBlur(Dr, (3, 3), 0)
+        med = float(np.median(Db))
+        pk = float(Db.max())
+        if pk - med < 8:
+            return float("nan"), None, axis
+        core = (Db > med + 0.25 * (pk - med)).astype(np.uint8)
+        n, lab, st, cen = cv2.connectedComponentsWithStats(core, connectivity=8)
+        if n < 2:
+            return float("nan"), None, axis
+        ids = np.unique(lab[near & (lab > 0)])
+        if len(ids) == 0:
+            ids = np.array([1 + int(np.argmin([np.hypot(cen[i][0] + xa - x, cen[i][1] + ya - y)
+                                               for i in range(1, n)]))])
+        comp = np.isin(lab, ids)
+        cm = cv2.dilate(comp.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+        cm[(lab > 0) & ~comp] = 0
+        sel = cm > 0
+        Dm, Xm, Ym = Dr[sel], xx[sel].astype(np.float64), yy[sel].astype(np.float64)
+        wts = np.clip(Dm - med, 0, None)
+        if wts.sum() <= 0:
+            return float("nan"), comp, axis
+        cx = float(np.sum(wts * Xm) / wts.sum())
+        cy = float(np.sum(wts * Ym) / wts.sum())
+        ones = np.ones_like(Dm)
+        ax_ = axis
+        if ax_ is None:
+            sxx = np.sum(wts * (Xm - cx) ** 2)
+            syy = np.sum(wts * (Ym - cy) ** 2)
+            sxy = np.sum(wts * (Xm - cx) * (Ym - cy))
+            ev, evec = np.linalg.eigh(np.array([[sxx, sxy], [sxy, syy]]))
+            if ev[1] / max(ev[0], 1e-9) > 1.3:
+                ax_ = evec[:, 0]
+        axes_ = [ax_] if ax_ is not None else [(1.0, 0.0), (0.0, 1.0)]
+        ws = [_width_along(Dm, ones, Xm, Ym, cx, cy, a) for a in axes_]
+        ws = [w_ for w_ in ws if np.isfinite(w_)]
+        return (float(np.mean(ws)) if ws else float("nan")), comp, ax_
+    got = [model_width(D) for D in maps]
+    got = [g_ for g_ in got if g_[1] is not None]
+    if not got:
         return float("nan")
-    cx = float(np.sum(wts * Xm) / wts.sum())
-    cy = float(np.sum(wts * Ym) / wts.sum())
-    ones = np.ones_like(Dm)
-    if axis is None:
-        sxx = np.sum(wts * (Xm - cx) ** 2)
-        syy = np.sum(wts * (Ym - cy) ** 2)
-        sxy = np.sum(wts * (Xm - cx) * (Ym - cy))
-        ev, evec = np.linalg.eigh(np.array([[sxx, sxy], [sxy, syy]]))
-        if ev[1] / max(ev[0], 1e-9) > 1.3:
-            axis = evec[:, 0]
-    axes = [axis] if axis is not None else [(1.0, 0.0), (0.0, 1.0)]
-    ws = [_width_along(Dm, ones, Xm, Ym, cx, cy, a) for a in axes]
-    ws = [w_ for w_ in ws if np.isfinite(w_)]
-    w_model = float(np.mean(ws)) if ws else float("nan")
+    fin = [g_ for g_ in got if np.isfinite(g_[0])]
+    w_model, comp, ax_used = max(fin, key=lambda g_: g_[0]) if fin else got[0]
+    axes = [ax_used] if ax_used is not None else [(1.0, 0.0), (0.0, 1.0)]
     # The profile model assumes the ball differs from the backdrop by about
     # the same amount everywhere. Panels break that, so for a big ball also
     # take the outline's width (convex hull of the blob, across the motion)
@@ -221,7 +323,7 @@ def measure_width(frame, bg, x, y, d_guess, axis=None) -> float:
     # in brightness and in colour (a yellow panel can match a grey wall in
     # brightness alone).
     sil = np.zeros_like(comp)
-    for Dmap in ([Dr, Dc] if Dc is not None else [Dr]):
+    for Dmap in ([Dl, Dc] if Dc is not None else maps):
         Ds = cv2.GaussianBlur(Dmap.astype(np.float64), (3, 3), 0)
         med_s, pk_s = float(np.median(Ds)), float(Ds.max())
         if pk_s - med_s < 8:
@@ -234,14 +336,28 @@ def measure_width(frame, bg, x, y, d_guess, axis=None) -> float:
     pts = np.column_stack([xx[sil], yy[sil]]).astype(np.float32)
     if len(pts) >= 12:
         hull = cv2.convexHull(pts).reshape(-1, 2).astype(np.float64)
-        w_sil = float(np.mean([np.ptp(hull @ np.asarray(a, float)) + 1.0 for a in axes]))
-        if w_sil >= 24 and (not np.isfinite(w_model) or abs(w_model / w_sil - 1) > 0.12):
+        if axis is not None:
+            w_sil = float(np.ptp(hull @ np.asarray(axis, float)) + 1.0)   # across the motion
+        else:
+            # Still ball: the typical width over many directions, so a panel
+            # that matches the backdrop (a missing wedge) or a little blur
+            # each spoil only a few of them.
+            dirs = [(np.cos(a), np.sin(a)) for a in np.radians(np.arange(0, 180, 15))]
+            w_sil = float(np.median([np.ptp(hull @ np.asarray(a)) + 1.0 for a in dirs]))
+        # A part of the ball only ever reads narrow, so a narrower model gives
+        # way sooner than a wider one.
+        if w_sil >= 24 and (not np.isfinite(w_model) or w_model < 0.94 * w_sil
+                            or w_model > 1.12 * w_sil):
             return w_sil
     return w_model
 
 
 def detect(frame, bg, *, roi=None, min_area=8, max_frac=0.2, max_blobs=12,
-           min_thr=14.0) -> list[Det]:
+           min_thr=14.0, footprint=None) -> list[Det]:
+    """Moving blobs in one steadied frame. footprint: the frame's outline on a
+    canvas bigger than it (a panning camera); blobs reaching past it are cut
+    off by the edge of the picture and are skipped, like those at the
+    border."""
     if frame.ndim == 3:
         D_raw = np.max(cv2.absdiff(frame, bg), axis=2)
     else:
@@ -270,6 +386,11 @@ def detect(frame, bg, *, roi=None, min_area=8, max_frac=0.2, max_blobs=12,
             continue
         if x <= 1 or y <= 1 or x + w >= W - 1 or y + h >= H - 1:
             continue  # cut off by the frame edge: centroid and width would be wrong
+        if footprint is not None and min(
+                cv2.pointPolygonTest(footprint, (float(px), float(py)), True)
+                for px, py in ((x - 1, y - 1), (x + w + 1, y - 1), (x - 1, y + h + 1),
+                               (x + w + 1, y + h + 1))) < 3.0:
+            continue  # reaches past this frame's own picture on the canvas
         pad = 5
         xa, ya = max(x - pad, 0), max(y - pad, 0)
         xb, yb = min(x + w + pad, W), min(y + h + pad, H)
@@ -300,11 +421,52 @@ def detect(frame, bg, *, roi=None, min_area=8, max_frac=0.2, max_blobs=12,
         peak = float(D[ya:yb, xa:xb][core > 0].max())
         if peak < 1.3 * thr:
             continue
+        # The silhouette: holes filled, so a dark logo or seam doesn't move the
+        # centre. Its area centroid is the centre of mass of a uniform object.
+        sil = cv2.morphologyEx(core, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        cnts, _ = cv2.findContours(sil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        ax_ = ay_ = tx_ = ty_ = float("nan")
+        hull = None
+        if cnts:
+            cnt = max(cnts, key=cv2.contourArea)
+            mom = cv2.moments(cnt)
+            if mom["m00"] > 0:
+                ax_ = float(mom["m10"] / mom["m00"]) + xa
+                ay_ = float(mom["m01"] / mom["m00"]) + ya
+            hull = cv2.convexHull(cnt).reshape(-1, 2).astype(np.float32) + np.float32([xa, ya])
+            # A solid seen from the side is thickest where its outline is widest:
+            # weighting each pixel by its distance to the edge weighs a round
+            # lump by its volume (r^3), not its area (r^2). For a lumpy 3D
+            # object that lands much nearer its centre of mass.
+            fill = np.zeros_like(sil)
+            cv2.drawContours(fill, [cnt], -1, 1, -1)
+            dtm = cv2.distanceTransform(fill, cv2.DIST_L2, 3)
+            sw = float(dtm.sum())
+            if sw > 0:
+                tx_ = float((dtm * xx).sum() / sw)
+                ty_ = float((dtm * yy).sum() / sw)
+        col = (frame[ya:yb, xa:xb][core > 0].reshape(-1, 3).mean(axis=0).astype(np.float32)
+               if frame.ndim == 3 else None)
         out.append(Det(f=-1, x=cx, y=cy, d=width, area=float(area), elong=elong,
-                       contrast=peak))
+                       contrast=peak, ax=ax_, ay=ay_, tx=tx_, ty=ty_,
+                       shadow=_shadow_like(frame, bg, ya, yb, xa, xb, core),
+                       hull=hull, col=col))
         if len(out) >= max_blobs:
             break
     return out
+
+
+def _shadow_like(frame, bg, ya, yb, xa, xb, core) -> bool:
+    """A shadow is the backdrop, only darker: every colour channel drops by
+    about the same factor. A ball has its own colour, or is much darker."""
+    if frame.ndim != 3:
+        return False
+    fr = frame[ya:yb, xa:xb][core > 0].astype(np.float32)
+    bg_ = bg[ya:yb, xa:xb][core > 0].astype(np.float32)
+    if len(fr) < 6:
+        return False
+    ratio = np.median((fr + 1.0) / (bg_ + 1.0), axis=0)
+    return bool(np.all((ratio > 0.45) & (ratio < 0.93)) and np.ptp(ratio) < 0.08)
 
 
 # ---------------------------------------------------------------------------
@@ -343,9 +505,16 @@ def link(dets_per_frame, times, max_missing=3) -> list[Track]:
             gate = 2.0 * last.d + 0.6 * mv + 8.0
             for di, d in enumerate(dets):
                 dist = np.hypot(d.x - px, d.y - py)
-                size_ok = 0.5 < d.d / max(last.d, 1e-6) < 2.0
+                ratio = d.d / max(last.d, 1e-6)
+                # A tumbling stick or phone changes width as it turns.
+                size_ok = 0.5 < ratio < 2.0 or (min(d.elong, last.elong) > 1.5
+                                                 and 0.3 < ratio < 3.3)
                 if dist < gate and size_ok:
-                    pairs.append((dist / gate, ti, di))
+                    cost = dist / gate
+                    if d.col is not None and last.col is not None:
+                        # Colour keeps two objects apart where their paths cross.
+                        cost += 0.4 * min(float(np.linalg.norm(d.col - last.col)) / 60.0, 2.0)
+                    pairs.append((cost, ti, di))
         pairs.sort()
         used_t, used_d = set(), set()
         for _, ti, di in pairs:
@@ -412,13 +581,23 @@ def _speed(tr: Track, times) -> float:
     return float(np.hypot(b.x - a.x, b.y - a.y) / dt) if dt > 0 else 0.0
 
 
-def _flight_score(t, x, y, d, dm) -> float:
-    """How much one flight looks like a dropped ball: long, smooth, steady in
-    size, and speeding up downward."""
+def _steadiness(t, v) -> float:
+    """Relative scatter of v around a straight-line trend in time."""
+    ok = np.isfinite(v) & (v > 0)
+    if ok.sum() < 4 or np.ptp(t[ok]) <= 0:
+        return 0.5
+    c = np.polyfit(t[ok] - t[ok].mean(), v[ok], 1)
+    res = v[ok] - np.polyval(c, t[ok] - t[ok].mean())
+    return float(1.4826 * np.median(np.abs(res)) / max(np.median(v[ok]), 1e-6))
+
+
+def _flight_score(t, x, y, d, dm, area=None, down=(0.0, 1.0)) -> tuple[float, bool]:
+    """How much one flight looks like a dropped object: long, smooth, steady in
+    size, and speeding up along `down`. Also says whether it is a clean fall."""
     from .physics import robust_fit_2d
     n = len(t)
     fit = robust_fit_2d(t, x, y)
-    a_down, s_down = fit.accel_along((0.0, 1.0))
+    a_down, s_down = fit.accel_along(down)
     a_mag = float(np.hypot(*fit.accel_vec()))
     ext = float(np.hypot(np.ptp(x), np.ptp(y)))
     # Speeds up downward, clearly (a hand pulling away or a slowing arm doesn't).
@@ -427,18 +606,29 @@ def _flight_score(t, x, y, d, dm) -> float:
     cosang = a_down / a_mag if a_mag > 0 else 0.0
     f_dir = 1.0 if cosang > 0.87 else (0.5 if cosang > 0.64 else 0.15)
     # A ball keeps its size; hands, arms and shadows change shape. A slow trend
-    # (ball moving toward the camera) is allowed.
-    ok = np.isfinite(d) & (d > 0)
-    if ok.sum() >= 4 and np.ptp(t[ok]) > 0:
-        c = np.polyfit(t[ok] - t[ok].mean(), d[ok], 1)
-        res = d[ok] - np.polyval(c, t[ok] - t[ok].mean())
-        cv = float(1.4826 * np.median(np.abs(res)) / max(np.median(d[ok]), 1e-6))
-    else:
-        cv = 0.5
+    # (ball moving toward the camera) is allowed. Something long that tumbles
+    # changes width but keeps its area, so the steadier of the two counts.
+    cv = _steadiness(t, d)
+    if area is not None:
+        cv = min(cv, _steadiness(t, np.sqrt(np.asarray(area, float))) * 1.5)
     f_size = 1.0 / (1.0 + (cv / 0.15) ** 2)
     # Smooth path: the fit residual is small next to the ball's size.
     f_fit = float(np.exp(-fit.rms / (0.35 * dm + 0.7)))
-    return float(n * min(ext / dm, 25.0) * f_acc * f_dir * f_size * f_fit)
+    clean = (f_acc == 1.0 and cosang > 0.8 and n >= 8 and float(np.ptp(t)) >= 0.1
+             and ext >= 1.5 * dm and fit.rms < 0.5 * dm + 1.0)
+    return float(n * min(ext / dm, 25.0) * f_acc * f_dir * f_size * f_fit), bool(clean)
+
+
+def _own_down(t, x, y, dm):
+    """The way this track accelerates, if it clearly does so steadily (a camera
+    held sideways makes things fall sideways); None otherwise."""
+    from .camera import gravity_2d
+    g, n_ok, spread = gravity_2d(t, x, y, dm)
+    if n_ok < 4 or spread > 15:
+        return None
+    if g[1] > math.cos(math.radians(30)):
+        return None                      # close enough to the picture's own down
+    return g
 
 
 def classify_and_score(tracks: list[Track], times) -> list[Track]:
@@ -446,9 +636,14 @@ def classify_and_score(tracks: list[Track], times) -> list[Track]:
 
     The track is cut at bounces first and each flight is judged on its own,
     so a ball that bounces five times collects five flights of evidence
-    instead of failing one parabola fitted through all of them.
+    instead of failing one parabola fitted through all of them. Falling
+    means speeding up toward the picture's bottom. Only when nothing in the
+    clip does that cleanly does a track that steadily speeds up some other
+    way (a camera held sideways) count, at a small discount: a leg or a
+    hand moving sideways mustn't outscore a ball falling down.
     """
     from .physics import split_flights
+    own_scores = {}
     for tr in tracks:
         x, y, d = tr.x, tr.y, tr.d
         dm = float(np.nanmedian(d)) if np.isfinite(d).any() else 1.0
@@ -461,13 +656,31 @@ def classify_and_score(tracks: list[Track], times) -> list[Track]:
         tr.kind = "moving"
         t = np.array([times[f] for f in tr.f], float)
         score = 0.0
+        tr.falls = False
+        area = tr.area
         if len(t) >= 5 and np.ptp(t) > 0:
             for idx in split_flights(t, x, y, (0.0, 1.0), diam_px=dm, min_pts=5):
-                score += _flight_score(t[idx], x[idx], y[idx], d[idx], dm)
+                sc_, clean = _flight_score(t[idx], x[idx], y[idx], d[idx], dm, area[idx])
+                score += sc_
+                tr.falls = tr.falls or clean
+            own = _own_down(t, x, y, dm) if len(t) >= 12 else None
+            if own is not None:
+                s2, f2 = 0.0, False
+                for idx in split_flights(t, x, y, own, diam_px=dm, min_pts=5):
+                    sc_, clean = _flight_score(t[idx], x[idx], y[idx], d[idx], dm, area[idx],
+                                               down=own)
+                    s2 += sc_
+                    f2 = f2 or clean
+                if 0.8 * s2 > score:
+                    own_scores[id(tr)] = (0.8 * s2, f2)
         if score <= 0:
             # Moves, but no flight worth fitting: keep it as a weak fallback.
             score = 0.02 * len(t) * min(extent / dm, 25.0)
         tr.score = float(score)
+    if own_scores and not any(tr.falls for tr in tracks if tr.kind == "moving"):
+        for tr in tracks:
+            if id(tr) in own_scores:
+                tr.score, tr.falls = own_scores[id(tr)]
     return sorted(tracks, key=lambda t: -t.score)
 
 
@@ -531,6 +744,93 @@ class TrackResult:
     seeded: bool = False               # main was chosen by a seed (a click, or a first pass)
     dets: list | None = None           # every candidate blob, per frame (for the debug video)
     tracks: list | None = None         # every linked track, best score first
+    objects: list | None = None        # one TrackResult per falling object, this one first
+    L_fine: np.ndarray | None = None   # accurate long-side lengths (non-round objects), NaN elsewhere
+
+
+def measure_length(frame, bg, hull) -> float:
+    """Length of an elongated object along its long axis, to a fraction of a pixel.
+
+    The outline found by thresholding overshoots each end by a pixel or so
+    (a faint edge pixel still passes the threshold). Instead, the picture is
+    turned so the long axis lies flat, the strongest contrast is taken down
+    each column, and each end is placed where that contrast falls to half of
+    its level near that end (each end its own level, so a two-tone object
+    like a hammer is measured right).
+    """
+    if hull is None or len(hull) < 3:
+        return float("nan")
+    h = np.asarray(hull, np.float64).reshape(-1, 2)
+    m = cv2.moments(h.astype(np.float32).reshape(-1, 1, 2))
+    if m["m00"] <= 0:
+        return float("nan")
+    cx, cy = m["m10"] / m["m00"], m["m01"] / m["m00"]
+    phi = 0.5 * np.arctan2(2 * m["mu11"], m["mu20"] - m["mu02"])
+    e1 = np.array([np.cos(phi), np.sin(phi)])
+    e2 = np.array([-np.sin(phi), np.cos(phi)])
+    u = (h - [cx, cy]) @ e1
+    v = (h - [cx, cy]) @ e2
+    pad = 7
+    u0, u1 = float(u.min()) - pad, float(u.max()) + pad
+    v0, v1 = float(v.min()) - pad, float(v.max()) + pad
+    Wn, Hn = int(np.ceil(u1 - u0)) + 1, int(np.ceil(v1 - v0)) + 1
+    if Wn < 8 or Hn < 5 or Wn * Hn > 400_000:
+        return float("nan")
+    # Output pixel (i, j) shows the point c + (u0 + i) e1 + (v0 + j) e2.
+    M = np.array([[e1[0], e2[0], cx + u0 * e1[0] + v0 * e2[0]],
+                  [e1[1], e2[1], cy + u0 * e1[1] + v0 * e2[1]]])
+    flags = cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP
+    a = cv2.warpAffine(frame, M, (Wn, Hn), flags=flags, borderMode=cv2.BORDER_REPLICATE)
+    b = cv2.warpAffine(bg, M, (Wn, Hn), flags=flags, borderMode=cv2.BORDER_REPLICATE)
+    D = cv2.absdiff(a, b).astype(np.float64)
+    if D.ndim == 3:
+        D = D.max(axis=2)
+    band = slice(max(int(pad - 2), 0), min(int(Hn - pad + 2), Hn))
+    prof = D[band].max(axis=0)
+    base = float(np.median(np.concatenate([D[:3].ravel(), D[-3:].ravel()])))
+    top = float(prof.max())
+    if top - base < 12:
+        return float("nan")
+    inside = np.flatnonzero(prof > base + 0.6 * (top - base))
+    if len(inside) < 4:
+        return float("nan")
+    i_a, i_b = int(inside[0]), int(inside[-1])
+    span = i_b - i_a
+    k = max(2, span // 6)
+    edges = []
+    for side in (0, 1):
+        seg = prof[i_a:i_a + k + 1] if side == 0 else prof[i_b - k:i_b + 1]
+        lvl = base + 0.5 * (float(np.percentile(seg, 75)) - base)
+        if side == 0:
+            j = i_a
+            while j > 0 and prof[j - 1] > lvl:
+                j -= 1
+            if j == 0:
+                return float("nan")
+            p0, p1 = prof[j - 1], prof[j]
+            edges.append(j - 1 + (lvl - p0) / max(p1 - p0, 1e-9))
+        else:
+            j = i_b
+            while j < len(prof) - 1 and prof[j + 1] > lvl:
+                j += 1
+            if j == len(prof) - 1:
+                return float("nan")
+            p0, p1 = prof[j], prof[j + 1]
+            edges.append(j + (p0 - lvl) / max(p0 - p1, 1e-9))
+    return float(edges[1] - edges[0])
+
+
+def refine_lengths(frames, bg, tr: Track, max_n: int = 120) -> np.ndarray | None:
+    """measure_length for up to max_n detections, if the object looks elongated."""
+    el = [d.elong for d in tr.dets]
+    if not tr.dets or np.median(el) < 1.25:
+        return None
+    n = len(tr.dets)
+    out = np.full(n, np.nan)
+    for j in np.unique(np.linspace(0, n - 1, min(max_n, n)).astype(int)):
+        d = tr.dets[j]
+        out[j] = measure_length(frames[d.f], bg, d.hull)
+    return out
 
 
 def refine_widths(frames, bg, tr: Track, times, max_n: int = 40) -> np.ndarray:
@@ -549,11 +849,89 @@ def refine_widths(frames, bg, tr: Track, times, max_n: int = 40) -> np.ndarray:
     return out
 
 
-def track_falling_object(frames, times, *, roi=None, bg=None, seed=None) -> TrackResult:
-    """Find the falling ball. seed: optional list of (t, x, y) points on it."""
+def _same_object(a: Track, b: Track, times) -> bool:
+    """Is b a piece of a (a panel, a highlight) or the rest of a's own path
+    after a dropout, rather than a second object?"""
+    da = max(float(np.nanmedian(a.d)) if np.isfinite(a.d).any() else 4.0, 2.0)
+    db = max(float(np.nanmedian(b.d)) if np.isfinite(b.d).any() else 4.0, 2.0)
+    ia = {int(f): j for j, f in enumerate(a.f)}
+    common = [int(f) for f in b.f if int(f) in ia]
+    if len(common) >= 3:
+        ib = {int(f): j for j, f in enumerate(b.f)}
+        sep = np.array([np.hypot(a.x[ia[f]] - b.x[ib[f]], a.y[ia[f]] - b.y[ib[f]])
+                        for f in common])
+        # Overlapping pieces that move as one. Two balls dropped side by side
+        # also move together, but they sit more than a ball apart.
+        return bool(np.median(sep) < 0.6 * (da + db) and np.ptp(sep) < 0.6 * max(da, db))
+    if len(common) > 0:
+        return False
+    # No shared frames: is b where a would be, a moment later (or earlier)?
+    first, second = (a, b) if a.f[-1] < b.f[0] else (b, a)
+    last, nxt = first.dets[-1], second.dets[0]
+    gap = float(times[nxt.f] - times[last.f])
+    if gap > 0.35:
+        return False                      # a separate drop later in the clip
+    ratio = nxt.d / max(last.d, 1e-6)
+    if not 0.65 < ratio < 1.55:
+        return False
+    # Allow for the speed it had, and the speed a fall adds over the gap.
+    sp = _speed(first, times)
+    acc = 2.0 * sp / max(float(times[last.f] - times[first.dets[0].f]), 0.05)
+    dist = float(np.hypot(nxt.x - last.x, nxt.y - last.y))
+    return dist < 4.0 * max(da, db) + 1.5 * sp * gap + acc * gap * gap
+
+
+def select_objects(moving: list[Track], times, primary: Track, max_n: int = 4) -> list[Track]:
+    """The distinct falling objects, primary first.
+
+    Every moving track with a clean fall of its own counts, except shadows
+    (the backdrop, only darker) and pieces or continuations of an object
+    already chosen. A hand pulling away doesn't speed up downward, so it
+    never has a clean fall.
+    """
+    out = [primary]
+    best = max(primary.score, 1e-9)
+    for tr in moving:
+        if len(out) >= max_n:
+            break
+        if tr is primary or not tr.falls or len(tr.dets) < 12:
+            continue
+        if tr.score < 0.01 * best or tr.shadow_frac > 0.5:
+            continue
+        if any(_same_object(o, tr, times) for o in out):
+            continue
+        out.append(tr)
+    return out
+
+
+def _rest_spot(frames, bg, tracks, main: Track, times):
+    """A static blob where the fall begins = the object's resting spot (ghost)."""
+    f0 = main.dets[0]
+    t0 = float(times[f0.f])
+    for t in tracks:
+        if t.kind != "static":
+            continue
+        sx, sy = float(np.median(t.x)), float(np.median(t.y))
+        ts0, ts1 = float(times[t.dets[0].f]), float(times[t.dets[-1].f])
+        if np.hypot(sx - f0.x, sy - f0.y) < 2.5 * f0.d and ts0 - 0.1 <= t0 <= ts1 + 0.6:
+            mid = t.dets[len(t.dets) // 2]
+            wd = measure_width(frames[mid.f], bg, sx, sy, float(np.median(t.d)))
+            rest = Det(f=t.dets[0].f, x=sx, y=sy, d=wd, area=0, elong=1, contrast=0)
+            return rest, (wd if np.isfinite(wd) else None)
+    return None, None
+
+
+def track_falling_object(frames, times, *, roi=None, bg=None, seed=None,
+                         max_objects: int = 4, footprints=None) -> TrackResult:
+    """Find the falling objects. seed: optional list of (t, x, y) points on the
+    one to treat as primary. The result's main is the primary object; every
+    falling object (primary first) is in .objects, each as its own result."""
     bg = background(frames) if bg is None else bg
     times = np.asarray(times, float)
-    dets = [detect(f, bg, roi=roi) for f in frames]
+    dets = [detect(f, bg, roi=roi,
+                   footprint=None if footprints is None else
+                   np.asarray(footprints[i], np.float32).reshape(-1, 1, 2))
+            for i, f in enumerate(frames)]
     tracks = link(dets, times)
     tracks = classify_and_score(tracks, times)
     dt = float(np.median(np.diff(times))) if len(times) > 1 else 1 / 30
@@ -569,24 +947,18 @@ def track_falling_object(frames, times, *, roi=None, bg=None, seed=None) -> Trac
     main = pick_seeded(moving, times, seed) if seed else None
     seeded = main is not None
     if main is None:
-        main = moving[0]
-    others = [t for t in moving if t is not main and t.score > 0.3 * main.score
-              and len(set(t.f) & set(main.f)) >= 6]
-    d_fine = refine_widths(frames, bg, main, times, max_n=120)
-    # A static blob where the fall begins = the object's resting spot (ghost).
-    rest, rest_d = None, None
-    f0 = main.dets[0]
-    t0 = float(times[f0.f])
-    for t in tracks:
-        if t.kind != "static":
-            continue
-        sx, sy = float(np.median(t.x)), float(np.median(t.y))
-        ts0, ts1 = float(times[t.dets[0].f]), float(times[t.dets[-1].f])
-        if np.hypot(sx - f0.x, sy - f0.y) < 2.5 * f0.d and ts0 - 0.1 <= t0 <= ts1 + 0.6:
-            mid = t.dets[len(t.dets) // 2]
-            wd = measure_width(frames[mid.f], bg, sx, sy, float(np.median(t.d)))
-            rest = Det(f=t.dets[0].f, x=sx, y=sy, d=wd, area=0, elong=1, contrast=0)
-            rest_d = wd if np.isfinite(wd) else None
-            break
-    return TrackResult(main, others, rest, rest_d, sum(len(d) for d in dets), d_fine,
-                       seeded=seeded, dets=dets, tracks=tracks)
+        # Prefer a track with a clean fall over a busier one without.
+        falling = [t for t in moving if t.falls and t.shadow_frac <= 0.5]
+        main = falling[0] if falling and falling[0].score >= 0.25 * moving[0].score else moving[0]
+    objs = select_objects(moving, times, main, max_n=max_objects) if max_objects > 1 else [main]
+    n_cand = sum(len(d) for d in dets)
+    results = []
+    for k, ob in enumerate(objs):
+        d_fine = refine_widths(frames, bg, ob, times, max_n=120)
+        rest, rest_d = _rest_spot(frames, bg, tracks, ob, times)
+        results.append(TrackResult(ob, [o for o in objs if o is not ob], rest, rest_d, n_cand,
+                                   d_fine, seeded=seeded and k == 0, dets=dets, tracks=tracks,
+                                   L_fine=refine_lengths(frames, bg, ob)))
+    for r in results:
+        r.objects = results
+    return results[0]

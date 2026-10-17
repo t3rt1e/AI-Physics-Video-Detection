@@ -203,6 +203,8 @@ class LiveSession:
         os.makedirs(self.dir, exist_ok=True)
         self.csv_path = os.path.join(data_dir, "drops.csv")
         self.kw = dict(analyze_kwargs or {"preset": "steel-38mm"})
+        # The tower drops one ball: measure just that, and keep the live loop quick.
+        self.kw.setdefault("max_objects", 1)
         self.on_update = on_update or (lambda msg: None)
         self.tail_s, self.pre_s = tail_s, pre_s
         self.scale_correction = scale_correction

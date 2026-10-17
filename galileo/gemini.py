@@ -68,16 +68,20 @@ can serve as a ruler.
 
 Return JSON only:
 {"object": short name, "is_round": true/false,
- "size_m": typical diameter in meters (for non-round objects, the width across
-           its narrowest visible side),
+ "size_m": for a ball or other round object its diameter in meters; for
+           anything else its longest dimension in meters,
  "size_rel_uncertainty": spread of that size across real examples, as a fraction
-           (a regulation basketball 0.02, a tennis ball 0.03, an apple 0.15),
+           (a regulation basketball 0.02, a tennis ball 0.03, an apple 0.15,
+           a smartphone 0.05, a book 0.15),
+ "terminal_speed_m_s": rough terminal speed in still air in m/s
+           (a ping-pong ball 8, a basketball 20, a smartphone 20, a golf ball 40),
  "confidence": 0-1 that the identification is right,
  "reason": one short sentence}"""
 
 
-def identify_object(frame_bgr: np.ndarray, xyd) -> dict | None:
-    """Ask Gemini what the falling object is and how big such objects are."""
+def identify_object(frame_bgr: np.ndarray, xyd, hint: str | None = None) -> dict | None:
+    """Ask Gemini what the falling object is and how big such objects are.
+    hint: what the person who filmed it says it is."""
     ok, why = available()
     if not ok:
         raise RuntimeError(why)
@@ -90,7 +94,11 @@ def identify_object(frame_bgr: np.ndarray, xyd) -> dict | None:
     boxed = frame_bgr.copy()
     cv2.rectangle(boxed, (int(x - d), int(y - d)), (int(x + d), int(y + d)), (0, 0, 255), 3)
     a, b = _jpeg(boxed), _jpeg(crop, 512)
-    key = "obj_" + hashlib.sha1(a + b + MODEL.encode()).hexdigest()[:20]
+    prompt = OBJECT_PROMPT
+    if hint:
+        prompt += (f"\n\nThe person who filmed it says it is: {hint}. Give the size of that "
+                   "object as it looks here.")
+    key = "obj_" + hashlib.sha1(a + b + MODEL.encode() + prompt.encode()).hexdigest()[:20]
     hit = _cache(key)
     if hit:
         return hit
@@ -98,7 +106,7 @@ def identify_object(frame_bgr: np.ndarray, xyd) -> dict | None:
     resp = _client().models.generate_content(
         model=MODEL,
         contents=[types.Part.from_bytes(data=a, mime_type="image/jpeg"),
-                  types.Part.from_bytes(data=b, mime_type="image/jpeg"), OBJECT_PROMPT],
+                  types.Part.from_bytes(data=b, mime_type="image/jpeg"), prompt],
         config=types.GenerateContentConfig(response_mime_type="application/json",
                                            temperature=0.1),
     )
@@ -110,9 +118,11 @@ def identify_object(frame_bgr: np.ndarray, xyd) -> dict | None:
            "size_m": float(data["size_m"]) if data.get("size_m") else None,
            "size_rel_uncertainty": float(data.get("size_rel_uncertainty", 0.1)),
            "confidence": float(data.get("confidence", 0.5)),
+           "terminal_speed_m_s": (float(data["terminal_speed_m_s"])
+                                  if data.get("terminal_speed_m_s") else None),
            "reason": str(data.get("reason", "")), "model": MODEL}
     if not out["is_round"]:
-        out["size_rel_uncertainty"] = max(out["size_rel_uncertainty"], 0.2)
+        out["size_rel_uncertainty"] = max(out["size_rel_uncertainty"], 0.1)
     _store(key, out)
     return out
 
@@ -150,7 +160,7 @@ def explain(result: dict) -> str | None:
         model=MODEL, contents=EXPLAIN_PROMPT.format(facts=json.dumps(facts, indent=1)),
         config=types.GenerateContentConfig(temperature=0.3),
     )
-    text = (resp.text or "").strip().replace("—", ",")
+    text = (resp.text or "").strip().replace("\u2014", ",")
     _store(key, {"text": text})
     return text
 

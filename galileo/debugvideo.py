@@ -14,8 +14,12 @@ Drawn on every frame of the measured stretch:
   red arrow       acceleration from the fit; the gold line beside it is 9.8 m/s^2
   cyan box        the patch decoded again at full resolution (zoom pass)
   white cross     your --seed pick
+  other colours   every other falling object Galileo measured, with its number,
+                  name and g; non-round objects also show their outline and a
+                  cross on the centre of mass Galileo followed
   readout         time, state, position, speed, fitted and local acceleration
   charts below    height and acceleration against time, with a cursor at this frame
+                  (for object 1, the primary)
 
 Text is plain ASCII (m/s^2, +/-) because OpenCV's fonts have nothing else.
 """
@@ -39,6 +43,7 @@ TRACK = (242, 168, 127)
 RED = (70, 70, 255)
 CYAN = (230, 210, 60)
 PANEL_BG = (24, 24, 24)
+OBJECT_COLORS = [(255, 120, 255), (120, 255, 120), (255, 255, 120), (120, 200, 255)]
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
@@ -125,6 +130,84 @@ def _fit_curve(fit, ta, tb, n=40):
     return tt, np.asarray(px, float), np.asarray(py, float)
 
 
+def _object_overlay(fin, g1, meta):
+    """Another object's track, fits and outline, in first-pass stabilized px."""
+    gf = fin["geo"]
+    r = gf.W / g1.W
+    t = np.asarray(fin["t"], float)
+    m_fac = np.asarray(fin["m_fac"], float)
+    cxp, cyp = gf.W / 2.0, gf.H / 2.0
+    lev = fin.get("lev")
+
+    def raw(tt, px, py):
+        m = np.interp(tt, t, m_fac)
+        qx, qy = cxp + (px - cxp) / m, cyp + (py - cyp) / m
+        if lev is not None and not lev.identity:
+            qx, qy = lev.backward(qx, qy)
+        return qx, qy
+    flights = fin["flights"]
+    flight_of = np.full(len(t), -1)
+    for q, idx in enumerate(flights):
+        flight_of[idx] = q
+    curves = []
+    for fr_ in fin["jf"].flights:
+        idx = fr_.idx
+        tt, px, py = _fit_curve(fr_.fit, t[idx[0]], t[idx[-1]])
+        px, py = raw(tt, px, py)
+        curves.append((tt, px / r, py / r))
+    xs, ys = raw(t, np.asarray(fin["xs"], float), np.asarray(fin["ys"], float))
+    dets = fin["tr"].main.dets
+    hulls = []
+    for dd in dets:
+        if dd.hull is None:
+            hulls.append(None)
+        else:
+            hulls.append((np.asarray(dd.hull, float) + [gf.ox, gf.oy]) / r)
+    v = meta.get("verdict") or {}
+    lab = f"{meta['n']}" + (f": {meta['label']}" if meta.get("label") else "")
+    if v.get("g") is not None:
+        lab += f"  g = {v['g']:.2f} ({v['verdict']})"
+    elif v.get("verdict"):
+        lab += f"  ({v['verdict']})"
+    return {"t": t, "X": np.asarray(fin["x"], float) / r, "Y": np.asarray(fin["y"], float) / r,
+            "CX": xs / r, "CY": ys / r, "D": np.asarray(fin["d"], float) / r,
+            "flight_of": flight_of, "curves": curves, "hulls": hulls,
+            "rigid": bool(fin.get("rigid")), "label": lab, "n": meta["n"]}
+
+
+def _draw_object(frame, ov, t_cur, dt, to_out, kx, fs, col, primary=False):
+    """Trail, fitted paths, outline and label of one object at time t_cur."""
+    if not primary:
+        for tt, px, py in ov["curves"]:
+            ox_, oy_ = to_out(px, py)
+            cv2.polylines(frame, [np.stack([ox_, oy_], 1).astype(np.int32)], False, col, 1,
+                          cv2.LINE_AA)
+        past = ov["t"] <= t_cur + 1e-9
+        if past.any():
+            ox_, oy_ = to_out(ov["CX"][past], ov["CY"][past])
+            for xo, yo, q in zip(ox_, oy_, ov["flight_of"][past]):
+                cv2.circle(frame, _pt(xo, yo), 2, col if q >= 0 else GREY, -1, cv2.LINE_AA)
+    jj = np.flatnonzero(np.abs(ov["t"] - t_cur) <= 0.5 * dt)
+    if not len(jj):
+        return
+    j = int(jj[0])
+    h = ov["hulls"][j] if ov["rigid"] else None
+    if h is not None and len(h) >= 3:
+        hx, hy = to_out(h[:, 0], h[:, 1])
+        cv2.polylines(frame, [np.stack([hx, hy], 1).astype(np.int32)], True, col, 1,
+                      cv2.LINE_AA)
+    cx, cy = to_out(ov["CX"][j], ov["CY"][j])
+    c = _pt(cx, cy)
+    if ov["rigid"]:
+        for dx_, dy_ in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            cv2.line(frame, c, (c[0] + 7 * dx_, c[1] + 7 * dy_), col, 2, cv2.LINE_AA)
+    elif not primary:
+        rad = max(5, int(0.5 * ov["D"][j] * kx) + 3) if np.isfinite(ov["D"][j]) else 8
+        cv2.circle(frame, c, rad, col, 2, cv2.LINE_AA)
+    rad = max(8, int(0.5 * np.nanmedian(ov["D"]) * kx) + 6) if np.isfinite(ov["D"]).any() else 12
+    _text(frame, ov["label"], (c[0] + rad, c[1] - rad), fs * 0.8, col)
+
+
 def render_debug_video(path, dbg, result, out_path, *, speed=1.0, max_side=1280):
     """Write the annotated MP4. dbg is what analyze() collected along the way."""
     if not dbg or "pass1" not in dbg:
@@ -162,10 +245,15 @@ def render_debug_video(path, dbg, result, out_path, *, speed=1.0, max_side=1280)
             flight_of[idx] = q
         good = glitch_mask(t, x, y, fin["d_ref"])
         cxp, cyp = gf.W / 2.0, gf.H / 2.0
+        lev = fin.get("lev")
 
         def raw(tt, px, py):
+            # Fit space (level view, scaled to one distance) -> stabilized px.
             m = np.interp(tt, t, m_fac)
-            return cxp + (px - cxp) / m, cyp + (py - cyp) / m
+            qx, qy = cxp + (px - cxp) / m, cyp + (py - cyp) / m
+            if lev is not None and not lev.identity:
+                qx, qy = lev.backward(qx, qy)
+            return qx, qy
 
         u = xs * gdir[0] + ys * gdir[1]
         # Local acceleration: a parabola through about +-40 ms around each point.
@@ -207,6 +295,20 @@ def render_debug_video(path, dbg, result, out_path, *, speed=1.0, max_side=1280)
                  excluded=set(fin.get("excluded") or ()),
                  push_from=(t[flights[0][0]] - launch.get("trim_s", 0.0) - 0.5 * dt)
                  if flights and launch.get("trim_s") else None)
+
+    # ---- the other objects --------------------------------------------------------
+    objs_meta = dbg.get("objects") or []
+    extras, prim_ov = [], None
+    for k, om in enumerate(objs_meta):
+        if not om.get("final"):
+            continue
+        ov = _object_overlay(om["final"], g1, om)
+        if k == 0:
+            prim_ov = ov
+        else:
+            extras.append(ov)
+    show_prim_label = prim_ov is not None and (extras or prim_ov["rigid"])
+    obj_tracks = {id(o.main) for o in (tr1.objects or [])}
 
     # ---- decode and draw ---------------------------------------------------------
     out_scale = min(1.0, max_side / max(info.width, info.height, 1))
@@ -262,7 +364,7 @@ def render_debug_video(path, dbg, result, out_path, *, speed=1.0, max_side=1280)
         # Other tracks from the first pass, while they are active.
         main1 = tr1.main
         for o in (tr1.tracks or [])[:12]:
-            if o is main1 or o.kind != "moving":
+            if o is main1 or o.kind != "moving" or (extras and id(o) in obj_tracks):
                 continue
             tt = times1[o.f]
             if tt[0] > t_cur or tt[-1] < t_cur - 0.3:
@@ -317,7 +419,8 @@ def render_debug_video(path, dbg, result, out_path, *, speed=1.0, max_side=1280)
                 cv2.circle(frame, _pt(ox_, oy_), rad, col, 2, cv2.LINE_AA)
                 gf = fin["geo"]
                 fxo, fyo = g1.to_frame(fi1, T["X"][j], T["Y"][j])
-                hud.append(f"ball at x = {fxo / g1.W:.3f}, y = {fyo / g1.H:.3f} of the frame, "
+                what = "object" if fin.get("rigid") else "ball"
+                hud.append(f"{what} at x = {fxo / g1.W:.3f}, y = {fyo / g1.H:.3f} of the frame, "
                            f"{T['D'][j] * T['r']:.1f} px wide")
                 if q >= 0 and q in T["excluded"]:
                     state = (f"flight {q + 1} of {len(T['curves'])} (thrown: fitted, but the "
@@ -346,15 +449,18 @@ def render_debug_video(path, dbg, result, out_path, *, speed=1.0, max_side=1280)
             if qa >= 0:
                 fr_ = jf.flights[qa]
                 vx, vy = fr_.fit.vel(t_cur - fr_.fit.t0)
-                px_, py_ = fr_.fit.pos(t_cur - fr_.fit.t0)
-                (px_,), (py_,) = raw(np.array([t_cur]), np.array([px_]), np.array([py_]))
-                bx, by = to_out(px_ / T["r"], py_ / T["r"])
+                fx_, fy_ = fr_.fit.pos(t_cur - fr_.fit.t0)
+
+                def out_pt(qx, qy):
+                    (qx,), (qy,) = raw(np.array([t_cur]), np.array([qx]), np.array([qy]))
+                    return to_out(qx / T["r"], qy / T["r"])
+                bx, by = out_pt(fx_, fy_)
                 v_down = vx * gdir[0] + vy * gdir[1]
                 v_side = -vx * gdir[1] + vy * gdir[0]
                 sp = float(np.hypot(vx, vy))
                 # Arrow: where the fit says it goes in 0.1 s of real time.
-                ax_ = vx / T["r"] * kx * 0.1 * k
-                ay_ = vy / T["r"] * ky * 0.1 * k
+                ex_, ey_ = out_pt(fx_ + vx * 0.1 * k, fy_ + vy * 0.1 * k)
+                ax_, ay_ = float(ex_ - bx), float(ey_ - by)
                 L = float(np.hypot(ax_, ay_))
                 cap = 0.35 * H
                 if L > cap:
@@ -373,13 +479,24 @@ def render_debug_video(path, dbg, result, out_path, *, speed=1.0, max_side=1280)
                 if s_m:
                     la = ref * abs(a_corr * a_unit) / g_ref
                     am = float(np.hypot(*a_vec))
-                    ux, uy = (a_vec / am) if am > 0 else (0.0, 1.0)
+                    ua = (a_vec / am) if am > 0 else np.array([0.0, 1.0])
+
+                    def out_dir(u_):
+                        # A direction in fit space, as it shows in the picture here.
+                        e = 0.25 * max(float(np.nanmedian(T["D"])) if np.isfinite(T["D"]).any()
+                                       else 4.0, 2.0) * T["r"]
+                        qx, qy = out_pt(fx_ + u_[0] * e, fy_ + u_[1] * e)
+                        dx_, dy_ = float(qx - bx), float(qy - by)
+                        nn = float(np.hypot(dx_, dy_))
+                        return (dx_ / nn, dy_ / nn) if nn > 0 else (float(u_[0]), float(u_[1]))
+                    ux, uy = out_dir(ua)
+                    gx_, gy_ = out_dir(gdir)
                     off = rad + 4 if len(jj) else 10
                     sx_, sy_ = bx + off, by
                     cv2.arrowedLine(frame, _pt(sx_, sy_), _pt(sx_ + ux * la, sy_ + uy * la),
                                     RED, 2, cv2.LINE_AA, tipLength=0.2)
-                    cv2.line(frame, _pt(sx_ + 6, sy_), _pt(sx_ + 6 + gdir[0] * ref,
-                                                           sy_ + gdir[1] * ref), GOLD, 1,
+                    cv2.line(frame, _pt(sx_ + 6, sy_), _pt(sx_ + 6 + gx_ * ref,
+                                                           sy_ + gy_ * ref), GOLD, 1,
                              cv2.LINE_AA)
                 hud.append(f"v = {sp * v_unit:.2f} {unit_v}   (down {v_down * v_unit:+.2f}, "
                            f"sideways {v_side * v_unit:+.2f})")
@@ -390,14 +507,22 @@ def render_debug_video(path, dbg, result, out_path, *, speed=1.0, max_side=1280)
                 if j is not None and np.isfinite(T["a_loc"][j]):
                     hud.append(f"a local (+/-{1000 * w * dt:.0f} ms) = {T['a_loc'][j] * a_unit:.2f}"
                                f" +/- {T['a_loc_s'][j] * a_unit:.2f} {unit_a}")
+        for q, ov in enumerate(extras):
+            _draw_object(frame, ov, t_cur, dt, to_out, kx, fs,
+                         OBJECT_COLORS[q % len(OBJECT_COLORS)])
+        if show_prim_label:
+            _draw_object(frame, prim_ov, t_cur, dt, to_out, kx, fs, WHITE, primary=True)
         hud.insert(1, f"state: {state}")
         hud.append(f"candidates in this frame: {n_cand}")
+        if extras:
+            hud.append("objects: " + "   ".join(
+                ov["label"] for ov in ([prim_ov] if prim_ov else []) + extras))
 
         # Your pick.
         if dbg.get("seed"):
             ts_, sx1, sy1 = dbg["seed"][0]
             if abs(ts_ - t_cur) <= max(0.1, dt):
-                ox_, oy_ = to_out(sx1, sy1)
+                ox_, oy_ = to_out(sx1 + g1.ox, sy1 + g1.oy)
                 c = _pt(ox_, oy_)
                 for dx_, dy_ in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                     cv2.line(frame, (c[0] + 4 * dx_, c[1] + 4 * dy_),

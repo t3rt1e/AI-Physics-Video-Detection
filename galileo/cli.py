@@ -15,6 +15,7 @@ import argparse
 import csv
 import glob
 import json
+import math
 import os
 import sys
 import time
@@ -56,11 +57,73 @@ def _seed(tokens):
     return tuple(v)
 
 
+def _objects(tokens):
+    """--object names, one per object: a known name ("tennis", "rotisserie
+    chicken"), anything else with its size ("grandma's vase=31cm"), or auto.
+    Commas separate objects too (PowerShell splits them anyway)."""
+    if not tokens:
+        return None
+    from .identify import parse_name, resolve
+    names = [p.strip() for tok in tokens for p in str(tok).replace(";", ",").split(",")
+             if p.strip()]
+    out = []
+    for n in names:
+        if n.lower() in ("auto", "?"):
+            out.append(None)
+            continue
+        name, size = parse_name(n)
+        if not resolve(name) and not size:
+            print(f"Note: '{name}' isn't a known object, so it has no size. Add one like "
+                  f'"{name}=22cm" for a ruler.', file=sys.stderr)
+        out.append(n)
+    return out
+
+
 def _analyze_kwargs(a):
-    return dict(preset=a.object, size_m=a.size_mm / 1000 if a.size_mm else None,
+    return dict(preset=_objects(a.object), size_m=a.size_mm / 1000 if a.size_mm else None,
                 size_rel_unc=a.size_unc, use_gemini=a.gemini, use_depth=a.depth,
                 tracker="sam2" if a.sam2 else "classical",
-                scale_correction=a.scale_correction, zoom=not a.no_zoom, drag_vt=a.drag_vt)
+                scale_correction=a.scale_correction, zoom=not a.no_zoom, drag_vt=a.drag_vt,
+                identify_mode=a.identify, max_objects=a.max_objects, hfov=a.hfov,
+                camera_pitch=a.pitch, camera_roll=a.roll,
+                camera_mode="upright" if a.upright else "auto")
+
+
+def _camera_line(r) -> str | None:
+    """One line on how the camera was held, when it matters."""
+    c = r.get("camera") or {}
+    parts = []
+    if c.get("pitched"):
+        b = c.get("pitch") or 0.0
+        parts.append(f"looks {'down' if b > 0 else 'up'} {abs(b):.0f}° "
+                     f"(± {max(c.get('pitch_sigma') or 0, 0.5):.0f}°, from {c.get('pitch_source')})")
+    if c.get("rolled"):
+        parts.append(f"rolled {c.get('roll', 0):.0f}°")
+    if not parts:
+        return None
+    fr = c.get("f_frac") or 0
+    hfov = 2 * math.degrees(math.atan(0.5 / fr)) if fr else 0
+    return (f"Camera: {', '.join(parts)}; field of view {hfov:.0f}° ({c.get('f_source')}). "
+            "Measured in a level view.")
+
+
+def _obj_line(o) -> str:
+    v = o["verdict"]
+    name = o.get("label") or "unknown object"
+    idn = o.get("identity") or {}
+    src = idn.get("source")
+    how = {"you": "you said", None: "not identified"}.get(src, src)
+    if src in ("CLIP", "Gemini") and idn.get("confidence") is not None:
+        how += f", {100 * idn['confidence']:.0f}% sure"
+    shape = "round" if o.get("shape") == "round" else "not round"
+    g = f"g = {v['g']:.2f} +/- {v['sigma']:.2f} m/s^2" if v.get("g") is not None else "no g"
+    line = f"Object {o['n']}: {name} ({shape}; {how}): {v['verdict']}, {g}"
+    if v["verdict"] == "UNSURE":
+        line += f" [{v.get('stage')}]"
+    sp = o.get("spin") or {}
+    if sp.get("applied"):
+        line += f"; centre of mass {sp['offset_px']:.0f} px off its outline's centre"
+    return line
 
 
 def _debug_path(clip, where):
@@ -85,6 +148,11 @@ def cmd_analyze(a):
     print(v["headline"])
     for line in v["reasons"]:
         print("  -", line)
+    objs = r.get("objects") or []
+    if len(objs) > 1 or (objs and objs[0].get("shape") != "round"):
+        print()
+        for o in objs:
+            print(_obj_line(o))
     if v.get("explanation"):
         print("\n" + v["explanation"])
     if v.get("stage") and v["verdict"] == "UNSURE":
@@ -92,6 +160,9 @@ def cmd_analyze(a):
     clk = r.get("clock") or {}
     if clk.get("source"):
         print(f"\nClock: {clk['source']} -> k = {clk['k']:.2f}")
+    cam_line = _camera_line(r)
+    if cam_line:
+        print(cam_line)
     if r.get("scale"):
         for ru in r["scale"]["rulers"]:
             print(f"Ruler: {ru['name']}: {ru['detail']} (±{ru['rel_sigma'] * 100:.1f}%)")
@@ -135,8 +206,8 @@ def cmd_batch(a):
     if a.json_dir:
         os.makedirs(a.json_dir, exist_ok=True)
     cols = ["file", "verdict", "confidence", "g", "sigma", "g_as_played", "k", "stage",
-            "ball_px", "zoomed", "frames", "fps", "flights", "drag_pct", "headline", "notes",
-            "debug_video"]
+            "object", "ball_px", "zoomed", "frames", "fps", "flights", "drag_pct",
+            "camera_pitch", "camera_roll", "other_objects", "headline", "notes", "debug_video"]
     rows = []
     kw = _analyze_kwargs(a)
     for i, p in enumerate(paths, 1):
@@ -166,6 +237,15 @@ def cmd_batch(a):
             "drag_pct": round(100 * (drag["factor"] - 1), 1) if drag else None,
             "headline": v.get("headline"), "notes": " | ".join(r.get("notes", [])),
             "debug_video": r.get("debug_video"),
+            "object": (r.get("objects") or [{}])[0].get("label"),
+            "camera_pitch": round((r.get("camera") or {}).get("pitch") or 0.0, 1)
+            if (r.get("camera") or {}).get("pitched") else 0.0,
+            "camera_roll": round((r.get("camera") or {}).get("roll") or 0.0, 1)
+            if (r.get("camera") or {}).get("rolled") else 0.0,
+            "other_objects": " | ".join(
+                f"{o['n']}: {o.get('label') or '?'} {o['verdict']['verdict']}"
+                + (f" g={o['g']:.2f}" if o.get("g") is not None else "")
+                for o in (r.get("objects") or [])[1:]),
         }
         rows.append(row)
         g = f"g = {row['g']:.2f}" if row["g"] is not None else "no g"
@@ -285,10 +365,22 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def measure_opts(s):
-        s.add_argument("--object", default=None, choices=sorted(C.OBJECT_PRESETS),
-                       help="known object to use as the ruler (ping-pong also corrects for "
-                            "air drag)")
-        s.add_argument("--size-mm", type=float, help="object diameter in mm (instead of --object)")
+        s.add_argument("--object", nargs="+", metavar="NAME",
+                       help="what the falling object is, for its size (the ruler) and air drag. "
+                            "Any name: a known one (tennis, phone, rotisserie chicken, and a few "
+                            "hundred more; see galileo/catalog.py) or anything with its size, "
+                            'e.g. "grandma\'s vase=31cm" (mm, cm, m, in, ft). Several objects: '
+                            "one name each, e.g. --object tennis basketball (matched to the "
+                            "objects by how they look, or by size). Leave out, or say auto, to "
+                            "let Galileo work it out")
+        s.add_argument("--identify", default="auto", choices=["auto", "clip", "gemini", "off"],
+                       help="how to name objects you didn't: auto (Gemini with --gemini, else "
+                            "CLIP if installed), or off")
+        s.add_argument("--max-objects", type=int, default=C.MAX_OBJECTS,
+                       help="how many falling objects to measure (1 = only the main one)")
+        s.add_argument("--size-mm", type=float,
+                       help="object size in mm (instead of --object): a ball's diameter, or "
+                            "the longest side of anything else")
         s.add_argument("--size-unc", type=float, default=0.01, help="relative size uncertainty")
         s.add_argument("--drag-vt", type=float,
                        help="terminal speed in m/s for the air-drag correction "
@@ -299,6 +391,17 @@ def main(argv=None):
         s.add_argument("--depth", action="store_true", help="add Depth Pro as a second ruler")
         s.add_argument("--sam2", action="store_true", help="track with SAM 2 instead")
         s.add_argument("--scale-correction", type=float, default=1.0)
+        s.add_argument("--hfov", type=float, metavar="DEG",
+                       help="the camera's field of view across the picture's long side, if "
+                            "known (a phone's main camera is about 65-75; it sharpens the "
+                            "answer when the camera looks down or up at the fall)")
+        s.add_argument("--pitch", type=float, metavar="DEG",
+                       help="how far the camera looked down (+) or up (-) from level, if known "
+                            "(otherwise read from the room's lines and the ball itself)")
+        s.add_argument("--roll", type=float, metavar="DEG",
+                       help="how far the camera was turned about its own axis, if known")
+        s.add_argument("--upright", action="store_true",
+                       help="assume a level, upright camera (skip working out its angle)")
 
     s = sub.add_parser("analyze", help="measure one clip")
     s.add_argument("clip")

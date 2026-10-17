@@ -14,6 +14,8 @@ const VERDICT = {
   UNSURE: { word: "Can't tell", icon: "?" },
 };
 const STATUS_MARK = { pass: "✓", warn: "!", fail: "✕", skip: "–" };
+// Other falling objects in the overlay (the first one uses the clip colour).
+const OBJECT_COLORS = ["#c0399b", "#2f8f3a", "#b8860b", "#1f6fb2"];
 const STATUS_WORD = { pass: "Pass", warn: "Caution", fail: "Fail", skip: "Not tested" };
 
 let STATUS = null;
@@ -99,6 +101,7 @@ class Panel {
       chart: q(".chart-canvas"), tip: q(".tooltip"), tests: q(".tests tbody"), facts: q(".facts"),
       pointsBody: q(".points tbody"), pickBtn: q(".pick"), pickClear: q(".pick-clear"),
       pickHint: q(".pick-hint"), pickLayer: q(".pick-layer"), wrap: q(".video-wrap"),
+      objTable: q(".objects"), objBody: q(".objects tbody"), keyMore: q(".key-more"),
     });
     this.result = null;
     this.clipId = null;
@@ -162,17 +165,41 @@ class Panel {
 
   fillObjects() {
     this.objSel.innerHTML = "";
-    const add = (v, t) => { const o = document.createElement("option"); o.value = v; o.textContent = t; this.objSel.appendChild(o); };
-    for (const [k, label] of Object.entries(STATUS.presets)) add(k, label);
+    const add = (v, t, parent = this.objSel) => {
+      const o = document.createElement("option"); o.value = v; o.textContent = t; parent.appendChild(o);
+    };
+    const auto = STATUS.auto_id || {};
+    add("auto", auto.clip ? "Work it out (recognise each object)" : "Work it out (needs CLIP or Gemini)");
+    const shapes = STATUS.shapes || {};
+    for (const [title, want] of [["Balls (diameter)", "round"], ["Other objects (longest side)", "rigid"]]) {
+      const og = document.createElement("optgroup");
+      og.label = title;
+      for (const [k, label] of Object.entries(STATUS.presets)) {
+        if ((shapes[k] || "round") === want) add(k, label, og);
+      }
+      if (og.children.length) this.objSel.appendChild(og);
+    }
     add("custom", "Known size (enter mm)…");
+    add("other", "Something else (name it)…");
     if (STATUS.gemini.available) add("gemini", "Ask Gemini what it is");
     this.objSel.value = STATUS.default_object;
     this.sizeMm = null;
+    this.otherName = null;
   }
 
   onObject() {
+    if (this.objSel.value === "other") {
+      // Anything at all: a name, and its size if you know it ("rotisserie chicken 22cm").
+      const v = window.prompt("What is falling? Add its size if you know it (a ball's diameter, or the longest side), e.g. \"rotisserie chicken 22cm\":", this.otherName || "");
+      const txt = (v || "").trim();
+      if (!txt) { this.objSel.value = STATUS.default_object; return; }
+      const m = txt.match(/^(.*?)[\s=:]+([0-9.]+)\s*(mm|cm|m|in|inch|inches|ft)?$/i);
+      this.otherName = m ? `${m[1].trim()}=${m[2]}${(m[3] || "mm").toLowerCase()}` : txt;
+      const o = [...this.objSel.options].find((x) => x.value === "other");
+      if (o) o.textContent = `Something else: ${txt}`;
+    }
     if (this.objSel.value === "custom") {
-      const v = window.prompt("Diameter of the falling object in millimetres:", this.sizeMm || "38");
+      const v = window.prompt("Size of the falling object in millimetres (a ball's diameter, or the longest side of anything else):", this.sizeMm || "38");
       const mm = parseFloat(v);
       if (!(mm > 0)) { this.objSel.value = STATUS.default_object; return; }
       this.sizeMm = mm;
@@ -279,7 +306,8 @@ class Panel {
     const t0 = performance.now();
     try {
       const body = {
-        clip: id, object: this.objSel.value, size_mm: this.sizeMm,
+        clip: id, object: this.objSel.value === "other" ? this.otherName : this.objSel.value,
+        size_mm: this.sizeMm,
         gemini: STATUS.gemini.default_on || this.objSel.value === "gemini", force,
         seed: this.seed,
       };
@@ -342,6 +370,7 @@ class Panel {
     // Lost the ball? Point at the pick button.
     const stage = v.stage || "";
     this.pickBtn.classList.toggle("suggest", stage.startsWith("tracking") && !this.seed);
+    this.renderObjects(r);
     this.renderTests(r.tests || []);
     this.renderFacts(r);
     this.renderPoints(r);
@@ -358,6 +387,43 @@ class Panel {
       for (let i = 1; i < ts.length; i++) d.push(ts[i] - ts[i - 1]);
       d.sort((a, b) => a - b);
       this.dtTol = Math.max(0.6 * d[d.length >> 1], 0.005);
+    }
+  }
+
+  renderObjects(r) {
+    const objs = r.objects || [];
+    const show = objs.length > 1 || (objs.length === 1 && objs[0].shape !== "round");
+    this.objTable.hidden = !show;
+    this.keyMore.hidden = objs.length < 2;
+    this.objBody.innerHTML = "";
+    if (!show) return;
+    for (const o of objs) {
+      const v = o.verdict || {};
+      const tr = document.createElement("tr");
+      const n = document.createElement("td");
+      const sw = document.createElement("span");
+      sw.className = "swatch";
+      sw.style.background = o.n === 1 ? COLORS.clipPlate : OBJECT_COLORS[(o.n - 2) % OBJECT_COLORS.length];
+      n.append(sw, String(o.n));
+      const name = document.createElement("td");
+      const idn = o.identity || {};
+      const src = idn.source;
+      let how = !src ? "not recognised" : src === "you" ? "you said" : src;
+      if ((src === "CLIP" || src === "Gemini") && idn.confidence != null) how += `, ${Math.round(idn.confidence * 100)}% sure`;
+      how += o.shape === "round" ? "; round" : "; not round, followed by its centre of mass";
+      if (o.spin && o.spin.applied) how += ` (${o.spin.offset_px.toFixed(0)} px off its outline's centre)`;
+      name.textContent = o.label || "Unknown object";
+      const sm = document.createElement("span");
+      sm.className = "how";
+      sm.textContent = how;
+      name.appendChild(sm);
+      const g = document.createElement("td");
+      g.textContent = v.g != null ? fmtG(v.g, v.sigma) : "–";
+      const res = document.createElement("td");
+      const vv = VERDICT[v.verdict] || VERDICT.UNSURE;
+      res.textContent = v.verdict === "UNSURE" ? `${vv.word}: ${(v.headline || "").replace(/^Can't tell: /, "")}` : vv.word;
+      tr.append(n, name, g, res);
+      this.objBody.appendChild(tr);
     }
   }
 
@@ -405,7 +471,16 @@ class Panel {
       add("Flights", fit.flights.map((x) => `${x.n} frames`).join(", "));
     }
     if (r.drag && Math.abs(r.drag.factor - 1) > 0.005) add("Air drag", `corrected ${((r.drag.factor - 1) * 100).toFixed(1)}% (top speed ${r.drag.vt.toFixed(1)} m/s)`);
-    if (r.stabilization && r.stabilization.applied) add("Camera motion", `removed (drifted ${r.stabilization.max_drift_px.toFixed(0)} px)`);
+    if (r.stabilization && r.stabilization.applied) add("Camera motion", `removed (${r.stabilization.model === "homography" ? "pans and turns, with perspective" : "shake and drift"}; moved up to ${r.stabilization.max_drift_px.toFixed(0)} px)`);
+    const cam = r.camera || {};
+    if (cam.pitched || cam.rolled) {
+      const bits = [];
+      if (cam.pitched) bits.push(`looks ${cam.pitch > 0 ? "down" : "up"} ${Math.abs(cam.pitch).toFixed(0)}° (from ${cam.pitch_source})`);
+      if (cam.rolled) bits.push(`rolled ${Math.abs(cam.roll).toFixed(0)}°`);
+      const hfov = cam.f_frac ? 2 * Math.atan(0.5 / cam.f_frac) * 180 / Math.PI : null;
+      add("Camera angle", bits.join(", ") + `; measured in a level view` + (hfov ? ` (field of view ${hfov.toFixed(0)}°, ${cam.f_source})` : ""));
+    }
+    if (r.fit && r.fit.camera_error_rel > 0.02) add("Camera uncertainty", `±${(r.fit.camera_error_rel * 100).toFixed(0)}% on g (mostly the lens's field of view; give it for a tighter answer)`);
     if (r.elapsed_s != null) add("Time to measure", `${r.elapsed_s.toFixed(1)} s`);
   }
 
@@ -485,6 +560,38 @@ class Panel {
       ctx.beginPath();
       ctx.arc(ox + cur.x * dw, oy + cur.y * dh, rad, 0, Math.PI * 2);
       ctx.stroke();
+      if ((r.objects || []).length > 1) {
+        ctx.fillStyle = COLORS.clipPlate;
+        ctx.font = `600 13px ${COLORS.sans}`;
+        ctx.fillText("1", ox + cur.x * dw + rad + 3, oy + cur.y * dh - rad);
+      }
+    }
+    // Every other falling object: its trail, a ring, and its number.
+    const objs = r.objects || [];
+    for (const o of objs.slice(1)) {
+      const op = (o.track && o.track.points) || [];
+      if (!op.length) continue;
+      const col = OBJECT_COLORS[(o.n - 2) % OBJECT_COLORS.length];
+      ctx.fillStyle = col;
+      ctx.globalAlpha = 0.55;
+      for (const p of op) {
+        if (p.t > t + 1e-4) break;
+        ctx.beginPath();
+        ctx.arc(ox + p.x * dw, oy + p.y * dh, 2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+      const c = nearestByT(op, t);
+      if (c && Math.abs(c.t - t) <= this.dtTol) {
+        const rr = Math.max(7, c.r * dw + 4);
+        ctx.strokeStyle = col;
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.arc(ox + c.x * dw, oy + c.y * dh, rr, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.font = `600 13px ${COLORS.sans}`;
+        ctx.fillText(String(o.n), ox + c.x * dw + rr + 3, oy + c.y * dh - rr);
+      }
     }
   }
 

@@ -12,11 +12,12 @@ G_EARTH = 9.80
 G_GAINESVILLE = 9.793
 
 # Known objects that can act as their own ruler. size_m is the diameter for
-# balls. rel_unc is the relative spread of that size across real objects.
-# Known objects that can act as their own ruler. size_m is the diameter for
-# balls. rel_unc is the relative spread of that size across real objects.
-# vt is the terminal speed in still air (m/s): light balls feel enough drag to
-# read low, and Galileo corrects for it when vt is known.
+# balls and the longest side for everything else (shape "rigid": its outline
+# changes as it tumbles, so it is measured differently, see galileo/shape.py).
+# rel_unc is the relative spread of that size across real objects. vt is the
+# terminal speed in still air (m/s): light objects feel enough drag to read
+# low, and Galileo corrects for it when vt is known. For tumbling objects vt
+# is a rough average over the ways they can face the air.
 OBJECT_PRESETS = {
     "steel-38mm": {"label": "38 mm steel ball", "size_m": 0.038, "rel_unc": 0.002, "vt": 150.0},
     "steel-25mm": {"label": "25 mm steel ball", "size_m": 0.025, "rel_unc": 0.002, "vt": 120.0},
@@ -32,7 +33,38 @@ OBJECT_PRESETS = {
     "pickleball": {"label": "pickleball", "size_m": 0.074, "rel_unc": 0.015, "vt": 15.0},
     "apple": {"label": "apple", "size_m": 0.075, "rel_unc": 0.15, "vt": 40.0},
     "orange": {"label": "orange", "size_m": 0.075, "rel_unc": 0.15, "vt": 40.0},
+    # Not round: size_m is the longest side.
+    "phone": {"label": "smartphone", "size_m": 0.152, "rel_unc": 0.05, "vt": 20.0,
+              "shape": "rigid"},
+    "tablet": {"label": "tablet", "size_m": 0.247, "rel_unc": 0.06, "vt": 17.0, "shape": "rigid"},
+    "book": {"label": "book", "size_m": 0.23, "rel_unc": 0.15, "vt": 18.0, "shape": "rigid"},
+    "cards": {"label": "deck of cards", "size_m": 0.089, "rel_unc": 0.02, "vt": 16.0,
+              "shape": "rigid"},
+    "water-bottle": {"label": "water bottle", "size_m": 0.21, "rel_unc": 0.10, "vt": 27.0,
+                     "shape": "rigid"},
+    "soda-can": {"label": "soda can", "size_m": 0.122, "rel_unc": 0.03, "vt": 30.0,
+                 "shape": "rigid"},
+    "remote": {"label": "TV remote", "size_m": 0.18, "rel_unc": 0.15, "vt": 15.0, "shape": "rigid"},
+    "pen": {"label": "pen", "size_m": 0.14, "rel_unc": 0.08, "vt": 11.0, "shape": "rigid"},
+    "pencil": {"label": "pencil", "size_m": 0.19, "rel_unc": 0.06, "vt": 9.0, "shape": "rigid"},
+    "banana": {"label": "banana", "size_m": 0.19, "rel_unc": 0.12, "vt": 19.0, "shape": "rigid"},
+    "egg": {"label": "egg", "size_m": 0.057, "rel_unc": 0.07, "vt": 36.0, "shape": "rigid"},
+    "shoe": {"label": "shoe", "size_m": 0.28, "rel_unc": 0.12, "vt": 14.0, "shape": "rigid"},
+    "football": {"label": "American football", "size_m": 0.28, "rel_unc": 0.03, "vt": 25.0,
+                 "shape": "rigid"},
 }
+
+# A non-round object's ruler is never trusted to better than this: a tumbling
+# object is often seen foreshortened, and blur can stretch its outline.
+RIGID_MIN_REL_UNC = 0.06
+
+# Objects measured per clip (the primary one plus others that fall).
+MAX_OBJECTS = 4
+
+# Automatic identification. CLIP is a pretrained image-text model that runs
+# offline; it only names objects it is fairly sure of.
+CLIP_MODEL = "openai/clip-vit-base-patch32"
+CLIP_MIN_PROB = 0.35
 
 # Verdict thresholds -------------------------------------------------------
 
