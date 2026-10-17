@@ -46,12 +46,51 @@ class Motion:
     vx: float = 0.0                 # m/s sideways drift
     pan: tuple = (0.0, 0.0)         # camera drift, px/s
     zoom_rate: float = 0.0          # fractional zoom per second
+    vt: float | None = None         # terminal speed for quadratic air drag (ping-pong ~8.4 m/s)
+    kick: float = 0.0               # random sideways speed change at each bounce, m/s (sd)
+    hand: bool = False              # a hand that holds the ball, then pulls away
+    shake: float = 0.0              # handheld camera sway, px (rough amplitude)
+
+
+def _integrate(m: Motion, sc: Scene, t_end: float):
+    """2D flight with quadratic drag and messy bounces, on a fine time grid."""
+    dt = 2e-4
+    n = int(t_end / dt) + 2
+    ppm = sc.px_per_m
+    x0 = sc.width / 2 if sc.x0 is None else sc.x0
+    X = np.empty(n)
+    Y = np.empty(n)
+    px = py = 0.0
+    vx, vy = m.vx, 0.0
+    floor = None if sc.floor_y is None or m.restitution is None else (sc.floor_y - sc.y0) / ppm
+    kdrag = m.g / m.vt**2 if m.vt else 0.0
+    rng = np.random.default_rng(sc.seed + 17)
+    for i in range(n):
+        X[i] = x0 + px * ppm
+        Y[i] = sc.y0 + py * ppm
+        sp = math.hypot(vx, vy)
+        vx += -kdrag * sp * vx * dt
+        vy += (m.g - kdrag * sp * vy) * dt
+        px += vx * dt
+        py += vy * dt
+        if floor is not None and py >= floor and vy > 0:
+            py = 2 * floor - py
+            vy = -m.restitution * vy
+            vx += rng.normal(0.0, m.kick) if m.kick else 0.0
+    return np.arange(n) * dt, X, Y
 
 
 def _trajectory(m: Motion, sc: Scene, t: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Ball centre (x, y) in px at times t (s)."""
     x0 = sc.width / 2 if sc.x0 is None else sc.x0
     tr = np.clip(t - m.t_release, 0, None)
+    if m.vt or m.kick:
+        path = getattr(m, "_path", None)
+        if path is None or path[0][-1] < float(np.max(tr)):
+            path = _integrate(m, sc, max(float(np.max(tr)) + 0.5, 3.0))
+            m._path = path
+        g, X, Y = path
+        return np.interp(tr, g, X), np.interp(tr, g, Y)
     if m.accel_fn is not None:
         dt = 1e-4
         grid = np.arange(0, max(float(tr.max()), 0) + 2 * dt, dt)
@@ -149,15 +188,43 @@ def render_frame(t_frame: float, m: Motion, sc: Scene, bg: np.ndarray, rng, *,
         ball = np.asarray(sc.ball_bgr, np.float32)[None, None, :] * lum[:, :, None]
         reg = img[r0:r1 + 1, c0:c1 + 1]
         img[r0:r1 + 1, c0:c1 + 1] = reg * (1 - cov[:, :, None]) + ball * cov[:, :, None]
+    if m.hand:
+        _draw_hand(img, t_frame, m, sc)
     if sc.psf_sigma > 0:
         img = cv2.GaussianBlur(img, (0, 0), sc.psf_sigma)
-    if m.pan != (0.0, 0.0) or m.zoom_rate:
+    if m.pan != (0.0, 0.0) or m.zoom_rate or m.shake:
         z = 1.0 + m.zoom_rate * t_frame
-        A = np.array([[z, 0, (1 - z) * w / 2 + m.pan[0] * t_frame],
-                      [0, z, (1 - z) * h / 2 + m.pan[1] * t_frame]], np.float32)
+        sx, sy = _shake(t_frame, m.shake, sc.seed) if m.shake else (0.0, 0.0)
+        A = np.array([[z, 0, (1 - z) * w / 2 + m.pan[0] * t_frame + sx],
+                      [0, z, (1 - z) * h / 2 + m.pan[1] * t_frame + sy]], np.float32)
         img = cv2.warpAffine(img, A, (w, h), borderMode=cv2.BORDER_REPLICATE)
     img += rng.normal(0, sc.noise, img.shape).astype(np.float32)
     return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def _shake(t: float, amp: float, seed: int) -> tuple[float, float]:
+    """Smooth handheld sway: a few slow wobbles and a faster tremor."""
+    rng = np.random.default_rng(seed + 99)
+    f = rng.uniform([0.4, 0.9, 2.0, 5.0], [0.8, 1.6, 3.5, 8.0])
+    ph = rng.uniform(0, 2 * np.pi, (2, 4))
+    a = amp * np.array([0.6, 0.35, 0.2, 0.08])
+    return (float(np.sum(a * np.sin(2 * np.pi * f * t + ph[0]))),
+            float(np.sum(a * np.sin(2 * np.pi * f * t + ph[1]))))
+
+
+def _draw_hand(img, t, m: Motion, sc: Scene):
+    """A skin-toned block gripping the top of the ball, pulled up and away after release."""
+    R = 0.5 * sc.ball_d_m * sc.px_per_m
+    x0 = sc.width / 2 if sc.x0 is None else sc.x0
+    dt = max(0.0, t - m.t_release - 0.03)
+    away = min(dt, 0.35)
+    cx = x0 + 0.9 * away * sc.px_per_m          # pulls away sideways...
+    cy = sc.y0 - 1.6 * R - 0.6 * away * sc.px_per_m   # ...and up
+    w, h = 5.0 * R, 3.2 * R
+    cv2.rectangle(img, (int(cx - w / 2), int(cy - h / 2)), (int(cx + w / 2), int(cy + h / 2)),
+                  (120, 150, 205), -1)
+    cv2.rectangle(img, (int(cx - w / 2), int(cy + h / 2 - 2)),
+                  (int(cx - w / 2 + 1.4 * R), int(cy + h / 2 + 1.2 * R)), (115, 145, 200), -1)
 
 
 def make_clip(path: str, *, scene: Scene | None = None, motion: Motion | None = None,
@@ -182,10 +249,23 @@ def make_clip(path: str, *, scene: Scene | None = None, motion: Motion | None = 
     readout = rolling_shutter * period
     n = int(round(duration * capture_fps))
     t_cap = np.arange(n) * period
-    frames = [render_frame(t, m, sc, bg, rng, exposure=exposure, readout=readout)
-              for t in t_cap]
     k = int(slowmo["k"]) if slowmo else 1
     method = slowmo["method"] if slowmo else None
+    tags = {}
+    if tag_capture_fps:
+        tags["com.android.capture.fps"] = f"{capture_fps:.6f}"
+    if method in (None, "retime"):
+        out_fps = capture_fps / k if method == "retime" else capture_fps
+        wr = Writer(path, out_fps, (sc.width, sc.height), tags=tags)
+        for i, t in enumerate(t_cap):
+            wr.write(render_frame(t, m, sc, bg, rng, exposure=exposure, readout=readout),
+                     i / out_fps)
+        wr.close()
+        return {"path": path, "g": m.g, "px_per_m": sc.px_per_m, "ball_d_m": sc.ball_d_m,
+                "capture_fps": capture_fps, "file_fps": out_fps, "k": k if slowmo else 1,
+                "method": method, "frames": n}
+    frames = [render_frame(t, m, sc, bg, rng, exposure=exposure, readout=readout)
+              for t in t_cap]
     out_fps = capture_fps
     seq: list[np.ndarray] = frames
     if method == "retime":
@@ -208,9 +288,6 @@ def make_clip(path: str, *, scene: Scene | None = None, motion: Motion | None = 
                     seq.append(render_frame(tm, m, sc, bg, rng, exposure=0.0, readout=0.0,
                                             subsamples=1, override_xy=xy))
         seq.append(frames[-1])
-    tags = {}
-    if tag_capture_fps:
-        tags["com.android.capture.fps"] = f"{capture_fps:.6f}"
     wr = Writer(path, out_fps, (sc.width, sc.height), tags=tags)
     for i, f in enumerate(seq):
         wr.write(f, i / out_fps)

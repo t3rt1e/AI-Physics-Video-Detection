@@ -148,13 +148,49 @@ def _noise_px(u: np.ndarray) -> float:
     return float(max(1.4826 * np.median(np.abs(d3 - np.median(d3))) / np.sqrt(20), 0.05))
 
 
+def glitch_mask(t, x, y, diam_px=None) -> np.ndarray:
+    """True for points that are fine, False for one-frame tracking glitches.
+
+    A glitch jumps away from the path and comes straight back, e.g. the
+    tracker grabbing a hand or a shadow for a single frame. Smooth motion
+    barely deviates from the midpoint of its neighbours; a glitch deviates by
+    much more than the noise. Bounce frames also stand out, and dropping them
+    is harmless because contact frames are never fitted anyway.
+    """
+    t = np.asarray(t, float)
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    n = len(t)
+    ok = np.ones(n, bool)
+    if n < 5:
+        return ok
+    noise = float(np.hypot(_noise_px(x), _noise_px(y)))
+    lim = max(6.0 * noise, 0.35 * (diam_px or 0.0), 1.5)
+    for i in range(1, n - 1):
+        t0, t1, t2 = t[i - 1], t[i], t[i + 1]
+        if t2 <= t0:
+            continue
+        a = (t1 - t0) / (t2 - t0)
+        mx = x[i - 1] + a * (x[i + 1] - x[i - 1])
+        my = y[i - 1] + a * (y[i + 1] - y[i - 1])
+        dev = np.hypot(x[i] - mx, y[i] - my)
+        span = np.hypot(x[i + 1] - x[i - 1], y[i + 1] - y[i - 1])
+        if dev > lim and dev > 0.6 * span:
+            ok[i] = False
+    return ok
+
+
 def split_flights(t, x, y, gdir=(0.0, 1.0), *, min_pts=5, max_gap_s=0.2,
-                  diam_px=None) -> list[np.ndarray]:
+                  diam_px=None, smooth_s=1.0 / 60.0) -> list[np.ndarray]:
     """Cut a track into ballistic flights.
 
-    Splits at bounces (the object stops moving down and starts moving up
-    between neighbouring frames) and at long gaps, and trims stationary
-    frames at either end (ball held before release, ball at rest after).
+    Splits at bounces (the object stops moving down and starts moving up)
+    and at long gaps, and trims still frames at either end (ball held before
+    release, ball at rest after). One-frame glitches are left out.
+
+    Direction changes are judged over smooth_s (1/60 s) rather than frame to
+    frame: at 120-240 fps the ball moves under a pixel per frame early in a
+    fall, so frame-to-frame noise would otherwise look like bounces.
     Returns a list of index arrays into the inputs.
     """
     t = np.asarray(t, float)
@@ -165,8 +201,9 @@ def split_flights(t, x, y, gdir=(0.0, 1.0), *, min_pts=5, max_gap_s=0.2,
         return []
     g = np.asarray(gdir, float)
     g = g / np.linalg.norm(g)
+    good = np.flatnonzero(glitch_mask(t, x, y, diam_px))
     u = x * g[0] + y * g[1]
-    noise = _noise_px(u)
+    noise = _noise_px(u[good])
     eps = max(3.0 * noise, 0.25)
     if diam_px:
         eps = max(eps, 0.02 * diam_px)
@@ -174,27 +211,30 @@ def split_flights(t, x, y, gdir=(0.0, 1.0), *, min_pts=5, max_gap_s=0.2,
     # Break at gaps first.
     pieces = []
     start = 0
-    for i in range(1, n):
-        if t[i] - t[i - 1] > max_gap_s:
-            pieces.append(np.arange(start, i))
+    for i in range(1, len(good)):
+        if t[good[i]] - t[good[i - 1]] > max_gap_s:
+            pieces.append(good[start:i])
             start = i
-    pieces.append(np.arange(start, n))
+    pieces.append(good[start:])
 
     flights: list[np.ndarray] = []
     for idx in pieces:
         if len(idx) < 3:
             continue
         uu = u[idx]
-        du = np.diff(uu)
-        # Signs of real steps only; duplicate frames give zero steps.
+        dt_med = float(np.median(np.diff(t[idx]))) if len(idx) > 1 else 1.0
+        step = max(1, int(round(smooth_s / max(dt_med, 1e-6))))
+        step = min(step, max(1, (len(idx) - 1) // 4))
+        du = uu[step:] - uu[:-step]
+        # Signs of real changes only; repeated frames give zero steps.
         sig_steps = [(k, np.sign(d)) for k, d in enumerate(du) if abs(d) > eps]
         bounces = []
         for (k1, s1), (k2, s2) in zip(sig_steps, sig_steps[1:]):
             if s1 > 0 and s2 < 0:
-                # Lowest point between the last downward and first upward step.
-                lo, hi = k1 + 1, k2
+                lo, hi = k1, min(k2 + step, len(uu) - 1)
                 b = lo + int(np.argmax(uu[lo:hi + 1]))
-                bounces.append(b)
+                if not bounces or b > bounces[-1] + 1:
+                    bounces.append(b)
         cuts = [0] + bounces + [len(idx) - 1]
         for j in range(len(cuts) - 1):
             a, b = cuts[j], cuts[j + 1]
@@ -202,28 +242,30 @@ def split_flights(t, x, y, gdir=(0.0, 1.0), *, min_pts=5, max_gap_s=0.2,
             a = a + (1 if j > 0 else 0)
             b = b - (1 if j < len(cuts) - 2 else 0)
             seg = idx[a:b + 1]
-            seg = _trim_stationary(seg, u, eps)
+            seg = _trim_stationary(seg, u, eps, step)
             if len(seg) >= min_pts:
                 flights.append(seg)
     return flights
 
 
-def _trim_stationary(seg: np.ndarray, u: np.ndarray, eps: float) -> np.ndarray:
+def _trim_stationary(seg: np.ndarray, u: np.ndarray, eps: float, step: int = 1) -> np.ndarray:
     """Drop frames where the object sits still at either end of a segment.
 
     A held ball before release, or a ball resting after landing, is not on
-    the parabola. The first kept frame is the first one that has moved; the
-    last kept frame is the last one before the object stops.
+    the parabola. Movement is judged over `step` frames so slow starts at high
+    frame rates still count as moving once they add up.
     """
     if len(seg) < 3:
         return seg
     uu = u[seg]
-    moving = np.abs(np.diff(uu)) > eps
+    step = max(1, min(step, len(seg) - 1))
+    moving = np.abs(uu[step:] - uu[:-step]) > eps
     if not moving.any():
         return seg[:0]
     ks = np.flatnonzero(moving)
     first = 0 if moving[0] else int(ks[0]) + 1
-    last = len(seg) - 1 if moving[-1] else int(ks[-1])
+    last = len(seg) - 1 if moving[-1] else int(ks[-1]) + step - 1
+    last = min(last, len(seg) - 1)
     if last <= first:
         return seg[:0]
     return seg[first:last + 1]
@@ -254,6 +296,7 @@ class JointFit:
     a_sigma: float = 0.0
     main: int = 0
     notes: list[str] = field(default_factory=list)
+    used: list[int] = field(default_factory=list)   # flights that went into a_px
 
 
 def _fit_all(flights, t, x, y, w0, alpha, r, rc, fixed=None):
@@ -340,18 +383,21 @@ def _combine(jf: JointFit):
     sizes = [len(f.idx) for f in jf.flights]
     jf.main = int(np.argmax(sizes))
     m = jf.flights[jf.main]
-    vals, wts = [], []
-    for f in jf.flights:
+    vals, wts, used = [], [], []
+    for j, f in enumerate(jf.flights):
         if len(f.idx) < 6 or not np.isfinite(f.a_sigma) or f.a_sigma <= 0:
             continue
         # Hops are weighed in only if they agree with the main flight to 25%.
-        if abs(f.a_along / m.a_along - 1.0) > 0.25:
+        if not m.a_along or abs(f.a_along / m.a_along - 1.0) > 0.25:
             continue
         vals.append(f.a_along)
         wts.append(1.0 / f.a_sigma**2)
+        used.append(j)
     if not vals:
         jf.a_px, jf.a_sigma = m.a_along, m.a_sigma
+        jf.used = [jf.main]
         return
+    jf.used = used
     wts = np.asarray(wts)
     jf.a_px = float(np.sum(np.asarray(vals) * wts) / np.sum(wts))
     jf.a_sigma = float(1.0 / np.sqrt(np.sum(wts)))
@@ -366,6 +412,44 @@ def rolling_shutter_effect(jf: JointFit, t, x, y, w0) -> float:
     if plain.a_px == 0:
         return 0.0
     return float(jf.a_px / plain.a_px - 1.0)
+
+
+def recombine(jf: JointFit):
+    """Recompute a_px after the flights' accelerations were corrected (air drag)."""
+    _combine(jf)
+
+
+def drag_factor(fit: Fit2D, tau, gdir, v_scale: float, vt: float) -> tuple[float, float]:
+    """How much air drag lowered a flight's fitted acceleration, to first order.
+
+    Quadratic drag adds -(g / vt^2) |v| v to the acceleration, so along
+    gravity the ball feels g * (1 - |v| v_down / vt^2). A parabola fitted to
+    positions measures a weighted average of the acceleration, with weight
+    (1 - s^2)^2 across the flight (s from -1 at the first frame to 1 at the
+    last), so the fit reads low by q = that same average of
+    |v| v_down / vt^2, and g = a_fit / (1 - q). v comes from the fit itself,
+    converted to m/s by v_scale (m per px times the slow-motion factor k). A
+    hop that rises and falls has q near 0, because drag adds on the way up
+    and subtracts on the way down. Returns (factor, q).
+    """
+    tau = np.asarray(tau, float)
+    vx, vy = fit.vel(tau)
+    g = np.asarray(gdir, float)
+    g = g / np.linalg.norm(g)
+    vx = np.asarray(vx, float) * v_scale
+    vy = np.asarray(vy, float) * v_scale
+    v_down = vx * g[0] + vy * g[1]
+    span = float(np.ptp(tau)) if len(tau) > 1 else 0.0
+    if span > 0:
+        sn = 2.0 * (tau - tau.min()) / span - 1.0
+        w = (1.0 - sn**2) ** 2
+    else:
+        w = np.ones(len(tau))
+    if w.sum() <= 0:
+        w = np.ones(len(tau))
+    q = float(np.sum(w * np.hypot(vx, vy) * v_down) / np.sum(w)) / max(vt, 1e-6) ** 2
+    q = float(np.clip(q, -0.5, 0.6))
+    return 1.0 / (1.0 - q), q
 
 
 def gravity_direction(jf: JointFit) -> np.ndarray:

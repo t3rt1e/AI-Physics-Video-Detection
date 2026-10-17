@@ -9,8 +9,8 @@ Weights download from Hugging Face on first use (facebook/sam2.1-hiera-small,
 about 180 MB). Wants a GPU; on CPU expect seconds per frame.
 
 Seeding: give a box (x0, y0, x1, y1) in working pixels on the first frame
-where the object is clearly visible, or let the classical tracker's best
-guess seed it.
+where the object is clearly visible, a seed point (frame, x, y) on the ball
+(a click), or let the classical tracker's best guess seed it.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ import tempfile
 import cv2
 import numpy as np
 
-from .track import Det, Track, TrackResult, _width_along, track_falling_object
+from .track import Det, Track, TrackResult, _width_along, background, detect, track_falling_object
 
 MODEL_ID = os.environ.get("GALILEO_SAM2_MODEL", "facebook/sam2.1-hiera-small")
 _state: dict = {}
@@ -55,9 +55,27 @@ def _mask_det(mask: np.ndarray, fi: int, prev: Det | None) -> Det | None:
     return Det(f=fi, x=cx, y=cy, d=width, area=float(len(xs)), elong=1.0, contrast=255.0)
 
 
-def track_with_sam2(frames, times, box=None) -> TrackResult:
+def _box_at(frames, fi, x, y):
+    """A box around the blob nearest (x, y) in frame fi."""
+    H, W = frames[fi].shape[:2]
+    r = 0.03 * max(W, H)
+    try:
+        dets = detect(frames[fi], background(frames))
+        near = min(dets, key=lambda d: np.hypot(d.x - x, d.y - y)) if dets else None
+        if near is not None and np.hypot(near.x - x, near.y - y) < max(3 * near.d, 40):
+            x, y, r = near.x, near.y, 1.2 * near.d
+    except Exception:
+        pass
+    return (x - r, y - r, x + r, y + r)
+
+
+def track_with_sam2(frames, times, box=None, seed=None) -> TrackResult:
+    """seed: (frame index, x, y) on the ball, used when no box is given."""
     import torch
     seed_f = 0
+    if box is None and seed is not None:
+        seed_f = int(seed[0])
+        box = _box_at(frames, seed_f, float(seed[1]), float(seed[2]))
     if box is None:
         guess = track_falling_object(frames, times)
         if guess.main is None:
@@ -89,7 +107,8 @@ def track_with_sam2(frames, times, box=None) -> TrackResult:
             prev = d
     tr = Track(dets=dets, kind="moving", score=1.0)
     return TrackResult(main=tr if len(dets) >= 6 else None, others=[], rest=None, rest_d=None,
-                       n_candidates=len(dets), d_fine=np.array([d.d for d in dets]))
+                       n_candidates=len(dets), d_fine=np.array([d.d for d in dets]),
+                       seeded=True)
 
 
 class _nullctx:

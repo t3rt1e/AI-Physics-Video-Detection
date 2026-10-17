@@ -11,15 +11,21 @@ from __future__ import annotations
 import numpy as np
 
 from . import config as C
-from .physics import JointFit, robust_fit_2d
+from .physics import JointFit, drag_factor, robust_fit_2d
 
 
 def _result(name, status, summary, **detail):
     return {"name": name, "status": status, "summary": summary, "detail": detail}
 
 
-def parabola_check(t, x, y, w0, jf: JointFit) -> dict:
-    """Constant acceleration within one fall: compare first and second halves."""
+def parabola_check(t, x, y, w0, jf: JointFit, drag: dict | None = None) -> dict:
+    """Constant acceleration within one fall: compare first and second halves.
+
+    Only a clear, significant change fails. When the halves are too noisy to
+    compare, the check says so instead of passing. drag ({"vt", "v_scale"})
+    lets a light ball read lower in the faster second half, as air drag makes
+    a real one do.
+    """
     name = "Constant acceleration"
     if not jf.flights:
         return _result(name, "skip", "No clean fall to test.")
@@ -34,15 +40,26 @@ def parabola_check(t, x, y, w0, jf: JointFit) -> dict:
     accs = []
     for p in parts:
         f = robust_fit_2d(t[p], x[p], y[p], w0[p], alpha=jf.alpha, r=r[p], rc=fl.fit.rc)
-        accs.append(f.accel_along(jf.gdir))
+        a, sa = f.accel_along(jf.gdir)
+        if drag:
+            fac, _ = drag_factor(f, t[p] - f.t0, jf.gdir, drag["v_scale"], drag["vt"])
+            a, sa = a * fac, sa * fac
+        accs.append((a, sa))
     (a1, s1), (a2, s2) = accs
-    if a1 <= 0 or a2 <= 0:
+    detail = dict(a_first_px=a1, a_second_px=a2, sigma_first=s1, sigma_second=s2,
+                  drag_corrected=bool(drag))
+    # A half that clearly runs the wrong way (decelerating fall, rising "drop").
+    if (a1 + 2.5 * s1 < 0 and a2 - 2.5 * s2 > 0) or (a2 + 2.5 * s2 < 0 and a1 - 2.5 * s1 > 0):
         return _result(name, "fail",
-                       "The object doesn't keep accelerating downward through the fall.",
-                       a_first=a1, a_second=a2)
+                       "The object stops accelerating downward partway through the fall.",
+                       **detail)
+    a_ref = max(abs(a1), abs(a2), 1e-9)
+    if a1 <= 0 or a2 <= 0 or s1 / a_ref > 0.35 or s2 / a_ref > 0.35:
+        return _result(name, "skip", "Too noisy to compare the two halves of the fall.",
+                       **detail)
     ratio = a2 / a1
     z = (a2 - a1) / max(np.hypot(s1, s2), 1e-9)
-    detail = dict(a_first_px=a1, a_second_px=a2, ratio=ratio, z=float(z))
+    detail.update(ratio=ratio, z=float(z))
     lo, hi = C.PARABOLA_RATIO_FAIL
     wlo, whi = C.PARABOLA_RATIO_WARN
     pct = (ratio - 1.0) * 100.0
@@ -51,12 +68,14 @@ def parabola_check(t, x, y, w0, jf: JointFit) -> dict:
                        f"Acceleration changes by {pct:+.0f}% between the first and second half "
                        "of the fall. Real gravity is constant.", **detail)
     if (ratio < wlo or ratio > whi) and abs(z) > 3:
+        why = ("lens distortion, or a sign of generated motion" if drag else
+               "air drag, lens distortion, or a sign of generated motion")
         return _result(name, "warn",
-                       f"Acceleration drifts {pct:+.0f}% during the fall (air drag, lens "
-                       "distortion, or a sign of generated motion).", **detail)
+                       f"Acceleration drifts {pct:+.0f}% during the fall ({why}).", **detail)
+    extra = " after allowing for air drag" if drag else ""
     return _result(name, "pass",
-                   f"Acceleration holds steady through the fall ({pct:+.0f}% half to half).",
-                   **detail)
+                   f"Acceleration holds steady through the fall ({pct:+.0f}% half to half"
+                   f"{extra}).", **detail)
 
 
 def _u_poly(fit, g):

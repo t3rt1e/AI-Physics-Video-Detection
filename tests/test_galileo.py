@@ -128,6 +128,84 @@ def test_fake_tower_runs_a_drop():
     assert d.laptop_fit()["g"] == pytest.approx(ft.g, rel=0.01)
 
 
+def test_split_flights_high_fps_noise_is_not_a_bounce():
+    # 240 fps: early in the fall the ball moves well under a pixel per frame,
+    # so frame-to-frame noise must not read as bounces.
+    rng = np.random.default_rng(4)
+    t = np.arange(0, 0.5, 1 / 240)
+    y = _fall(t) + rng.normal(0, 0.4, len(t))
+    x = 300 + rng.normal(0, 0.4, len(t))
+    fl = split_flights(t, x, y, diam_px=12.0)
+    assert len(fl) == 1 and len(fl[0]) > 0.8 * len(t)
+
+
+def _drag_fall(t_end, fps, vt, g=9.81, px_per_m=400.0, vx=0.0):
+    dt = 1e-4
+    n = int(t_end / dt) + 1
+    x = y = 0.0
+    u, v = vx, 0.0
+    k = g / vt**2
+    X, Y = [], []
+    for _ in range(n):
+        X.append(x)
+        Y.append(y)
+        sp = np.hypot(u, v)
+        u += -k * sp * u * dt
+        v += (g - k * sp * v) * dt
+        x += u * dt
+        y += v * dt
+    tf = np.arange(0, t_end, 1 / fps)
+    grid = np.arange(n) * dt
+    return tf, 500 + np.interp(tf, grid, X) * px_per_m, 100 + np.interp(tf, grid, Y) * px_per_m
+
+
+def test_drag_correction_recovers_g_for_a_ping_pong_ball():
+    from galileo.physics import drag_factor
+    t, x, y = _drag_fall(0.45, 120, vt=8.4, vx=0.3)
+    fl = split_flights(t, x, y)
+    jf = fit_flights(t, x, y, np.ones(len(t)), fl, fps=120, n_px_axis=1080, rs_mode="off")
+    g_raw = jf.a_px / 400.0
+    f = jf.flights[jf.main]
+    fac, q = drag_factor(f.fit, t[f.idx] - f.fit.t0, (0, 1), 1 / 400.0, 8.4)
+    assert g_raw < 9.81 * 0.96                     # drag makes it read low...
+    assert abs(g_raw * fac / 9.81 - 1) < 0.015     # ...and the correction brings it back
+
+
+def test_verdict_guards():
+    from galileo.verdict import decide
+    scale = {"s": 1 / 400.0, "rel_sigma": 0.02}
+    base = dict(scale=scale, clock=None, tests=[], n_points=40, duration=0.4)
+    v = decide(a_px=3900.0, a_sigma=40.0, falls=False, **base)
+    assert v["verdict"] == "UNSURE" and v["stage"] == "tracking: not a fall"
+    v = decide(a_px=5.0, a_sigma=40.0, **base)
+    assert v["verdict"] == "AI" and v["stage"] == "physics: no acceleration"
+    v = decide(a_px=-900.0, a_sigma=40.0, **base)
+    assert v["verdict"] == "UNSURE" and v["stage"] == "tracking: slows while falling"
+    v = decide(a_px=3900.0, a_sigma=900.0, **base)          # +-23%: too wide to call
+    assert v["verdict"] == "UNSURE" and v["stage"] == "measurement: too uncertain"
+    v = decide(a_px=3500.0, a_sigma=30.0, drag={"factor": 1.12, "vt": 8.4}, **base)
+    assert v["verdict"] == "REAL" and v["g"] == pytest.approx(3500 / 400 * 1.12)
+
+
+def test_pick_seeded_follows_the_click():
+    from galileo.track import Det, Track, pick_seeded
+    times = np.arange(30) / 60.0
+
+    def tr(x0, vy):
+        return Track(dets=[Det(f=i, x=x0, y=50 + vy * i, d=10, area=80, elong=1, contrast=60)
+                           for i in range(30)], kind="moving")
+    a, b = tr(100, 4.0), tr(300, 5.0)
+    assert pick_seeded([a, b], times, [(times[10], 301.0, 100.0)]) is b
+    assert pick_seeded([a, b], times, [(times[10], 99.0, 92.0)]) is a
+    assert pick_seeded([a, b], times, [(times[10], 600.0, 300.0)]) is None
+
+
+def test_cli_seed_survives_powershell_commas():
+    from galileo.cli import _seed
+    assert _seed(["1.25,0.48,0.33"]) == (1.25, 0.48, 0.33)
+    assert _seed(["1.25", "0.48", "0.33"]) == (1.25, 0.48, 0.33)
+
+
 # ---- video end to end ---------------------------------------------------------
 from galileo.analyze import analyze  # noqa: E402
 from galileo.synth import Motion, Scene, make_clip  # noqa: E402
@@ -148,6 +226,45 @@ def clips(tmp_path_factory):
     out["slow"] = make_clip(str(d / "slow.mp4"), scene=_scene(), motion=Motion(g=9.81),
                             capture_fps=30, duration=0.85, slowmo={"k": 4, "method": "dup"})["path"]
     return out
+
+
+@pytest.fixture(scope="module")
+def hand_clip(tmp_path_factory):
+    d = tmp_path_factory.mktemp("hand")
+    sc = Scene(width=640, height=360, px_per_m=220.0, ball_d_m=0.040, ball_bgr=(238, 240, 242),
+               bg_level=105, shading=0.3, y0=60.0, floor_y=330.0, seed=7)
+    m = Motion(g=9.81, restitution=0.85, vt=8.4, kick=0.2, hand=True, t_release=0.3)
+    return make_clip(str(d / "hand.mp4"), scene=sc, motion=m, capture_fps=60, duration=1.4)
+
+
+def test_tracker_follows_the_ball_not_the_hand(hand_clip):
+    from galileo.stabilize import stabilize
+    from galileo.track import track_falling_object
+    from galileo.video import read_frames
+    frames, times, _ = read_frames(hand_clip["path"])
+    _, T, info = stabilize(frames)
+    assert T is None and info["max_drift_px"] < 1.0      # the moving hand isn't camera motion
+    tr = track_falling_object(frames, times)
+    ball_px = 0.040 * 220.0
+    assert abs(np.nanmedian(tr.main.d) / ball_px - 1) < 0.35
+    assert np.ptp(tr.main.y) > 150                       # it fell and bounced
+
+
+def test_small_fast_ball_gets_zoomed_and_drag_corrected(tmp_path, monkeypatch):
+    from galileo import config as C
+    sc = Scene(width=1280, height=720, px_per_m=350.0, ball_d_m=0.040, ball_bgr=(238, 240, 242),
+               bg_level=105, shading=0.3, y0=120.0, floor_y=None, seed=8)
+    m = Motion(g=9.81, vt=8.4, vx=0.15, hand=True, t_release=0.25)
+    clip = make_clip(str(tmp_path / "pp.mp4"), scene=sc, motion=m, capture_fps=120,
+                     duration=0.85, rolling_shutter=0.5)["path"]
+    # Force a coarse first pass (as a long 1080p 120 fps clip gets): ball ~7 px.
+    monkeypatch.setattr(C, "WORK_MAX_SIDE", 640)
+    r = analyze(clip, preset="ping-pong")
+    v = r["verdict"]
+    assert r.get("zoom") and r["zoom"]["ball_px"] > 1.6 * r["zoom"]["ball_px_before"]
+    assert r["drag"]["factor"] > 1.03
+    assert v["verdict"] == "REAL"
+    assert v["g"] == pytest.approx(9.81, rel=0.05)
 
 
 def test_real_clip_reads_earth_gravity(clips):
@@ -188,3 +305,11 @@ def test_web_api(clips, tmp_path):
         json.dumps(body)  # strictly JSON-safe
         assert c.get("/media/clips/real.mp4", headers={"Range": "bytes=0-99"}).status_code == 206
         assert c.post("/api/analyze", json={"clip": "../etc/passwd"}).status_code == 400
+        # A click on the ball mid-fall: same answer, and bad picks are refused.
+        pts = body["track"]["points"]
+        p = pts[len(pts) // 2]
+        r2 = c.post("/api/analyze", json={"clip": "clips/real.mp4", "object": "steel-38mm",
+                                          "seed": {"t": p["t"], "x": p["x"], "y": p["y"]}})
+        assert r2.status_code == 200 and r2.json()["verdict"]["verdict"] == "REAL"
+        assert c.post("/api/analyze", json={"clip": "clips/real.mp4",
+                                            "seed": {"t": 0.5}}).status_code == 400

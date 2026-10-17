@@ -97,10 +97,13 @@ class Panel {
       headline: q(".headline"), expl: q(".explanation"), reasons: q(".reasons"),
       plate: q(".plate-canvas"), plateCap: q(".plate-caption"), legend: q(".legend"),
       chart: q(".chart-canvas"), tip: q(".tooltip"), tests: q(".tests tbody"), facts: q(".facts"),
-      pointsBody: q(".points tbody"),
+      pointsBody: q(".points tbody"), pickBtn: q(".pick"), pickClear: q(".pick-clear"),
+      pickHint: q(".pick-hint"), pickLayer: q(".pick-layer"), wrap: q(".video-wrap"),
     });
     this.result = null;
     this.clipId = null;
+    this.seed = null;      // {t, x, y}: a click on the ball, x and y as fractions of the picture
+    this.picking = false;
 
     this.clipSel.addEventListener("change", () => this.setClip(this.clipSel.value));
     this.objSel.addEventListener("change", () => this.onObject());
@@ -119,6 +122,9 @@ class Panel {
       this.note.hidden = false;
       this.note.textContent = "This browser can't play the clip. The measurement still works; only the overlay needs playback.";
     });
+    this.pickBtn.addEventListener("click", () => this.setPicking(!this.picking));
+    this.pickClear.addEventListener("click", () => { this.seed = null; this.syncPick(); this.measure(); });
+    this.pickLayer.addEventListener("click", (e) => this.onPick(e));
     this.chart.addEventListener("mousemove", (e) => this.hoverChart(e));
     this.chart.addEventListener("mouseleave", () => { this.tip.hidden = true; this.drawChart(); });
     new ResizeObserver(() => this.redrawAll()).observe(root);
@@ -174,10 +180,52 @@ class Panel {
     if (this.clipId) this.measure();
   }
 
+  /* -- pick the ball: one click tells the tracker which object to follow -- */
+  setPicking(on) {
+    this.picking = on && !!this.clipId;
+    if (this.picking) this.video.pause();
+    this.syncPick();
+  }
+
+  syncPick() {
+    this.pickBtn.setAttribute("aria-pressed", this.picking ? "true" : "false");
+    this.pickBtn.textContent = this.picking ? "Cancel pick" : (this.seed ? "Pick again" : "Pick the ball");
+    this.pickHint.hidden = !this.picking;
+    this.pickLayer.hidden = !this.picking;
+    this.pickClear.hidden = !this.seed || this.picking;
+    this.drawOverlay();
+  }
+
+  pictureRect() {
+    // Where the picture sits inside the player (object-fit: contain leaves bars).
+    const v = this.video;
+    const W = this.wrap.clientWidth, H = this.wrap.clientHeight;
+    if (!v.videoWidth || !W || !H) return null;
+    const vr = v.videoWidth / v.videoHeight, er = W / H;
+    if (vr > er) return { dw: W, dh: W / vr, ox: 0, oy: (H - W / vr) / 2 };
+    return { dw: H * vr, dh: H, ox: (W - H * vr) / 2, oy: 0 };
+  }
+
+  onPick(e) {
+    const g = this.pictureRect();
+    if (!g) return;
+    const rect = this.wrap.getBoundingClientRect();
+    const x = (e.clientX - rect.left - g.ox) / g.dw;
+    const y = (e.clientY - rect.top - g.oy) / g.dh;
+    if (x < 0 || x > 1 || y < 0 || y > 1) return;
+    this.seed = { t: this.video.currentTime, x, y };
+    this.picking = false;
+    this.syncPick();
+    this.measure();
+  }
+
   setClip(id, { measure = true } = {}) {
     if (!id) return;
     this.clipId = id;
     this.clipSel.value = id;
+    this.seed = null;
+    this.picking = false;
+    this.syncPick();
     const c = CLIPS.find((x) => x.id === id) || {};
     this.video.src = `/media/${id}`;
     this.result = null;
@@ -233,6 +281,7 @@ class Panel {
       const body = {
         clip: id, object: this.objSel.value, size_mm: this.sizeMm,
         gemini: STATUS.gemini.default_on || this.objSel.value === "gemini", force,
+        seed: this.seed,
       };
       const r = await api("/api/analyze", {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
@@ -251,6 +300,9 @@ class Panel {
     // A finished tower drop: load its clip and result without re-measuring.
     refreshClips().then(() => {
       this.clipId = msg.clip;
+      this.seed = null;
+      this.picking = false;
+      this.syncPick();
       this.fillClips(msg.clip);
       this.video.src = `/media/${msg.clip}`;
       this.note.hidden = false;
@@ -287,6 +339,9 @@ class Panel {
       li.textContent = n;
       this.reasons.appendChild(li);
     }
+    // Lost the ball? Point at the pick button.
+    const stage = v.stage || "";
+    this.pickBtn.classList.toggle("suggest", stage.startsWith("tracking") && !this.seed);
     this.renderTests(r.tests || []);
     this.renderFacts(r);
     this.renderPoints(r);
@@ -334,6 +389,8 @@ class Panel {
     add("File", `${(file.path || "").split(/[\\/]/).pop()}, ${file.width}×${file.height}`);
     if (r.work) add("Frame rate", `${r.work.fps_measured.toFixed(2)} fps in the file` + (file.capture_fps ? `, captured at ${file.capture_fps} fps` : ""));
     if (r.work) add("Frames analysed", `${r.work.frames} at ${Math.round(r.work.scale * 100)}% size`);
+    if (r.zoom) add("Zoomed in", `ball ${r.zoom.ball_px_before.toFixed(0)} px, then ${r.zoom.ball_px.toFixed(0)} px at ${Math.round(r.zoom.scale * 100)}% resolution (${r.zoom.frames} frames)`);
+    if (this.seed) add("Ball picked", `at ${this.seed.t.toFixed(2)} s`);
     const sc = r.scale;
     if (sc) for (const ru of sc.rulers) add(`Ruler: ${ru.name}`, `${ru.detail} (±${(ru.rel_sigma * 100).toFixed(1)}%)`);
     if (sc && sc.correction) add("Calibration", `scale × ${sc.correction.toFixed(4)} from tower drops`);
@@ -347,6 +404,7 @@ class Panel {
       add("Ball size", `${fit.diam_px.toFixed(1)} px`);
       add("Flights", fit.flights.map((x) => `${x.n} frames`).join(", "));
     }
+    if (r.drag && Math.abs(r.drag.factor - 1) > 0.005) add("Air drag", `corrected ${((r.drag.factor - 1) * 100).toFixed(1)}% (top speed ${r.drag.vt.toFixed(1)} m/s)`);
     if (r.stabilization && r.stabilization.applied) add("Camera motion", `removed (drifted ${r.stabilization.max_drift_px.toFixed(0)} px)`);
     if (r.elapsed_s != null) add("Time to measure", `${r.elapsed_s.toFixed(1)} s`);
   }
@@ -390,6 +448,15 @@ class Panel {
     if (vr > er) { dw = W; dh = W / vr; ox = 0; oy = (H - dh) / 2; }
     else { dh = H; dw = H * vr; oy = 0; ox = (W - dw) / 2; }
     const t = v.currentTime;
+    if (this.seed && Math.abs(this.seed.t - t) < 0.15) {
+      const sx = ox + this.seed.x * dw, sy = oy + this.seed.y * dh;
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(sx - 10, sy); ctx.lineTo(sx - 4, sy); ctx.moveTo(sx + 4, sy); ctx.lineTo(sx + 10, sy);
+      ctx.moveTo(sx, sy - 10); ctx.lineTo(sx, sy - 4); ctx.moveTo(sx, sy + 4); ctx.lineTo(sx, sy + 10);
+      ctx.stroke();
+    }
     const pts = r.track.points;
     ctx.fillStyle = COLORS.clipPlate;
     ctx.globalAlpha = 0.55;
@@ -496,7 +563,8 @@ class Panel {
       let d = interpD(first, t);
       let measured = true;
       if (d == null) { d = Math.max(0, poly(plot.fit_coef, t)); measured = false; }
-      const de = poly(plot.earth_coef, t);
+      const deI = interpD(plot.earth, t);
+      const de = deI != null ? deI : poly(plot.earth_coef, t);
       const yc = top + d * ys;
       const ye = top + de * ys;
       ctx.globalAlpha = 0.28;
@@ -628,13 +696,20 @@ class Panel {
     else yEarth = pad.t + 6;
     let lf = yFit, le = yEarth;
     if (Math.abs(lf - le) < 15) { if (lf < le) { lf -= 8; le += 8; } else { lf += 8; le -= 8; } }
+    const drag = plot.drag_vt != null;
     ctx.fillText(`g = ${plot.g_fit.toFixed(2)}`, W - pad.r + 6, lf);
-    ctx.fillText(`Earth ${plot.g_ref.toFixed(2)}`, W - pad.r + 6, le);
+    ctx.fillText(drag ? "Earth + air" : `Earth ${plot.g_ref.toFixed(2)}`, W - pad.r + 6, le);
 
+    const fitText = drag && plot.g_fit_drag_corrected != null
+      ? `Best fit, g = ${plot.g_fit.toFixed(2)} m/s² as filmed (${plot.g_fit_drag_corrected.toFixed(2)} after air drag)`
+      : `Best fit, g = ${plot.g_fit.toFixed(2)} m/s²`;
+    const earthText = drag
+      ? `Earth's gravity, ${plot.g_ref.toFixed(2)} m/s², with air drag on a light ball`
+      : `Earth's gravity, ${plot.g_ref.toFixed(2)} m/s²`;
     this.legend.innerHTML =
       `<span><i class="dot" style="background:${COLORS.clip}"></i>Tracked ball</span>` +
-      `<span><i style="background:${COLORS.clip}"></i>Best fit, g = ${plot.g_fit.toFixed(2)} m/s²</span>` +
-      `<span><i style="background:${COLORS.earth}"></i>Earth's gravity, ${plot.g_ref.toFixed(2)} m/s²</span>`;
+      `<span><i style="background:${COLORS.clip}"></i>${fitText}</span>` +
+      `<span><i style="background:${COLORS.earth}"></i>${earthText}</span>`;
     cv.setAttribute("aria-label", `Distance fallen against time. Fit g ${plot.g_fit.toFixed(2)}, Earth ${plot.g_ref.toFixed(2)} m/s squared. Data in the tracked points table.`);
   }
 
@@ -648,7 +723,8 @@ class Panel {
     this.drawChart(t);
     const poly = (c, x) => c[0] + c[1] * x + c[2] * x * x;
     const fit = poly(g.plot.fit_coef, t);
-    const earth = poly(g.plot.earth_coef, t);
+    const eI = interpD(g.plot.earth, t);
+    const earth = eI != null ? eI : poly(g.plot.earth_coef, t);
     let near = null;
     for (const p of g.plot.points) if (!near || Math.abs(p[0] - t) < Math.abs(near[0] - t)) near = p;
     const meas = near && Math.abs(g.X(near[0]) - x) < 10 ? `<br>Tracked: ${near[1].toFixed(3)} m` : "";
@@ -711,6 +787,10 @@ function connectWS() {
   ws.onmessage = (e) => onLive(JSON.parse(e.data));
   ws.onclose = () => setTimeout(connectWS, 1500);
 }
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") for (const p of Object.values(panels)) if (p.picking) p.setPicking(false);
+});
 
 function onLive(m) {
   const state = $("#tower-state");

@@ -118,6 +118,11 @@ select {
 .upload:focus-within { outline: 2px solid var(--focus); outline-offset: 2px; }
 
 .clip-note { margin: 0 0 var(--s3); font-size: 14px; color: var(--ink-2); }
+.pick[aria-pressed="true"] { color: var(--paper); background: var(--clip); border-color: var(--clip); }
+.pick.suggest { border-color: var(--clip); box-shadow: 0 0 0 2px rgba(45, 98, 192, 0.25); }
+.pick-hint { margin: 0 0 var(--s3); padding: var(--s2) var(--s3); font-size: 14px; color: var(--ink); background: var(--paper-2); border-left: 3px solid var(--clip); }
+/* Leaves the bottom strip free so the video's own controls still work while picking. */
+.pick-layer { position: absolute; left: 0; right: 0; top: 0; bottom: 56px; cursor: crosshair; }
 .clip-note strong { color: var(--ink); }
 
 .video-wrap { position: relative; background: var(--plate); aspect-ratio: 16 / 9; border-radius: 2px; overflow: hidden; }

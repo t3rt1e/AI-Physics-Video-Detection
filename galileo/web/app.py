@@ -241,14 +241,25 @@ def create_app(data_dir: str = "data", *, tower_port: str | None = None,
         size_mm = body.get("size_mm")
         gem = bool(body.get("gemini"))
         roi = body.get("roi")
+        seed = None
+        sd = body.get("seed")
+        if isinstance(sd, dict):
+            try:
+                seed = (float(sd["t"]), float(sd["x"]), float(sd["y"]))
+            except (KeyError, TypeError, ValueError):
+                raise HTTPException(400, "seed needs t, x and y")
+            if not all(math.isfinite(v) for v in seed):
+                raise HTTPException(400, "seed needs finite numbers")
         opts = {"object": obj, "size_mm": size_mm, "gemini": gem, "roi": roi,
-                "corr": scale_corr if p.parent.name == "drops" else 1.0, "v": __version__}
+                "seed": [round(v, 4) for v in seed] if seed else None,
+                "corr": scale_corr if p.parent.name == "drops" else 1.0, "v": __version__,
+                "pipeline": 2}
         key = _file_key(p) + "_" + hashlib.sha1(json.dumps(opts, sort_keys=True)
                                                 .encode()).hexdigest()[:10]
         cache = data / "cache" / f"{key}.json"
         if cache.exists() and not body.get("force"):
             return JSONResponse(json.loads(cache.read_text()))
-        kw = {"use_gemini": gem, "roi": roi, "scale_correction": opts["corr"]}
+        kw = {"use_gemini": gem, "roi": roi, "scale_correction": opts["corr"], "seed": seed}
         if obj == "custom" and size_mm:
             kw.update(size_m=float(size_mm) / 1000.0, size_rel_unc=0.01, label="object")
         elif obj == "gemini":

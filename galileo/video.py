@@ -132,16 +132,18 @@ def work_scale(info: ClipInfo, n_frames: int, max_side: int, budget: int) -> flo
 
 def read_frames(path: str, info: ClipInfo | None = None, *, scale: float = 1.0,
                 t_start: float | None = None, t_end: float | None = None,
-                max_frames: int | None = None, gray: bool = False):
+                max_frames: int | None = None, gray: bool = False, crop=None):
     """Decode frames (display orientation) at `scale`. Returns (frames, times, numbers).
 
     times are seconds from the first frame of the file, from presentation
-    timestamps. numbers are frame indices within the file.
+    timestamps. numbers are frame indices within the file. crop is
+    (x0, y0, x1, y1) in pixels of the scaled, upright frame: only that window
+    is kept, so a small region can be decoded at full resolution.
     """
     info = info or probe(path)
     frames, times, nums = [], [], []
     if av is None:
-        return _read_cv(path, info, scale, t_start, t_end, max_frames, gray)
+        return _read_cv(path, info, scale, t_start, t_end, max_frames, gray, crop)
     with av.open(path) as c:
         vs = c.streams.video[0]
         vs.thread_type = "AUTO"
@@ -170,7 +172,10 @@ def read_frames(path: str, info: ClipInfo | None = None, *, scale: float = 1.0,
                     img = fr.reformat(width=tw, height=th, format=fmt).to_ndarray()
             else:
                 img = fr.to_ndarray(format=fmt)
-            frames.append(_rotate(img, rot))
+            img = _rotate(img, rot)
+            if crop is not None:
+                img = np.ascontiguousarray(img[crop[1]:crop[3], crop[0]:crop[2]])
+            frames.append(img)
             times.append(t)
             nums.append(i)
             if max_frames and len(frames) >= max_frames:
@@ -211,7 +216,7 @@ def regularize_timestamps(ts) -> np.ndarray:
     return per * (n - n[0]).astype(float)
 
 
-def _read_cv(path, info, scale, t_start, t_end, max_frames, gray):
+def _read_cv(path, info, scale, t_start, t_end, max_frames, gray, crop=None):
     cap = cv2.VideoCapture(path)
     frames, times, nums = [], [], []
     i = 0
@@ -230,6 +235,8 @@ def _read_cv(path, info, scale, t_start, t_end, max_frames, gray):
             img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         if gray:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if crop is not None:
+            img = np.ascontiguousarray(img[crop[1]:crop[3], crop[0]:crop[2]])
         frames.append(img)
         times.append(t)
         nums.append(i - 1)

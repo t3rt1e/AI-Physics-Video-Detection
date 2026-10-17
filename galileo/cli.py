@@ -1,6 +1,7 @@
 """Command line: python -m galileo <command>
 
   analyze CLIP        measure one clip and print the verdict
+  batch FOLDER        measure every clip in a folder and write a CSV
   serve               web app (+ live tower loop with --tower or --fake-tower)
   synth               render rehearsal clips with known physics
   twin                make the AI twin of a tower photo with Veo
@@ -11,6 +12,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import glob
 import json
 import os
 import sys
@@ -19,23 +22,52 @@ import time
 from . import config as C
 
 
-def _roi(s):
-    if not s:
+def _numbers(tokens):
+    """'1,2,3' or 1 2 3 (PowerShell splits unquoted commas into separate words)."""
+    if not tokens:
         return None
-    v = [float(x) for x in s.split(",")]
+    if isinstance(tokens, str):
+        tokens = [tokens]
+    parts = [p for tok in tokens for p in str(tok).replace(";", ",").split(",") if p.strip()]
+    return [float(p) for p in parts]
+
+
+def _roi(tokens):
+    v = _numbers(tokens)
+    if v is None:
+        return None
     if len(v) != 4:
-        raise argparse.ArgumentTypeError("ROI is x0,y0,x1,y1 as fractions of width/height")
+        raise SystemExit("--roi is x0,y0,x1,y1 as fractions of width/height, e.g. "
+                         '--roi "0.3,0,0.7,1"')
     return v
+
+
+def _seed(tokens):
+    try:
+        v = _numbers(tokens)
+    except ValueError:
+        v = []
+    if v is None:
+        return None
+    if len(v) != 3:
+        raise SystemExit("--seed is T,X,Y: the time in seconds when the ball is in the air, "
+                         "then its position as fractions of the width and height (0.5,0.3) or "
+                         'in pixels (960,320), e.g. --seed "1.25,0.48,0.33"')
+    return tuple(v)
+
+
+def _analyze_kwargs(a):
+    return dict(preset=a.object, size_m=a.size_mm / 1000 if a.size_mm else None,
+                size_rel_unc=a.size_unc, use_gemini=a.gemini, use_depth=a.depth,
+                tracker="sam2" if a.sam2 else "classical",
+                scale_correction=a.scale_correction, zoom=not a.no_zoom, drag_vt=a.drag_vt)
 
 
 def cmd_analyze(a):
     from .analyze import analyze
-    size_m = a.size_mm / 1000 if a.size_mm else None
-    r = analyze(a.clip, preset=a.object, size_m=size_m, size_rel_unc=a.size_unc,
-                roi=a.roi, t_start=a.start, t_end=a.end, use_gemini=a.gemini,
-                use_depth=a.depth, tracker="sam2" if a.sam2 else "classical",
-                scale_correction=a.scale_correction,
-                progress=(lambda s: print(f"  {s}...", file=sys.stderr)) if a.verbose else None)
+    r = analyze(a.clip, roi=_roi(a.roi), t_start=a.start, t_end=a.end, seed=_seed(a.seed),
+                progress=(lambda s: print(f"  {s}...", file=sys.stderr)) if a.verbose else None,
+                **_analyze_kwargs(a))
     v = r["verdict"]
     print(f"\n{v['verdict']}  ({v.get('confidence', 0):.0%} confidence)")
     print(v["headline"])
@@ -43,12 +75,23 @@ def cmd_analyze(a):
         print("  -", line)
     if v.get("explanation"):
         print("\n" + v["explanation"])
+    if v.get("stage") and v["verdict"] == "UNSURE":
+        print(f"\nStopped at: {v['stage']}")
     clk = r.get("clock") or {}
     if clk.get("source"):
         print(f"\nClock: {clk['source']} -> k = {clk['k']:.2f}")
     if r.get("scale"):
         for ru in r["scale"]["rulers"]:
             print(f"Ruler: {ru['name']}: {ru['detail']} (±{ru['rel_sigma'] * 100:.1f}%)")
+    z = r.get("zoom")
+    if z:
+        print(f"Zoom: ball {z['ball_px_before']:.0f} px in the first pass, {z['ball_px']:.0f} px "
+              f"measured at {z['scale'] * 100:.0f}% resolution")
+    tr = (r.get("track") or {}).get("points") or []
+    if tr:
+        mid = tr[len(tr) // 2]
+        print(f"Tracked {len(tr)} points, e.g. t = {mid['t']:.2f} s at x = {mid['x']:.2f}, "
+              f"y = {mid['y']:.2f} (wrong object? rerun with --seed T,X,Y on the ball)")
     for n in r.get("notes", []):
         print("Note:", n)
     print(f"({r['elapsed_s']:.1f} s)")
@@ -56,6 +99,81 @@ def cmd_analyze(a):
         with open(a.json, "w") as fh:
             json.dump(r, fh, indent=1, default=str)
         print("Full result:", a.json)
+
+
+VIDEO_EXT = (".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi")
+
+
+def cmd_batch(a):
+    """Measure many clips, one row each, so misreads are easy to sort."""
+    from .analyze import analyze
+    paths = []
+    for item in a.inputs:
+        if os.path.isdir(item):
+            for p in sorted(glob.glob(os.path.join(item, "*"))):
+                if p.lower().endswith(VIDEO_EXT):
+                    paths.append(p)
+        else:
+            paths.extend(sorted(glob.glob(item)) or [item])
+    if not paths:
+        print("No video files found.")
+        return
+    if a.json_dir:
+        os.makedirs(a.json_dir, exist_ok=True)
+    cols = ["file", "verdict", "confidence", "g", "sigma", "g_as_played", "k", "stage",
+            "ball_px", "zoomed", "frames", "fps", "flights", "drag_pct", "headline", "notes"]
+    rows = []
+    kw = _analyze_kwargs(a)
+    for i, p in enumerate(paths, 1):
+        name = os.path.basename(p)
+        print(f"[{i}/{len(paths)}] {name} ... ", end="", flush=True)
+        try:
+            r = analyze(p, **kw)
+        except Exception as e:  # keep going: one bad file shouldn't stop the batch
+            print(f"error: {e}")
+            rows.append({"file": name, "verdict": "ERROR", "headline": str(e)})
+            continue
+        v = r["verdict"]
+        fit = r.get("fit") or {}
+        work = r.get("work") or {}
+        drag = r.get("drag") or {}
+        row = {
+            "file": name, "verdict": v["verdict"], "confidence": round(v.get("confidence") or 0, 2),
+            "g": None if v.get("g") is None else round(v["g"], 3),
+            "sigma": None if v.get("sigma") is None else round(v["sigma"], 3),
+            "g_as_played": None if v.get("g_naive") is None else round(v["g_naive"], 3),
+            "k": v.get("k"), "stage": v.get("stage"),
+            "ball_px": round(fit["diam_px"], 1) if fit.get("diam_px") else None,
+            "zoomed": bool(r.get("zoom")), "frames": work.get("frames"),
+            "fps": round(work["fps_measured"], 2) if work.get("fps_measured") else None,
+            "flights": " ".join(str(fl["n"]) for fl in fit.get("flights", [])),
+            "drag_pct": round(100 * (drag["factor"] - 1), 1) if drag else None,
+            "headline": v.get("headline"), "notes": " | ".join(r.get("notes", [])),
+        }
+        rows.append(row)
+        g = f"g = {row['g']:.2f}" if row["g"] is not None else "no g"
+        print(f"{row['verdict']} ({g}, {row['stage']}, {r['elapsed_s']:.1f} s)")
+        if a.json_dir:
+            out = os.path.join(a.json_dir, os.path.splitext(name)[0] + ".json")
+            with open(out, "w") as fh:
+                json.dump(r, fh, indent=1, default=str)
+    with open(a.csv, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for row in rows:
+            w.writerow(row)
+    counts = {}
+    for row in rows:
+        counts[row["verdict"]] = counts.get(row["verdict"], 0) + 1
+    print("\n" + ", ".join(f"{k}: {n}" for k, n in sorted(counts.items())))
+    if a.expect:
+        want = {"real": ("REAL", "SLOWMO"), "ai": ("AI",)}[a.expect]
+        good = sum(1 for row in rows if row["verdict"] in want)
+        print(f"Expected {a.expect}: {good} of {len(rows)} right. Rows that missed:")
+        for row in rows:
+            if row["verdict"] not in want:
+                print(f"  {row['file']}: {row['verdict']} ({row.get('stage')}) {row.get('headline')}")
+    print(f"Wrote {a.csv}")
 
 
 def cmd_serve(a):
@@ -149,22 +267,44 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="galileo", description="Measure physics in video.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    def measure_opts(s):
+        s.add_argument("--object", default=None, choices=sorted(C.OBJECT_PRESETS),
+                       help="known object to use as the ruler (ping-pong also corrects for "
+                            "air drag)")
+        s.add_argument("--size-mm", type=float, help="object diameter in mm (instead of --object)")
+        s.add_argument("--size-unc", type=float, default=0.01, help="relative size uncertainty")
+        s.add_argument("--drag-vt", type=float,
+                       help="terminal speed in m/s for the air-drag correction "
+                            "(ping-pong 8.4; presets set it for you)")
+        s.add_argument("--no-zoom", action="store_true",
+                       help="skip the full-resolution second pass on small balls")
+        s.add_argument("--gemini", action="store_true", help="Gemini names the object and explains")
+        s.add_argument("--depth", action="store_true", help="add Depth Pro as a second ruler")
+        s.add_argument("--sam2", action="store_true", help="track with SAM 2 instead")
+        s.add_argument("--scale-correction", type=float, default=1.0)
+
     s = sub.add_parser("analyze", help="measure one clip")
     s.add_argument("clip")
-    s.add_argument("--object", default=None, choices=sorted(C.OBJECT_PRESETS),
-                   help="known object to use as the ruler")
-    s.add_argument("--size-mm", type=float, help="object diameter in mm (instead of --object)")
-    s.add_argument("--size-unc", type=float, default=0.01, help="relative size uncertainty")
-    s.add_argument("--roi", type=_roi, help="x0,y0,x1,y1 as fractions, e.g. 0.3,0,0.7,1")
+    measure_opts(s)
+    s.add_argument("--seed", nargs="+", metavar="T,X,Y",
+                   help='point at the ball: time (s) when it is in the air, then x,y as '
+                        'fractions or pixels, e.g. --seed "1.25,0.48,0.33"')
+    s.add_argument("--roi", nargs="+", metavar="X0,Y0,X1,Y1",
+                   help='region as fractions, e.g. --roi "0.3,0,0.7,1"')
     s.add_argument("--start", type=float)
     s.add_argument("--end", type=float)
-    s.add_argument("--gemini", action="store_true", help="Gemini names the object and explains")
-    s.add_argument("--depth", action="store_true", help="add Depth Pro as a second ruler")
-    s.add_argument("--sam2", action="store_true", help="track with SAM 2 instead")
-    s.add_argument("--scale-correction", type=float, default=1.0)
     s.add_argument("--json", help="write the full result here")
     s.add_argument("-v", "--verbose", action="store_true")
     s.set_defaults(func=cmd_analyze)
+
+    s = sub.add_parser("batch", help="measure every clip in a folder, write a CSV")
+    s.add_argument("inputs", nargs="+", help="folders, files, or wildcards like clips/*.mp4")
+    measure_opts(s)
+    s.add_argument("--csv", default="galileo_batch.csv", help="where to write the table")
+    s.add_argument("--json-dir", help="also save each full result as JSON here")
+    s.add_argument("--expect", choices=["real", "ai"],
+                   help="what these clips are, to count the misses")
+    s.set_defaults(func=cmd_batch)
 
     s = sub.add_parser("serve", help="web app and live tower loop")
     s.add_argument("--host", default="127.0.0.1")

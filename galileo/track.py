@@ -379,32 +379,112 @@ def _speed(tr: Track, times) -> float:
     return float(np.hypot(b.x - a.x, b.y - a.y) / dt) if dt > 0 else 0.0
 
 
+def _flight_score(t, x, y, d, dm) -> float:
+    """How much one flight looks like a dropped ball: long, smooth, steady in
+    size, and speeding up downward."""
+    from .physics import robust_fit_2d
+    n = len(t)
+    fit = robust_fit_2d(t, x, y)
+    a_down, s_down = fit.accel_along((0.0, 1.0))
+    a_mag = float(np.hypot(*fit.accel_vec()))
+    ext = float(np.hypot(np.ptp(x), np.ptp(y)))
+    # Speeds up downward, clearly (a hand pulling away or a slowing arm doesn't).
+    f_acc = 1.0 if (a_down > 0 and a_down > 3.0 * s_down) else 0.15
+    # Acceleration points down, not sideways or up.
+    cosang = a_down / a_mag if a_mag > 0 else 0.0
+    f_dir = 1.0 if cosang > 0.87 else (0.5 if cosang > 0.64 else 0.15)
+    # A ball keeps its size; hands, arms and shadows change shape. A slow trend
+    # (ball moving toward the camera) is allowed.
+    ok = np.isfinite(d) & (d > 0)
+    if ok.sum() >= 4 and np.ptp(t[ok]) > 0:
+        c = np.polyfit(t[ok] - t[ok].mean(), d[ok], 1)
+        res = d[ok] - np.polyval(c, t[ok] - t[ok].mean())
+        cv = float(1.4826 * np.median(np.abs(res)) / max(np.median(d[ok]), 1e-6))
+    else:
+        cv = 0.5
+    f_size = 1.0 / (1.0 + (cv / 0.15) ** 2)
+    # Smooth path: the fit residual is small next to the ball's size.
+    f_fit = float(np.exp(-fit.rms / (0.35 * dm + 0.7)))
+    return float(n * min(ext / dm, 25.0) * f_acc * f_dir * f_size * f_fit)
+
+
 def classify_and_score(tracks: list[Track], times) -> list[Track]:
+    """Score every moving track by its ballistic flights.
+
+    The track is cut at bounces first and each flight is judged on its own,
+    so a ball that bounces five times collects five flights of evidence
+    instead of failing one parabola fitted through all of them.
+    """
+    from .physics import split_flights
     for tr in tracks:
         x, y, d = tr.x, tr.y, tr.d
-        dm = float(np.median(d)) if len(d) else 1.0
+        dm = float(np.nanmedian(d)) if np.isfinite(d).any() else 1.0
+        dm = max(dm, 1.0)
         extent = float(np.hypot(np.ptp(x), np.ptp(y)))
         if extent < 1.0 * dm:
             tr.kind = "static"
             tr.score = 0.0
             continue
         tr.kind = "moving"
-        t = np.array([times[f] for f in tr.f])
-        n = len(t)
-        rms = dm
-        ay = 0.0
-        if n >= 4 and np.ptp(t) > 0:
-            tt = t - t.mean()
-            cy = np.polyfit(tt, y, 2)
-            cx = np.polyfit(tt, x, 2)
-            rms = float(np.sqrt(np.mean((y - np.polyval(cy, tt)) ** 2 +
-                                        (x - np.polyval(cx, tt)) ** 2)))
-            ay = 2 * cy[0]
-        score = n * min(extent / dm, 25.0) * np.exp(-rms / (0.5 * dm + 1.0))
-        if ay <= 0:
-            score *= 0.2
+        t = np.array([times[f] for f in tr.f], float)
+        score = 0.0
+        if len(t) >= 5 and np.ptp(t) > 0:
+            for idx in split_flights(t, x, y, (0.0, 1.0), diam_px=dm, min_pts=5):
+                score += _flight_score(t[idx], x[idx], y[idx], d[idx], dm)
+        if score <= 0:
+            # Moves, but no flight worth fitting: keep it as a weak fallback.
+            score = 0.02 * len(t) * min(extent / dm, 25.0)
         tr.score = float(score)
     return sorted(tracks, key=lambda t: -t.score)
+
+
+def pick_seeded(tracks: list[Track], times, seed) -> Track | None:
+    """The moving track that passes through the seed point(s).
+
+    seed: list of (t, x, y) in the same pixels as the tracks. One point is a
+    click on the ball; many points are an earlier track to follow again.
+    """
+    if not seed or not tracks:
+        return None
+    times = np.asarray(times, float)
+    dt = float(np.median(np.diff(times))) if len(times) > 1 else 1 / 30
+    tol_t = max(2.5 * dt, 0.04)
+    best, best_key = None, None
+    for tr in tracks:
+        if tr.kind != "moving" or not tr.dets:
+            continue
+        tt = times[tr.f]
+        dm = max(float(np.nanmedian(tr.d)) if np.isfinite(tr.d).any() else 8.0, 2.0)
+        lim = max(3.0 * dm, 25.0)
+        hits, dists = 0, []
+        for (ts, xs, ys) in seed:
+            j = np.flatnonzero(np.abs(tt - ts) <= tol_t)
+            if len(j) == 0:
+                continue
+            dd = float(np.min(np.hypot(tr.x[j] - xs, tr.y[j] - ys)))
+            if dd <= lim:
+                hits += 1
+                dists.append(dd)
+        if hits == 0:
+            continue
+        key = (hits, -float(np.median(dists)))
+        if best_key is None or key > best_key:
+            best, best_key = tr, key
+    if best is not None:
+        return best
+    if len(seed) == 1:
+        # The click missed every detection in time (the ball was still held,
+        # or the click fell between frames): take the track passing closest.
+        ts, xs, ys = seed[0]
+        for tr in tracks:
+            if tr.kind != "moving" or not tr.dets:
+                continue
+            dm = max(float(np.nanmedian(tr.d)) if np.isfinite(tr.d).any() else 8.0, 2.0)
+            cost = float(np.min(np.hypot(tr.x - xs, tr.y - ys)
+                                + 200.0 * np.abs(times[tr.f] - ts)))
+            if cost < 6.0 * dm + 60.0 and (best_key is None or cost < best_key):
+                best, best_key = tr, cost
+    return best
 
 
 @dataclass
@@ -415,6 +495,7 @@ class TrackResult:
     rest_d: float | None
     n_candidates: int
     d_fine: np.ndarray | None = None   # accurate widths for a subset of main (NaN elsewhere)
+    seeded: bool = False               # main was chosen by a seed (a click, or a first pass)
 
 
 def refine_widths(frames, bg, tr: Track, times, max_n: int = 40) -> np.ndarray:
@@ -433,31 +514,43 @@ def refine_widths(frames, bg, tr: Track, times, max_n: int = 40) -> np.ndarray:
     return out
 
 
-def track_falling_object(frames, times, *, roi=None, bg=None) -> TrackResult:
+def track_falling_object(frames, times, *, roi=None, bg=None, seed=None) -> TrackResult:
+    """Find the falling ball. seed: optional list of (t, x, y) points on it."""
     bg = background(frames) if bg is None else bg
+    times = np.asarray(times, float)
     dets = [detect(f, bg, roi=roi) for f in frames]
     tracks = link(dets, times)
     tracks = classify_and_score(tracks, times)
-    tracks = merge_fragments(tracks, times)
+    dt = float(np.median(np.diff(times))) if len(times) > 1 else 1 / 30
+    # Bridge short dropouts (bounce contact, a frame lost behind a hand),
+    # judged in time so 240 fps clips get the same 40 ms as 60 fps ones.
+    gap = max(4, int(round(0.04 / max(dt, 1e-6))))
+    tracks = merge_fragments(tracks, times, max_gap_frames=gap)
     tracks = classify_and_score(tracks, times)
     moving = [t for t in tracks if t.kind == "moving"]
     if not moving:
         return TrackResult(None, [], None, None, sum(len(d) for d in dets))
-    main = moving[0]
-    others = [t for t in moving[1:] if t.score > 0.3 * main.score
+    main = pick_seeded(moving, times, seed) if seed else None
+    seeded = main is not None
+    if main is None:
+        main = moving[0]
+    others = [t for t in moving if t is not main and t.score > 0.3 * main.score
               and len(set(t.f) & set(main.f)) >= 6]
     d_fine = refine_widths(frames, bg, main, times)
     # A static blob where the fall begins = the object's resting spot (ghost).
     rest, rest_d = None, None
     f0 = main.dets[0]
+    t0 = float(times[f0.f])
     for t in tracks:
         if t.kind != "static":
             continue
         sx, sy = float(np.median(t.x)), float(np.median(t.y))
-        if np.hypot(sx - f0.x, sy - f0.y) < 2.5 * f0.d and abs(t.dets[0].f - f0.f) < 30:
+        ts0, ts1 = float(times[t.dets[0].f]), float(times[t.dets[-1].f])
+        if np.hypot(sx - f0.x, sy - f0.y) < 2.5 * f0.d and ts0 - 0.1 <= t0 <= ts1 + 0.6:
             mid = t.dets[len(t.dets) // 2]
             wd = measure_width(frames[mid.f], bg, sx, sy, float(np.median(t.d)))
             rest = Det(f=t.dets[0].f, x=sx, y=sy, d=wd, area=0, elong=1, contrast=0)
             rest_d = wd if np.isfinite(wd) else None
             break
-    return TrackResult(main, others, rest, rest_d, sum(len(d) for d in dets), d_fine)
+    return TrackResult(main, others, rest, rest_d, sum(len(d) for d in dets), d_fine,
+                       seeded=seeded)
