@@ -3,6 +3,11 @@
 function uploadMarkup(prefix, label = '') {
   const presets = STATUS.presets || [], auto = !!STATUS.auto?.available;
   const options = presets.map(p => `<option value="${esc(p.key)}">${esc(p.label)} (${p.size_mm} mm)</option>`).join('');
+  const identification = STATUS.auto?.gemini
+    ? `Automatic identification tries Gemini first.${STATUS.auto.clip ? ' CLIP is the backup if Gemini cannot identify the object.' : ' CLIP backup is not available on this server.'}`
+    : STATUS.auto?.clip
+      ? `Automatic identification uses CLIP. Gemini is unavailable: ${STATUS.auto.gemini_detail || 'check the server’s API key and google-genai installation'}.`
+      : STATUS.auto?.detail || 'Automatic identification is not available on this server.';
   return `<div class="upload-fields" id="${prefix}-fields">
     <label class="zone" id="${prefix}-zone">
       <input class="visually-hidden" type="file" id="${prefix}-file" aria-label="${label ? esc(label) + ': ' : ''}Choose video" accept="video/*,.mp4,.mov,.m4v,.webm,.mkv,.avi">
@@ -13,7 +18,7 @@ function uploadMarkup(prefix, label = '') {
       <small>${auto ? "We'll identify the object, or ask you to help." : 'Choose the object so Galileo can estimate its real size.'}</small></label>
     <label class="field" id="${prefix}-size-wrap" hidden>Size in millimetres<input id="${prefix}-size" type="number" min="1" max="5000" step="any" placeholder="e.g. 38"><small>Diameter of a ball, or the object's longest side.</small></label>
     <details class="adv"><summary>More options</summary><label class="field">Camera field of view (optional)<input id="${prefix}-hfov" type="number" min="10" max="179.99" step="any" placeholder="Automatic"><small>Degrees across the long side of the video.</small></label>
-      ${!auto ? `<details class="t"><summary>Automatic identification setup</summary><p class="hint">${esc(STATUS.auto?.detail || 'Automatic identification is not installed on this server.')} See requirements-ml.txt in the project for the optional dependencies.</p></details>` : ''}</details>
+      <details class="t"><summary>Automatic identification status</summary><p class="hint">${esc(identification)}</p>${!STATUS.auto?.gemini ? '<p class="hint">Gemini reads GEMINI_API_KEY or GOOGLE_API_KEY from the server environment and needs google-genai. Restart the server after changing its environment. See galileo/site/README.md for setup.</p>' : ''}</details></details>
     <p class="err" id="${prefix}-error" role="alert" hidden></p>
   </div>`;
 }

@@ -19,6 +19,54 @@ No new production dependencies were added. Automatic object identification
 continues to use the main project's optional CLIP/Gemini setup. If it isn't
 available, the upload form lets you choose an object or enter its size.
 
+## Gemini-first object identification
+
+The website now matches the command line: when the core's
+`galileo.gemini.available()` finds a key and the optional SDK, each new job
+passes `use_gemini=True` to the public analyzer. Previously, an omitted web
+option incorrectly became `False`, so automatic uploads used only CLIP.
+Single uploads, both clips in a comparison, and remeasurement jobs all use the
+same adapter. Explicit per-job `gemini=False`/`True` choices remain supported.
+
+Choose **Identify automatically** in the upload form. The core prefers Gemini's
+identification and falls back to CLIP when Gemini fails or returns no usable
+identification. Its existing model retries, cache, manual object/size handling,
+and physics remain unchanged. The core may still precompute CLIP candidate
+scores before requesting Gemini; seeing CLIP load does not mean Gemini was
+skipped. The result's object identity records the provider actually used.
+
+The supplied core reads `GEMINI_API_KEY` or `GOOGLE_API_KEY` from the **server
+process's environment**. It does not search your filesystem for key files.
+If your key is already saved as a Windows environment variable, close and
+reopen the terminal (or IDE) before restarting the website so it inherits the
+updated environment. Ensure the SDK is installed in that same Python environment:
+
+```bash
+python -m pip install google-genai
+python -m galileo.site
+```
+
+If you instead saved the raw key in a text file, load that file into the server
+environment before launching. For example, in PowerShell (replace the path):
+
+```powershell
+$env:GEMINI_API_KEY = (Get-Content -Raw 'C:\path\to\gemini-key.txt').Trim()
+python -m galileo.site
+```
+
+**More options → Automatic identification status** shows whether Gemini is
+available and CLIP can serve as the backup. If Gemini is unavailable, it shows
+the core's setup reason even when CLIP is working. This is a configuration check;
+a rejected key, network failure, or exhausted quota is handled when the core
+makes its request. Credentials are never added to browser responses or job options.
+
+Provider regression tests cover both environment-variable names, missing keys,
+missing SDKs, explicit choices, and per-job checks. Three tests run the real
+public analysis pipeline on a sample clip with simulated model responses:
+Gemini success, Gemini error, and an empty Gemini response. These verify that
+Gemini's identity is preferred and CLIP supplies the fallback without making
+external API requests. A live request with your local key could not be tested here.
+
 ## What's new
 
 - A complete visual redesign: larger editorial typography, framed panels,
@@ -131,6 +179,7 @@ technical overview; it does not change the core's independent analysis limits.
 | `pipeline.py` | Public detector adapter and safe debug timeline mapping |
 | `app.py` | Existing job/media API and previews |
 | `tests/test_pipeline.py` | Adapter contract and timeline safety checks |
+| `tests/test_identification.py` | Gemini availability, provider priority, and CLIP fallback |
 | `tests/test_visuals.cjs` | Overlay coordinates, detection gaps, and gravity-gauge safety |
 
 ## Verification for this update
@@ -143,7 +192,7 @@ python -m pytest galileo/site/tests -q
 node --test galileo/site/tests/test_visuals.cjs
 ```
 
-14 Python adapter checks and 8 dependency-free JavaScript renderer checks passed.
+28 Python adapter/provider checks and 8 dependency-free JavaScript renderer checks passed.
 The adapter checks cover forwarding to the public analyzer,
 retaining future result fields, newly added presets, camera-input validation,
 and matching/mismatched/broken debug timelines. The renderer checks cover

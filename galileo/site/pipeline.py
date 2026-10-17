@@ -10,8 +10,13 @@ import numpy as np
 
 def analyse(job_dir: Path, src: Path, opts: dict, say):
     from ..analyze import analyze
+    from ..gemini import available as gemini_available
 
-    kw = {"use_gemini": bool(opts.get("gemini"))}
+    # Match the CLI: an omitted option means automatic, not False. Resolve this
+    # for each job through the core's key/SDK check, so ordinary uploads (single
+    # or comparison) prefer Gemini and retain the core's CLIP fallback.
+    preference = opts.get("gemini")
+    kw = {"use_gemini": gemini_available()[0] if preference is None else bool(preference)}
     obj = opts.get("object") or "auto"
     if opts.get("seed"):
         seed = opts["seed"]
