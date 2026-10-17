@@ -250,6 +250,30 @@ def test_tracker_follows_the_ball_not_the_hand(hand_clip):
     assert np.ptp(tr.main.y) > 150                       # it fell and bounced
 
 
+def test_debug_video_draws_every_frame(hand_clip, tmp_path):
+    from galileo.video import probe, read_frames
+    out = str(tmp_path / "hand_debug.mp4")
+    r = analyze(hand_clip["path"], preset="ping-pong", debug_video=out)
+    assert r.get("debug_video") == out and r["verdict"]["verdict"] == "REAL"
+    src, dbg = probe(hand_clip["path"]), probe(out)
+    assert dbg.width == src.width and dbg.height > src.height      # picture plus the charts
+    frames, _, _ = read_frames(out)
+    assert len(frames) == r["work"]["frames"]
+
+
+def test_panelled_ball_is_measured_whole(tmp_path):
+    # A volleyball's panels differ from the wall by different amounts; the
+    # width must come from the whole ball, not one panel.
+    sc = Scene(width=640, height=480, px_per_m=200.0, ball_d_m=0.21, bg_level=150, noise=2.0,
+               panels=((180, 90, 30), (40, 210, 235), (150, 150, 150), (180, 90, 30),
+                       (40, 210, 235), (240, 240, 240)), shading=0.25, y0=70.0, seed=11)
+    clip = make_clip(str(tmp_path / "volley.mp4"), scene=sc, motion=Motion(g=9.81, t_release=0.2),
+                     capture_fps=60, duration=0.75)["path"]
+    r = analyze(clip, preset="volleyball")
+    assert r["fit"]["diam_px"] == pytest.approx(0.21 * 200.0, rel=0.06)
+    assert r["verdict"]["verdict"] == "REAL"
+
+
 def test_small_fast_ball_gets_zoomed_and_drag_corrected(tmp_path, monkeypatch):
     from galileo import config as C
     sc = Scene(width=1280, height=720, px_per_m=350.0, ball_d_m=0.040, ball_bgr=(238, 240, 242),

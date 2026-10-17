@@ -25,6 +25,7 @@ class Scene:
     px_per_m: float = 520.0        # scale at the ball's distance
     ball_d_m: float = 0.038
     ball_bgr: tuple = (40, 150, 255)   # orange
+    panels: tuple | None = None    # several BGR colours in sectors (a volleyball), overrides ball_bgr
     shading: float = 0.35          # 0 = flat disc, 1 = strong limb darkening
     bg_level: int = 22
     grid: bool = False             # draw a 2 cm grid (calibration shots)
@@ -169,6 +170,8 @@ def render_frame(t_frame: float, m: Motion, sc: Scene, bg: np.ndarray, rng, *,
         cc = np.arange(c0, c1 + 1, dtype=np.float64) + 0.5
         cov = np.zeros((len(rr), len(cc)))
         shade = np.zeros_like(cov)
+        panels = np.asarray(sc.panels, np.float32) if sc.panels else None
+        colacc = np.zeros((len(rr), len(cc), 3)) if panels is not None else None
         for s in range(subsamples):
             tau = t_frame + readout * (rr - 0.5) / h + exposure * (s + 0.5) / subsamples
             if override_xy is None:
@@ -178,14 +181,24 @@ def render_frame(t_frame: float, m: Motion, sc: Scene, bg: np.ndarray, rng, *,
                 by = np.full_like(tau, override_xy[1])
             dy = rr - by
             hw = np.sqrt(np.clip(R * R - dy * dy, 0, None))
-            dx = np.abs(cc[None, :] - bx[:, None])
+            sdx = cc[None, :] - bx[:, None]
+            dx = np.abs(sdx)
             c = np.clip(hw[:, None] - dx + 0.5, 0.0, 1.0)
             rho2 = np.clip((dx**2 + dy[:, None] ** 2) / (R * R), 0, 1)
+            sh = c * (1.0 - sc.shading + sc.shading * np.sqrt(1.0 - rho2))
             cov += c
-            shade += c * (1.0 - sc.shading + sc.shading * np.sqrt(1.0 - rho2))
+            shade += sh
+            if panels is not None:
+                ang = np.arctan2(np.broadcast_to(dy[:, None], sdx.shape), sdx)
+                sec = np.floor((ang + np.pi) / (2 * np.pi) * len(panels)).astype(int) % len(panels)
+                colacc += sh[:, :, None] * panels[sec]
+        cov_sum = np.maximum(cov, 1e-9)
         cov /= subsamples
-        lum = np.where(cov > 0, shade / np.maximum(cov * subsamples, 1e-9), 0)
-        ball = np.asarray(sc.ball_bgr, np.float32)[None, None, :] * lum[:, :, None]
+        if panels is not None:
+            ball = (colacc / cov_sum[:, :, None]).astype(np.float32)
+        else:
+            lum = np.where(cov > 0, shade / cov_sum, 0)
+            ball = np.asarray(sc.ball_bgr, np.float32)[None, None, :] * lum[:, :, None]
         reg = img[r0:r1 + 1, c0:c1 + 1]
         img[r0:r1 + 1, c0:c1 + 1] = reg * (1 - cov[:, :, None]) + ball * cov[:, :, None]
     if m.hand:

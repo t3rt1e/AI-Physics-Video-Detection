@@ -11,20 +11,20 @@ from __future__ import annotations
 import numpy as np
 
 from . import config as C
-from .physics import JointFit, drag_factor, robust_fit_2d
+from .physics import JointFit, robust_fit_2d
 
 
 def _result(name, status, summary, **detail):
     return {"name": name, "status": status, "summary": summary, "detail": detail}
 
 
-def parabola_check(t, x, y, w0, jf: JointFit, drag: dict | None = None) -> dict:
+def parabola_check(t, x, y, w0, jf: JointFit, drag_corrected: bool = False) -> dict:
     """Constant acceleration within one fall: compare first and second halves.
 
     Only a clear, significant change fails. When the halves are too noisy to
-    compare, the check says so instead of passing. drag ({"vt", "v_scale"})
-    lets a light ball read lower in the faster second half, as air drag makes
-    a real one do.
+    compare, the check says so instead of passing. drag_corrected says the
+    positions already had air drag's push taken out (light balls), which only
+    changes the wording.
     """
     name = "Constant acceleration"
     if not jf.flights:
@@ -40,14 +40,10 @@ def parabola_check(t, x, y, w0, jf: JointFit, drag: dict | None = None) -> dict:
     accs = []
     for p in parts:
         f = robust_fit_2d(t[p], x[p], y[p], w0[p], alpha=jf.alpha, r=r[p], rc=fl.fit.rc)
-        a, sa = f.accel_along(jf.gdir)
-        if drag:
-            fac, _ = drag_factor(f, t[p] - f.t0, jf.gdir, drag["v_scale"], drag["vt"])
-            a, sa = a * fac, sa * fac
-        accs.append((a, sa))
+        accs.append(f.accel_along(jf.gdir))
     (a1, s1), (a2, s2) = accs
     detail = dict(a_first_px=a1, a_second_px=a2, sigma_first=s1, sigma_second=s2,
-                  drag_corrected=bool(drag))
+                  drag_corrected=bool(drag_corrected))
     # A half that clearly runs the wrong way (decelerating fall, rising "drop").
     if (a1 + 2.5 * s1 < 0 and a2 - 2.5 * s2 > 0) or (a2 + 2.5 * s2 < 0 and a1 - 2.5 * s1 > 0):
         return _result(name, "fail",
@@ -68,11 +64,11 @@ def parabola_check(t, x, y, w0, jf: JointFit, drag: dict | None = None) -> dict:
                        f"Acceleration changes by {pct:+.0f}% between the first and second half "
                        "of the fall. Real gravity is constant.", **detail)
     if (ratio < wlo or ratio > whi) and abs(z) > 3:
-        why = ("lens distortion, or a sign of generated motion" if drag else
+        why = ("lens distortion, or a sign of generated motion" if drag_corrected else
                "air drag, lens distortion, or a sign of generated motion")
         return _result(name, "warn",
                        f"Acceleration drifts {pct:+.0f}% during the fall ({why}).", **detail)
-    extra = " after allowing for air drag" if drag else ""
+    extra = " after taking out air drag" if drag_corrected else ""
     return _result(name, "pass",
                    f"Acceleration holds steady through the fall ({pct:+.0f}% half to half"
                    f"{extra}).", **detail)
@@ -106,7 +102,9 @@ def bounce_check(t, jf: JointFit, frame_dt: float) -> dict:
         tb = grid[sgn[np.argmin(np.abs(grid[sgn] - tm))]] if len(sgn) else tm
         va = np.polyval(np.polyder(pa[::-1]), tb - ta0)
         vb = np.polyval(np.polyder(pb[::-1]), tb - tb0)
-        e = -vb / va if va > 0 else float("nan")
+        if not (va > 0 and vb < 0):
+            continue  # not a bounce (coming in down, going out up): a gap or a glitch
+        e = -vb / va
         pairs.append({"t_bounce": float(tb), "v_in": float(va), "v_out": float(vb),
                       "restitution": float(e),
                       "a_ratio": float(b.a_along / a.a_along) if a.a_along else float("nan"),

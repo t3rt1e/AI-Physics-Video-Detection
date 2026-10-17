@@ -130,20 +130,21 @@ def work_scale(info: ClipInfo, n_frames: int, max_side: int, budget: int) -> flo
     return max(s, 0.25)
 
 
-def read_frames(path: str, info: ClipInfo | None = None, *, scale: float = 1.0,
+def iter_frames(path: str, info: ClipInfo | None = None, *, scale: float = 1.0,
                 t_start: float | None = None, t_end: float | None = None,
-                max_frames: int | None = None, gray: bool = False, crop=None):
-    """Decode frames (display orientation) at `scale`. Returns (frames, times, numbers).
+                gray: bool = False, crop=None, first_num: int | None = None,
+                last_num: int | None = None):
+    """Yield (frame, time, number) one frame at a time, upright, at `scale`.
 
-    times are seconds from the first frame of the file, from presentation
-    timestamps. numbers are frame indices within the file. crop is
-    (x0, y0, x1, y1) in pixels of the scaled, upright frame: only that window
-    is kept, so a small region can be decoded at full resolution.
+    time is seconds from the file's first frame (presentation timestamps);
+    number is the frame's index in the file. Frames outside the time window
+    or the [first_num, last_num] range are skipped without converting them.
+    crop is (x0, y0, x1, y1) in pixels of the scaled, upright frame.
     """
     info = info or probe(path)
-    frames, times, nums = [], [], []
     if av is None:
-        return _read_cv(path, info, scale, t_start, t_end, max_frames, gray, crop)
+        yield from _iter_cv(path, info, scale, t_start, t_end, gray, crop, first_num, last_num)
+        return
     with av.open(path) as c:
         vs = c.streams.video[0]
         vs.thread_type = "AUTO"
@@ -156,11 +157,14 @@ def read_frames(path: str, info: ClipInfo | None = None, *, scale: float = 1.0,
             if t_first is None:
                 t_first = t
             t -= t_first
+            if first_num is not None and i < first_num:
+                continue
+            if last_num is not None and i > last_num:
+                break
             if t_start is not None and t < t_start - 1e-9:
                 continue
             if t_end is not None and t > t_end + 1e-9:
                 break
-            rot = info.rotation
             sw, sh = fr.width, fr.height
             tw, th = max(2, int(round(sw * scale))), max(2, int(round(sh * scale)))
             fmt = "gray" if gray else "bgr24"
@@ -172,14 +176,31 @@ def read_frames(path: str, info: ClipInfo | None = None, *, scale: float = 1.0,
                     img = fr.reformat(width=tw, height=th, format=fmt).to_ndarray()
             else:
                 img = fr.to_ndarray(format=fmt)
-            img = _rotate(img, rot)
+            img = _rotate(img, info.rotation)
             if crop is not None:
                 img = np.ascontiguousarray(img[crop[1]:crop[3], crop[0]:crop[2]])
-            frames.append(img)
-            times.append(t)
-            nums.append(i)
-            if max_frames and len(frames) >= max_frames:
-                break
+            yield img, t, i
+
+
+def read_frames(path: str, info: ClipInfo | None = None, *, scale: float = 1.0,
+                t_start: float | None = None, t_end: float | None = None,
+                max_frames: int | None = None, gray: bool = False, crop=None):
+    """Decode frames (display orientation) at `scale`. Returns (frames, times, numbers).
+
+    times are seconds from the first frame of the file, from presentation
+    timestamps. numbers are frame indices within the file. crop is
+    (x0, y0, x1, y1) in pixels of the scaled, upright frame: only that window
+    is kept, so a small region can be decoded at full resolution.
+    """
+    info = info or probe(path)
+    frames, times, nums = [], [], []
+    for img, t, i in iter_frames(path, info, scale=scale, t_start=t_start, t_end=t_end,
+                                 gray=gray, crop=crop):
+        frames.append(img)
+        times.append(t)
+        nums.append(i)
+        if max_frames and len(frames) >= max_frames:
+            break
     times = np.asarray(times)
     side = _sidecar(path)
     if side and side.get("timestamps") and len(nums) > 0:
@@ -216,34 +237,35 @@ def regularize_timestamps(ts) -> np.ndarray:
     return per * (n - n[0]).astype(float)
 
 
-def _read_cv(path, info, scale, t_start, t_end, max_frames, gray, crop=None):
+def _iter_cv(path, info, scale, t_start, t_end, gray, crop=None, first_num=None,
+             last_num=None):
     cap = cv2.VideoCapture(path)
-    frames, times, nums = [], [], []
     i = 0
     fps = info.fps or 30.0
-    while True:
-        ok, img = cap.read()
-        if not ok:
-            break
-        t = i / fps
-        i += 1
-        if t_start is not None and t < t_start:
-            continue
-        if t_end is not None and t > t_end:
-            break
-        if scale != 1.0:
-            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        if gray:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        if crop is not None:
-            img = np.ascontiguousarray(img[crop[1]:crop[3], crop[0]:crop[2]])
-        frames.append(img)
-        times.append(t)
-        nums.append(i - 1)
-        if max_frames and len(frames) >= max_frames:
-            break
-    cap.release()
-    return frames, np.asarray(times), np.asarray(nums)
+    try:
+        while True:
+            ok, img = cap.read()
+            if not ok:
+                break
+            t = i / fps
+            i += 1
+            if first_num is not None and i - 1 < first_num:
+                continue
+            if last_num is not None and i - 1 > last_num:
+                break
+            if t_start is not None and t < t_start:
+                continue
+            if t_end is not None and t > t_end:
+                break
+            if scale != 1.0:
+                img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            if gray:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            if crop is not None:
+                img = np.ascontiguousarray(img[crop[1]:crop[3], crop[0]:crop[2]])
+            yield img, t, i - 1
+    finally:
+        cap.release()
 
 
 def motion_window(path: str, info: ClipInfo, max_frames: int, pad_s: float = 0.4):

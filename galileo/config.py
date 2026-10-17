@@ -29,6 +29,7 @@ OBJECT_PRESETS = {
     "soccer": {"label": "soccer ball", "size_m": 0.22, "rel_unc": 0.02, "vt": 23.0},
     "basketball": {"label": "basketball", "size_m": 0.239, "rel_unc": 0.02, "vt": 20.0},
     "ping-pong": {"label": "ping-pong ball", "size_m": 0.040, "rel_unc": 0.01, "vt": 8.4},
+    "pickleball": {"label": "pickleball", "size_m": 0.074, "rel_unc": 0.015, "vt": 15.0},
     "apple": {"label": "apple", "size_m": 0.075, "rel_unc": 0.15, "vt": 40.0},
     "orange": {"label": "orange", "size_m": 0.075, "rel_unc": 0.15, "vt": 40.0},
 }
@@ -68,9 +69,10 @@ MAX_FRAMES = 900
 
 # Zoom pass: if the ball is smaller than ZOOM_MIN_PX in the first pass, the fall
 # is decoded again, cropped around the ball's path, at a scale that makes the
-# ball about ZOOM_TARGET_PX wide (never above the original resolution).
-ZOOM_MIN_PX = 22.0
-ZOOM_TARGET_PX = 32.0
+# ball about ZOOM_TARGET_PX wide (never above the original resolution). Edge
+# errors are about a pixel whatever the size, so a bigger ball reads truer.
+ZOOM_MIN_PX = 40.0
+ZOOM_TARGET_PX = 64.0
 ZOOM_BUDGET_BYTES = 700_000_000
 
 # Gravity must point within this many degrees of the frame's "down".

@@ -31,6 +31,57 @@ press **Measure**. One clip on the command line:
 python -m galileo analyze data/clips/synthetic_ai_floaty_24fps.mp4 --object steel-38mm
 ```
 
+## Measuring your own clips
+
+```bash
+python -m galileo analyze my_drop.mp4 --object ping-pong      # or --size-mm 40 for any ball
+python -m galileo analyze my_drop.mp4 --object ping-pong --debug-video
+python -m galileo analyze my_drop.mp4 --object ping-pong --seed "1.25,0.48,0.33"
+python -m galileo batch path/to/real_clips --object ping-pong --expect real --csv real.csv
+```
+
+- **See what Galileo saw.** `--debug-video` writes `my_drop_debug.mp4` next to the clip
+  (or give it a path). Every frame shows the blobs it considered (grey rings), other
+  moving things with their scores, the tracked ball (one colour per flight, grey where a
+  frame was left out of the fit), the fitted path, the velocity (white arrow) and
+  acceleration (red arrow, beside a gold 9.8 m/s² line), where a real ball would be (gold
+  ring), and the zoom box. The readout gives the time, which flight it's in, the ball's
+  position as fractions of the frame (ready for `--seed`), its speed, the fitted
+  acceleration and a local one from the frames around it. Underneath, height and
+  acceleration against time with a cursor. `--debug-speed 0.25` plays it at quarter
+  speed; `batch ... --debug-dir debug` makes one per clip.
+
+- **Name the ball.** `--object` is the ruler (its real size). For light balls it also
+  turns on the air-drag correction: a ping-pong ball dropped from a meter falls 5 to 20%
+  slower than gravity alone would make it, and Galileo puts that back. `--size-mm` gives
+  the size but not the drag, so prefer the preset when there is one (or add
+  `--drag-vt 8.4`, the ball's top speed in m/s).
+- **Point at the ball when it tracks the wrong thing.** `--seed T,X,Y` is a time in
+  seconds when the ball is in the air and its position, either as fractions of the
+  width and height (`0.48,0.33`) or in pixels (`920,356`). In the web app, press
+  **Pick the ball**, pause on a frame with the ball in the air, and click it. In
+  PowerShell, keep the quotes around the numbers.
+- **Sort a folder at once.** `batch` measures every clip in a folder and writes a CSV
+  with the verdict, g, the stage where it stopped, the ball's size in pixels, whether it
+  zoomed in, and the notes. `--expect real` (or `ai`) lists the clips it got wrong, and
+  `--json-dir` keeps every full result.
+- **Small balls get a second look.** High-frame-rate clips are scaled down to fit in
+  memory, which can leave a ping-pong ball 5 to 8 px wide. When the ball comes out
+  smaller than about 40 px, Galileo decodes just the patch and stretch of time where it
+  flew at up to full resolution and measures it again (`--no-zoom` turns this off).
+
+**Reading "Can't tell".** The verdict says where it stopped (`stage` in the JSON, and
+in the CSV):
+
+| Stage | What it means | What to try |
+| --- | --- | --- |
+| `tracking: nothing moving` / `no flight` | No falling object found | Pick the ball; check the ball contrasts with the background |
+| `tracking: not a fall` | The tracked thing moves up or sideways: usually the hand | Pick the ball |
+| `tracking: slows while falling` | Something lowered or caught, not dropped | Pick the ball |
+| `tracking: too few frames or jitter` | Too short or too shaky a track | Film closer, steadier, with more of the fall in view |
+| `measurement: too uncertain` | The error bar is too wide to call | Bigger ball in the frame, longer fall, better light |
+| `ruler: missing` | No size given | Add `--object` or `--size-mm` |
+
 ## Does anything need training?
 
 **No.** Nothing in Galileo is trained, on your laptop or anywhere else.
@@ -115,7 +166,8 @@ its CONFIG block first.
   webcam to portrait: it fits the tower, and the sensor's rolling shutter then scans
   across the fall instead of along it.
 - A matte, brightly coloured ball on the black backdrop. Shiny steel tracks badly.
-- Use a dense ball. A ping-pong ball feels enough air drag to read low.
+- A dense ball is the cleanest. A ping-pong ball works with `--object ping-pong`, which
+  corrects for its air drag.
 - Steady light for the live loop. 60 fps or better.
 
 ## Calibration
@@ -150,26 +202,48 @@ Veo clips are 24 fps and 4, 6 or 8 s long, and stay downloadable for 2 days.
 
 1. **Frames** (`video.py`): PyAV decode with exact timestamps, display rotation, and
    capture-rate tags. Long clips are cut to the stretch with the most motion.
-2. **Camera motion** (`stabilize.py`): pans, drift and zooms are tracked on the
-   background and removed. A locked-off camera is left alone.
-3. **Tracking** (`track.py`): background subtraction, then the ball's width is measured
-   across its direction of motion, which motion blur can't stretch. A profile model for a
-   lit sphere plus lens blur keeps the width within about 2% on 25 px balls.
-4. **Fitting** (`physics.py`): the track is cut into flights at bounces and each gets a
-   robust parabola. One rolling-shutter term (bounded by a frame's readout time) is fitted
-   when it clearly helps; uncorrected, a 60 fps webcam can read 5 to 10% high.
-5. **Checks** (`checks.py`): tests that need neither ruler nor clock.
-6. **Clocks** (`clocks.py`): capture-rate tags, high-frame-rate timestamps, repeated
+2. **Camera motion** (`stabilize.py`): pans, drift, zooms and handheld shake are tracked
+   on the background against keyframes and removed. Matching against a keyframe (not the
+   previous frame) keeps a slowly moving hand from leaking in as fake camera motion at
+   120 to 240 fps. A locked-off camera is left alone.
+3. **Tracking** (`track.py`): background subtraction, then every moving thing is cut into
+   flights and scored on how much each flight looks like a dropped ball: long, smooth,
+   steady in size, and speeding up downward. A hand pulling away scores near zero; a ball
+   that bounces five times collects five flights of evidence. A click on the ball (a
+   seed) overrides the score. The ball's width is measured across its direction of
+   motion, which motion blur can't stretch; for big multi-coloured balls (a volleyball's
+   panels) the outline is used, because the panels don't stand out from the wall equally.
+4. **Zoom** (`analyze.py`): if the ball came out small, the stretch of time and patch of
+   picture where it flew are decoded again at up to full resolution and tracked there.
+5. **Fitting** (`physics.py`): the track is cut into flights at bounces (direction changes
+   are judged over 1/60 s, so noise at 240 fps isn't a bounce) and each gets a robust
+   parabola in x and y, so sideways motion is fine: g is the part along gravity. One
+   rolling-shutter term (bounded by a frame's readout time) is fitted when it clearly
+   helps; uncorrected, a 60 fps webcam can read 5 to 10% high. Gravity is the picture's
+   "down" unless the camera is clearly tilted (up to 30 degrees); it never flips.
+6. **Air drag**: for light balls Galileo works out, from the measured speed, how far drag
+   pushed the ball off a vacuum path at every frame, takes that out of the positions and
+   fits again. The parabola and the rolling-shutter term then see pure gravity instead of
+   bending to absorb drag. Rising and falling hops barely need it; a long first drop
+   needs the most.
+7. **Checks** (`checks.py`): tests that need neither ruler nor clock. Only a clear,
+   significant change fails the constant-acceleration check.
+8. **Clocks** (`clocks.py`): capture-rate tags, high-frame-rate timestamps, repeated
    frames, interpolation patterns, and lighting flicker (a hint only).
-7. **Rulers** (`scale.py`): object size, plus Depth Pro or a manual ruler, fused with
+9. **Rulers** (`scale.py`): object size, plus Depth Pro or a manual ruler, fused with
    error bars that widen when rulers disagree.
-8. **Verdict** (`verdict.py`): a scale-free failure means AI; otherwise g decides, with a
-   ±15% band (wider if the error bars are). Too slow with no clock explaining it is AI;
-   matching Earth after a found slow-down is real slow motion.
+10. **Verdict** (`verdict.py`): a scale-free failure means AI. A tracked thing that never
+   falls, or slows as it falls, gets "Can't tell" (it is probably a hand); one that falls
+   at a steady speed is AI. Otherwise g decides, with a ±15% band; if the error bar is
+   wider than ±35% the answer is "too uncertain" unless g is far off anyway. Too slow with
+   no clock explaining it is AI; matching Earth after a found slow-down is real slow
+   motion.
 
 On synthetic clips with known physics (60 fps rolling-shutter webcam, 240 fps native,
 8x tagged, 4x repeated, 4x interpolated, bounces, a panning camera, AI-style floaty and
-eased falls) every verdict comes out right and g lands within about 1 to 4% of truth.
+eased falls, and 1080p 120 fps ping-pong drops with a hand, air drag, sideways kicks at
+each bounce and handheld shake) every verdict comes out right and g lands within about
+1 to 4% of truth.
 Real footage is the real test, so film a few phone drops of the steel ball tonight and
 check them before the tower is up.
 

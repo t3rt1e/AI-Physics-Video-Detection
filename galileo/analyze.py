@@ -25,7 +25,7 @@ import numpy as np
 
 from . import checks, clocks
 from . import config as C
-from .physics import (_noise_px, drag_factor, fit_flights, gravity_direction, recombine,
+from .physics import (_noise_px, drag_factor, drag_path, fit_flights, gravity_direction,
                       rolling_shutter_effect, split_flights)
 from .scale import Ruler, fuse, ruler_from_size, ruler_manual
 from .stabilize import rescale_transforms, stabilize, warp
@@ -97,7 +97,7 @@ def _depth_factors(t, d, flight_idx):
     return m, float(change)
 
 
-def _arrays(tr, times, geo):
+def _arrays(tr, times, geo, notes=None):
     """Track as arrays in (global) working px."""
     main = tr.main
     f = main.f
@@ -110,6 +110,16 @@ def _arrays(tr, times, geo):
     area = main.area
     w0 = np.where(area > 1.8 * np.median(area), 0.3, 1.0)
     d_ref = float(np.nanmedian(d)) if np.isfinite(d).any() else float(np.median(d_quick))
+    # Safety net: the careful width and the blob's outline should roughly
+    # agree. If the careful one is far smaller on a big ball, it measured a
+    # piece of it (a panel), so use the outline.
+    dq = float(np.nanmedian(d_quick)) if np.isfinite(d_quick).any() else float("nan")
+    if np.isfinite(dq) and dq >= 16 and d_ref < 0.7 * dq:
+        if notes is not None:
+            notes.append(f"The ball's width came out {d_ref:.0f} px one way and {dq:.0f} px the "
+                         "other; used the outline width.")
+        d = np.where(np.isfinite(d_quick), d_quick, np.nan)
+        d_ref = dq
     return f, t, x, y, d, w0, d_ref
 
 
@@ -147,21 +157,43 @@ def _track(tracker, frames, times, roi_px, seed_pts, sam2_box):
 
 
 # ---------------------------------------------------------------------------
-def analyze(path: str, *, preset: str | None = None, size_m: float | None = None,
-            size_rel_unc: float = 0.01, label: str | None = None, roi=None,
-            t_start: float | None = None, t_end: float | None = None,
-            manual_ruler=None, use_gemini: bool = False, use_depth: bool = False,
-            tracker: str = "classical", sam2_box=None, stabilize_mode: str = "auto",
-            rs_mode: str = "auto", g_ref: float = C.G_EARTH, scale_correction: float = 1.0,
-            seed=None, zoom: bool = True, drag_vt: float | None = None,
-            progress: Callable[[str], None] | None = None) -> dict:
+def analyze(path: str, *, debug_video: str | None = None, debug_speed: float = 1.0,
+            progress: Callable[[str], None] | None = None, **kw) -> dict:
     """Measure one clip.
+
+    Keyword options: preset, size_m, size_rel_unc, label, roi, t_start, t_end,
+    manual_ruler, use_gemini, use_depth, tracker, sam2_box, stabilize_mode,
+    rs_mode, g_ref, scale_correction, and:
 
     seed: (t, x, y), a point on the ball at video time t; x, y as fractions of
     the picture (or original pixels). Use it when Galileo follows the wrong
     thing. zoom: allow the full-resolution second pass. drag_vt: the ball's
     terminal speed in m/s for the air-drag correction (presets carry one).
+    debug_video: also write an MP4 showing what Galileo saw, frame by frame
+    (debug_speed < 1 slows it down).
     """
+    dbg: dict | None = {} if debug_video else None
+    result = _run(path, dbg=dbg, progress=progress, **kw)
+    if debug_video:
+        say = progress or (lambda s_: None)
+        say("drawing the debug video")
+        try:
+            from .debugvideo import render_debug_video
+            render_debug_video(path, dbg, result, debug_video, speed=debug_speed)
+            result["debug_video"] = debug_video
+        except Exception as e:  # never lose the measurement over the picture
+            result.setdefault("notes", []).append(f"Debug video failed: {e}")
+    return result
+
+
+def _run(path: str, *, dbg: dict | None = None, preset: str | None = None,
+         size_m: float | None = None, size_rel_unc: float = 0.01, label: str | None = None,
+         roi=None, t_start: float | None = None, t_end: float | None = None,
+         manual_ruler=None, use_gemini: bool = False, use_depth: bool = False,
+         tracker: str = "classical", sam2_box=None, stabilize_mode: str = "auto",
+         rs_mode: str = "auto", g_ref: float = C.G_EARTH, scale_correction: float = 1.0,
+         seed=None, zoom: bool = True, drag_vt: float | None = None,
+         progress: Callable[[str], None] | None = None) -> dict:
     t_wall = time.time()
     say = progress or (lambda s: None)
     info = probe(path)
@@ -203,6 +235,9 @@ def analyze(path: str, *, preset: str | None = None, size_m: float | None = None
                                "measured, so it was ignored.")
     say("tracking")
     tr = _track(tracker, frames_s, times, roi_px, seed_pts, sam2_box)
+    if dbg is not None:
+        dbg.update(info=info, seed=seed_pts,
+                   pass1={"geo": geo, "times": times, "nums": nums, "tr": tr})
     if tr.main is None:
         return _unsure(result, "No falling object found. Pick the ball (click it in the web "
                                "app, or --seed on the command line), or try a region (ROI).",
@@ -210,7 +245,7 @@ def analyze(path: str, *, preset: str | None = None, size_m: float | None = None
     if seed_pts and not tr.seeded:
         result["notes"].append("Nothing moving passed through the ball pick, so Galileo "
                                "chose the object itself.")
-    f, t, x, y, d, w0, d_ref = _arrays(tr, times, geo)
+    f, t, x, y, d, w0, d_ref = _arrays(tr, times, geo, result["notes"])
     fl = split_flights(t, x, y, DOWN, diam_px=d_ref)
     if not fl:
         return _unsure(result, "The object moves, but no clean ballistic flight was found.",
@@ -246,8 +281,8 @@ def analyze(path: str, *, preset: str | None = None, size_m: float | None = None
                 result["notes"].append(f"Tried to zoom in on the {d_ref:.0f} px ball but lost "
                                        "it, so it was measured in the first pass.")
             else:
-                gray_z, times_z, geo_z, tr_z = z
-                f2, t2, x2, y2, d2, w02, d_ref2 = _arrays(tr_z, times_z, geo_z)
+                gray_z, times_z, geo_z, tr_z, nums_z = z
+                f2, t2, x2, y2, d2, w02, d_ref2 = _arrays(tr_z, times_z, geo_z, result["notes"])
                 fl2 = split_flights(t2, x2, y2, DOWN, diam_px=d_ref2)
                 if fl2:
                     ratio = geo_z.W / geo.W
@@ -257,6 +292,9 @@ def analyze(path: str, *, preset: str | None = None, size_m: float | None = None
                         "t0": float(times_z[0]), "t1": float(times_z[-1]),
                         "ball_px_before": d_ref, "ball_px": d_ref2}
                     others_acc = [(a * ratio, s_ * ratio) for a, s_ in others_acc]
+                    if dbg is not None:
+                        dbg["pass2"] = {"geo": geo_z, "times": times_z, "nums": nums_z,
+                                        "tr": tr_z, "crop": plan["crop"]}
                     gray, times, geo, tr = gray_z, times_z, geo_z, tr_z
                     f, t, x, y, d, w0, d_ref, fl = f2, t2, x2, y2, d2, w02, d_ref2, fl2
                 else:
@@ -271,15 +309,15 @@ def analyze(path: str, *, preset: str | None = None, size_m: float | None = None
     xs = cxp + (x - cxp) * m_fac
     ys = cyp + (y - cyp) * m_fac
     n_axis = geo.W if rs_axis == "x" else geo.H
-    jf = fit_flights(t, xs, ys, w0, fl, fps=fps_file, n_px_axis=n_axis, rs_axis=rs_axis,
-                     rs_mode=rs_mode, gdir=gdir)
+    fit_kw = dict(fps=fps_file, n_px_axis=n_axis, rs_axis=rs_axis, rs_mode=rs_mode, gdir=gdir)
+    jf = fit_flights(t, xs, ys, w0, fl, **fit_kw)
     gdir, tilt_note = _aim_gravity(jf)
     if tilt_note:
         result["notes"].append(tilt_note)
     if gdir is not DOWN and not np.allclose(gdir, DOWN):
         fl = split_flights(t, xs, ys, gdir, diam_px=d_ref) or fl
-        jf = fit_flights(t, xs, ys, w0, fl, fps=fps_file, n_px_axis=n_axis,
-                         rs_axis=rs_axis, rs_mode=rs_mode, gdir=gdir)
+        fit_kw["gdir"] = gdir
+        jf = fit_flights(t, xs, ys, w0, fl, **fit_kw)
     rs_rel = rolling_shutter_effect(jf, t, xs, ys, w0)
     naive = {"a_px": jf.a_px, "a_sigma": jf.a_sigma}
 
@@ -307,9 +345,8 @@ def analyze(path: str, *, preset: str | None = None, size_m: float | None = None
             fl2 = split_flights(t[ii], xs[ii], ys[ii], gdir, diam_px=d_ref)
             if fl2:
                 fl2 = [ii[s_] for s_ in fl2]
-                jf = fit_flights(t, xs, ys, w0, fl2, fps=fps_file / clock["k"],
-                                 n_px_axis=n_axis, rs_axis=rs_axis, rs_mode=rs_mode,
-                                 gdir=gdir)
+                fit_kw["fps"] = fps_file / clock["k"]
+                jf = fit_flights(t, xs, ys, w0, fl2, **fit_kw)
                 fl = fl2
                 refit_note = (f"Refit on the {len(ii)} original frames "
                               f"({clock['source']}).")
@@ -367,22 +404,45 @@ def analyze(path: str, *, preset: str | None = None, size_m: float | None = None
                                "widened.")
 
     # ---- air drag ----------------------------------------------------------------------
+    # For a light ball, work out how far drag pushed it off a vacuum path at
+    # each frame (from its measured speed), take that out of the positions, and
+    # fit again. The parabola and the rolling-shutter term then see pure
+    # gravity, instead of bending to absorb drag.
     k_clock = 1.0
     if clock and clock.get("confidence", 0) >= C.CLOCK_MIN_CONFIDENCE:
         k_clock = float(clock["k"])
+    jf_obs = jf                                  # fit to the positions as filmed
     a_raw, s_raw = jf.a_px, jf.a_sigma
+    xs_f, ys_f = xs, ys
+    D = np.zeros((len(t), 2))
     drag = None
-    if vt and scale:
+    if vt and scale and a_raw > 0:
         v_scale = scale["s"] * k_clock          # px per video-s -> m per real s
-        per = []
-        for fr_ in jf.flights:
-            fac, q = drag_factor(fr_.fit, t[fr_.idx] - fr_.fit.t0, gdir, v_scale, vt)
-            fr_.a_along *= fac
-            fr_.a_sigma *= fac
-            per.append(fac)
-        recombine(jf)
-        drag = {"factor": float(jf.a_px / a_raw) if a_raw else 1.0, "vt": float(vt),
-                "v_scale": float(v_scale), "flights": [float(v_) for v_ in per]}
+        jf_free, vd = jf_obs, [None] * len(jf_obs.flights)
+        for _ in range(2):
+            D = np.zeros((len(t), 2))
+            new_vd = []
+            for q, fr_ in enumerate(jf_free.flights):
+                idx = fr_.idx
+                grid, (dx_, dy_), vdq = drag_path(fr_.fit, t[idx[0]], t[idx[-1]], v_scale, vt,
+                                                  g_ref, k_clock, v_extra=vd[q])
+                D[idx, 0] = np.interp(t[idx], grid, dx_)
+                D[idx, 1] = np.interp(t[idx], grid, dy_)
+                new_vd.append(vdq)
+            vd = new_vd
+            xs_f, ys_f = xs - D[:, 0], ys - D[:, 1]
+            jf_free = fit_flights(t, xs_f, ys_f, w0, fl, **fit_kw)
+        factor = jf_free.a_px / a_raw
+        if 0.8 < factor < 2.0:
+            jf = jf_free
+            rs_rel = rolling_shutter_effect(jf, t, xs_f, ys_f, w0)
+            drag = {"factor": float(factor), "vt": float(vt), "v_scale": float(v_scale),
+                    "flights": [float(ff.a_along / fo.a_along) if fo.a_along else 1.0
+                                for fo, ff in zip(jf_obs.flights, jf.flights)],
+                    "max_shift_px": float(np.abs(D).max())}
+        else:
+            xs_f, ys_f = xs, ys
+            D = np.zeros((len(t), 2))
     elif scale and size_m and 0.036 <= size_m <= 0.044:
         mfl = jf.flights[jf.main]
         fac, _ = drag_factor(mfl.fit, t[mfl.idx] - mfl.fit.t0, gdir, scale["s"] * k_clock,
@@ -397,9 +457,7 @@ def analyze(path: str, *, preset: str | None = None, size_m: float | None = None
     say("testing physics")
     # Mention drag only where it matters (light balls), not for a steel ball's 0.05%.
     drag_on = bool(drag) and max(abs(v_ - 1) for v_ in drag["flights"]) > 0.005
-    tests = [checks.parabola_check(t, xs, ys, w0, jf,
-                                   drag={"vt": drag["vt"], "v_scale": drag["v_scale"]}
-                                   if drag_on else None),
+    tests = [checks.parabola_check(t, xs_f, ys_f, w0, jf, drag_corrected=drag_on),
              checks.bounce_check(t, jf, dt_med)]
     tests.append(checks.equal_falls_check((a_raw, s_raw), others_acc))
     rest_xy = None
@@ -437,13 +495,21 @@ def analyze(path: str, *, preset: str | None = None, size_m: float | None = None
     travel = float(u_m[-1] - np.min(u_m))
     falls = travel >= 2.0 * d_ref and v_end > 0
 
-    v = decide(a_px=a_raw, a_sigma=s_raw, scale=scale, clock=clock, tests=tests,
-               n_points=len(mf.idx), duration=mf.duration,
+    v = decide(a_px=a_raw, a_sigma=jf.a_sigma / drag["factor"] if drag else s_raw, scale=scale,
+               clock=clock, tests=tests, n_points=len(mf.idx), duration=mf.duration,
                g_ref=g_ref, tracking_ok=tracking_ok, rs_rel=rs_rel, drag=drag, falls=falls)
 
     # ---- payload ----------------------------------------------------------------------
     k_used = v.get("k", 1.0)
     vt_plot = vt if drag else None
+    if dbg is not None:
+        dbg["final"] = {"geo": geo, "times": times, "tr": tr, "f": f, "t": t, "x": x, "y": y,
+                        "d": d, "xs": xs, "ys": ys, "m_fac": m_fac, "jf": jf_obs,
+                        "jf_free": jf, "drag_shift": D, "gdir": gdir,
+                        "scale": scale, "k": k_used, "drag": drag, "g_ref": g_ref,
+                        "d_ref": d_ref, "flights": [fr_.idx for fr_ in jf.flights],
+                        "ghost": _ghost_path(jf_obs, times, gdir, scale, k_used, g_ref, geo.H,
+                                             t, xs, ys, vt_plot)}
     result.update({
         "verdict": v,
         "tests": tests,
@@ -461,15 +527,17 @@ def analyze(path: str, *, preset: str | None = None, size_m: float | None = None
             "depth_change_rel": depth_change,
             "flights": [{"n": int(len(fr_.idx)), "t0": float(t[fr_.idx[0]]),
                          "t1": float(t[fr_.idx[-1]]), "a_px": fr_.a_along,
-                         "a_sigma": fr_.a_sigma, "rms_px": fr_.fit.rms}
-                        for fr_ in jf.flights],
+                         "a_sigma": fr_.a_sigma, "rms_px": fr_.fit.rms,
+                         "a_px_observed": fo.a_along}
+                        for fr_, fo in zip(jf.flights, jf_obs.flights)],
             "main": jf.main, "diam_px": d_ref, "refit": refit_note,
             "jitter_px": jitter, "fall_diameters": travel / d_ref if d_ref else None,
         },
         "track": _track_payload(tr.main, times, geo),
-        "plot": _plot_payload(jf, t, xs, ys, gdir, scale, k_used, g_ref, d_ref, vt_plot,
+        "plot": _plot_payload(jf_obs, t, xs, ys, gdir, scale, k_used, g_ref, d_ref, vt_plot,
                               drag["flights"][0] if drag else 1.0),
-        "ghost": _ghost_payload(jf, times, gdir, scale, k_used, g_ref, geo, t, xs, ys, vt_plot),
+        "ghost": _ghost_payload(jf_obs, times, gdir, scale, k_used, g_ref, geo, t, xs, ys,
+                                vt_plot),
         "elapsed_s": time.time() - t_wall,
     })
     if use_gemini and v["verdict"] != "UNSURE":
@@ -556,12 +624,12 @@ def _zoom_plan(info, geo, times, t, x, y, f, fl, d_ref):
 def _zoom_pass(path, info, plan, geo, times, tr, tracker):
     """Decode the ball's patch at high resolution and track it there again.
 
-    Returns (gray frames, times, geometry, track result) or None.
+    Returns (gray frames, times, geometry, track result, frame numbers) or None.
     """
     z = plan["z"]
     x0, y0, x1, y1 = plan["crop"]
-    frames, tz, _ = read_frames(path, info, scale=z, t_start=plan["t0"], t_end=plan["t1"],
-                                max_frames=C.MAX_FRAMES, crop=plan["crop"])
+    frames, tz, nz = read_frames(path, info, scale=z, t_start=plan["t0"], t_end=plan["t1"],
+                                 max_frames=C.MAX_FRAMES, crop=plan["crop"])
     if len(frames) < 8:
         return None
     ratio = plan["W"] / geo.W
@@ -593,7 +661,7 @@ def _zoom_pass(path, info, plan, geo, times, tr, tracker):
     gray = [cv2.cvtColor(im, cv2.COLOR_BGR2GRAY) if im.ndim == 3 else im for im in frames]
     del frames
     geo_z = Geom(W=plan["W"], H=plan["H"], scale=z, ox=float(x0), oy=float(y0), T=Tz)
-    return gray, tz, geo_z, trz
+    return gray, tz, geo_z, trz, nz
 
 
 def _unsure(result, why, t_wall, stage=None, **extra):
@@ -706,8 +774,9 @@ def _plot_payload(jf, t, xs, ys, gdir, scale, k, g_ref, d_ref, vt=None, drag_fir
             "g_fit_drag_corrected": float(2 * c2 * drag_first) if vt else None}
 
 
-def _ghost_payload(jf, times, gdir, scale, k, g_ref, geo, t=None, xs=None, ys=None, vt=None):
-    """Where a real ball falling from the same start would be, frame by frame."""
+def _ghost_path(jf, times, gdir, scale, k, g_ref, H, t=None, xs=None, ys=None, vt=None):
+    """Where a real ball falling from the same start would be: (times, x, y) in
+    stabilized working px, one entry per frame from the start of the fall."""
     if not jf.flights or scale is None or t is None:
         return None
     o = _origin(jf, t, xs, ys, gdir, scale, k)
@@ -717,14 +786,25 @@ def _ghost_payload(jf, times, gdir, scale, k, g_ref, geo, t=None, xs=None, ys=No
     times = np.asarray(times, float)
     sel = np.flatnonzero(times >= o["t0"])
     if len(sel) == 0:
-        return {"points": []}
+        return np.zeros(0), np.zeros(0), np.zeros(0)
     # Start from the origin point, moving along gravity with the clip's own speed.
     du = _earth_fall((times[sel] - o["t0"]) / k, o["v0"], g_ref, vt) / scale["s"]
+    gx = x0 + du * gdir[0]
+    gy = y0 + du * gdir[1]
+    inside = (gy <= H * 1.2) & (gy >= -0.2 * H)
+    n = int(np.argmin(inside)) if not inside.all() else len(inside)
+    return times[sel][:n], gx[:n], gy[:n]
+
+
+def _ghost_payload(jf, times, gdir, scale, k, g_ref, geo, t=None, xs=None, ys=None, vt=None):
+    """The same, as fractions of the picture for the web overlay."""
+    gp = _ghost_path(jf, times, gdir, scale, k, g_ref, geo.H, t, xs, ys, vt)
+    if gp is None:
+        return None
+    times = np.asarray(times, float)
     out = []
-    for fi, dd in zip(sel, du):
-        gx, gy = x0 + dd * gdir[0], y0 + dd * gdir[1]
-        if gy > geo.H * 1.2 or gy < -0.2 * geo.H:
-            break
-        px, py = geo.to_frame(int(fi), gx, gy)
-        out.append({"t": float(times[fi]), "x": float(px / geo.W), "y": float(py / geo.H)})
+    for tt, gx, gy in zip(*gp):
+        fi = int(np.argmin(np.abs(times - tt)))
+        px, py = geo.to_frame(fi, gx, gy)
+        out.append({"t": float(tt), "x": float(px / geo.W), "y": float(py / geo.H)})
     return {"points": out}

@@ -414,9 +414,41 @@ def rolling_shutter_effect(jf: JointFit, t, x, y, w0) -> float:
     return float(jf.a_px / plain.a_px - 1.0)
 
 
-def recombine(jf: JointFit):
-    """Recompute a_px after the flights' accelerations were corrected (air drag)."""
-    _combine(jf)
+def drag_path(fit: Fit2D, ta: float, tb: float, v_scale: float, vt: float, g: float,
+              k: float = 1.0, v_extra=None, n: int | None = None):
+    """How far air drag has pushed a flight off its drag-free path, from ta on.
+
+    Quadratic drag pulls with -(g / vt^2) |v| v (m/s^2). Integrating that
+    twice along the flight gives the displacement it caused; subtracting it
+    from the tracked positions leaves the path the ball would have taken in a
+    vacuum, which a plain parabola (and the rolling-shutter term) can then fit
+    without mistaking drag for something else.
+
+    fit gives the velocity in px per video second; v_scale turns that into
+    real m/s (m per px times the slow-motion factor k). v_extra adds a
+    velocity on the same grid (the drag velocity from a previous pass, when
+    fit is already drag-free). Returns (grid, (dx, dy), (vx_d, vy_d)) in px
+    and px per video second.
+    """
+    n = n or 96
+    grid = np.linspace(ta, tb, n)
+    vx, vy = fit.vel(grid - fit.t0)
+    vx = np.asarray(vx, float).copy()
+    vy = np.asarray(vy, float).copy()
+    if v_extra is not None:
+        vx += v_extra[0]
+        vy += v_extra[1]
+    sp = np.hypot(vx, vy) * v_scale                      # real m/s
+    kd = g / max(vt, 1e-6) ** 2
+    ax = -kd * sp * vx / max(k, 1e-9)                     # px per video second^2
+    ay = -kd * sp * vy / max(k, 1e-9)
+
+    def integ(f):
+        out = np.zeros_like(f)
+        out[1:] = np.cumsum(0.5 * (f[1:] + f[:-1]) * np.diff(grid))
+        return out
+    vxd, vyd = integ(ax), integ(ay)
+    return grid, (integ(vxd), integ(vyd)), (vxd, vyd)
 
 
 def drag_factor(fit: Fit2D, tau, gdir, v_scale: float, vt: float) -> tuple[float, float]:

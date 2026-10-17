@@ -170,6 +170,7 @@ def measure_width(frame, bg, x, y, d_guess, axis=None) -> float:
         Dr = Dl if float(Dl.max()) >= max(25.0, 0.35 * float(Dc.max())) else Dc
     else:
         Dr = cv2.absdiff(fr, bgr)
+        Dc = None
     Dr = Dr.astype(np.float64)
     Db = cv2.GaussianBlur(Dr, (3, 3), 0)
     med = float(np.median(Db))
@@ -180,12 +181,19 @@ def measure_width(frame, bg, x, y, d_guess, axis=None) -> float:
     n, lab, st, cen = cv2.connectedComponentsWithStats(core, connectivity=8)
     if n < 2:
         return float("nan")
-    # Component nearest the expected position.
-    j = 1 + int(np.argmin([np.hypot(cen[i][0] + xa - x, cen[i][1] + ya - y) for i in range(1, n)]))
-    cm = cv2.dilate((lab == j).astype(np.uint8),
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
-    cm[(lab > 0) & (lab != j)] = 0
     yy, xx = np.mgrid[ya:yb, xa:xb]
+    # Every piece of the blob near the expected spot. A multi-coloured ball (a
+    # volleyball's panels) differs from the backdrop by a different amount in
+    # each panel and can come apart into several pieces; keeping only the
+    # nearest piece measured half a volleyball.
+    near = (xx - x) ** 2 + (yy - y) ** 2 <= (0.6 * max(d_guess, 4.0)) ** 2
+    ids = np.unique(lab[near & (lab > 0)])
+    if len(ids) == 0:
+        ids = np.array([1 + int(np.argmin([np.hypot(cen[i][0] + xa - x, cen[i][1] + ya - y)
+                                           for i in range(1, n)]))])
+    comp = np.isin(lab, ids)
+    cm = cv2.dilate(comp.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+    cm[(lab > 0) & ~comp] = 0
     sel = cm > 0
     Dm, Xm, Ym = Dr[sel], xx[sel].astype(np.float64), yy[sel].astype(np.float64)
     wts = np.clip(Dm - med, 0, None)
@@ -201,10 +209,35 @@ def measure_width(frame, bg, x, y, d_guess, axis=None) -> float:
         ev, evec = np.linalg.eigh(np.array([[sxx, sxy], [sxy, syy]]))
         if ev[1] / max(ev[0], 1e-9) > 1.3:
             axis = evec[:, 0]
-    if axis is not None:
-        return _width_along(Dm, ones, Xm, Ym, cx, cy, axis)
-    return float(np.nanmean([_width_along(Dm, ones, Xm, Ym, cx, cy, (1.0, 0.0)),
-                             _width_along(Dm, ones, Xm, Ym, cx, cy, (0.0, 1.0))]))
+    axes = [axis] if axis is not None else [(1.0, 0.0), (0.0, 1.0)]
+    ws = [_width_along(Dm, ones, Xm, Ym, cx, cy, a) for a in axes]
+    ws = [w_ for w_ in ws if np.isfinite(w_)]
+    w_model = float(np.mean(ws)) if ws else float("nan")
+    # The profile model assumes the ball differs from the backdrop by about
+    # the same amount everywhere. Panels break that, so for a big ball also
+    # take the outline's width (convex hull of the blob, across the motion)
+    # and trust it when the two disagree.
+    # The outline is cut at half the contrast, where a blurred edge really is,
+    # in brightness and in colour (a yellow panel can match a grey wall in
+    # brightness alone).
+    sil = np.zeros_like(comp)
+    for Dmap in ([Dr, Dc] if Dc is not None else [Dr]):
+        Ds = cv2.GaussianBlur(Dmap.astype(np.float64), (3, 3), 0)
+        med_s, pk_s = float(np.median(Ds)), float(Ds.max())
+        if pk_s - med_s < 8:
+            continue
+        n2, lab2, _, _ = cv2.connectedComponentsWithStats(
+            (Ds > med_s + 0.5 * (pk_s - med_s)).astype(np.uint8), connectivity=8)
+        ids2 = np.unique(lab2[near & (lab2 > 0)])
+        if len(ids2):
+            sil |= np.isin(lab2, ids2)
+    pts = np.column_stack([xx[sil], yy[sil]]).astype(np.float32)
+    if len(pts) >= 12:
+        hull = cv2.convexHull(pts).reshape(-1, 2).astype(np.float64)
+        w_sil = float(np.mean([np.ptp(hull @ np.asarray(a, float)) + 1.0 for a in axes]))
+        if w_sil >= 24 and (not np.isfinite(w_model) or abs(w_model / w_sil - 1) > 0.12):
+            return w_sil
+    return w_model
 
 
 def detect(frame, bg, *, roi=None, min_area=8, max_frac=0.2, max_blobs=12,
@@ -496,6 +529,8 @@ class TrackResult:
     n_candidates: int
     d_fine: np.ndarray | None = None   # accurate widths for a subset of main (NaN elsewhere)
     seeded: bool = False               # main was chosen by a seed (a click, or a first pass)
+    dets: list | None = None           # every candidate blob, per frame (for the debug video)
+    tracks: list | None = None         # every linked track, best score first
 
 
 def refine_widths(frames, bg, tr: Track, times, max_n: int = 40) -> np.ndarray:
@@ -529,7 +564,8 @@ def track_falling_object(frames, times, *, roi=None, bg=None, seed=None) -> Trac
     tracks = classify_and_score(tracks, times)
     moving = [t for t in tracks if t.kind == "moving"]
     if not moving:
-        return TrackResult(None, [], None, None, sum(len(d) for d in dets))
+        return TrackResult(None, [], None, None, sum(len(d) for d in dets), dets=dets,
+                           tracks=tracks)
     main = pick_seeded(moving, times, seed) if seed else None
     seeded = main is not None
     if main is None:
@@ -553,4 +589,4 @@ def track_falling_object(frames, times, *, roi=None, bg=None, seed=None) -> Trac
             rest_d = wd if np.isfinite(wd) else None
             break
     return TrackResult(main, others, rest, rest_d, sum(len(d) for d in dets), d_fine,
-                       seeded=seeded)
+                       seeded=seeded, dets=dets, tracks=tracks)

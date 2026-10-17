@@ -63,11 +63,23 @@ def _analyze_kwargs(a):
                 scale_correction=a.scale_correction, zoom=not a.no_zoom, drag_vt=a.drag_vt)
 
 
+def _debug_path(clip, where):
+    """Where the debug video goes: a file, a folder, or next to the clip."""
+    stem = os.path.splitext(os.path.basename(clip))[0] + "_debug.mp4"
+    if where in (None, "", "auto"):
+        return os.path.join(os.path.dirname(os.path.abspath(clip)), stem)
+    if os.path.isdir(where) or where.endswith(("/", "\\")):
+        os.makedirs(where, exist_ok=True)
+        return os.path.join(where, stem)
+    return where
+
+
 def cmd_analyze(a):
     from .analyze import analyze
+    dbg = _debug_path(a.clip, a.debug_video) if a.debug_video is not None else None
     r = analyze(a.clip, roi=_roi(a.roi), t_start=a.start, t_end=a.end, seed=_seed(a.seed),
                 progress=(lambda s: print(f"  {s}...", file=sys.stderr)) if a.verbose else None,
-                **_analyze_kwargs(a))
+                debug_video=dbg, debug_speed=a.debug_speed, **_analyze_kwargs(a))
     v = r["verdict"]
     print(f"\n{v['verdict']}  ({v.get('confidence', 0):.0%} confidence)")
     print(v["headline"])
@@ -95,6 +107,8 @@ def cmd_analyze(a):
     for n in r.get("notes", []):
         print("Note:", n)
     print(f"({r['elapsed_s']:.1f} s)")
+    if r.get("debug_video"):
+        print("Debug video:", r["debug_video"])
     if a.json:
         with open(a.json, "w") as fh:
             json.dump(r, fh, indent=1, default=str)
@@ -121,14 +135,16 @@ def cmd_batch(a):
     if a.json_dir:
         os.makedirs(a.json_dir, exist_ok=True)
     cols = ["file", "verdict", "confidence", "g", "sigma", "g_as_played", "k", "stage",
-            "ball_px", "zoomed", "frames", "fps", "flights", "drag_pct", "headline", "notes"]
+            "ball_px", "zoomed", "frames", "fps", "flights", "drag_pct", "headline", "notes",
+            "debug_video"]
     rows = []
     kw = _analyze_kwargs(a)
     for i, p in enumerate(paths, 1):
         name = os.path.basename(p)
         print(f"[{i}/{len(paths)}] {name} ... ", end="", flush=True)
         try:
-            r = analyze(p, **kw)
+            r = analyze(p, debug_video=_debug_path(p, a.debug_dir) if a.debug_dir else None,
+                        debug_speed=a.debug_speed, **kw)
         except Exception as e:  # keep going: one bad file shouldn't stop the batch
             print(f"error: {e}")
             rows.append({"file": name, "verdict": "ERROR", "headline": str(e)})
@@ -149,6 +165,7 @@ def cmd_batch(a):
             "flights": " ".join(str(fl["n"]) for fl in fit.get("flights", [])),
             "drag_pct": round(100 * (drag["factor"] - 1), 1) if drag else None,
             "headline": v.get("headline"), "notes": " | ".join(r.get("notes", [])),
+            "debug_video": r.get("debug_video"),
         }
         rows.append(row)
         g = f"g = {row['g']:.2f}" if row["g"] is not None else "no g"
@@ -294,6 +311,11 @@ def main(argv=None):
     s.add_argument("--start", type=float)
     s.add_argument("--end", type=float)
     s.add_argument("--json", help="write the full result here")
+    s.add_argument("--debug-video", nargs="?", const="auto", metavar="PATH",
+                   help="also write a video showing what Galileo tracked and fitted, frame by "
+                        "frame (default: CLIP_debug.mp4 next to the clip)")
+    s.add_argument("--debug-speed", type=float, default=1.0,
+                   help="playback speed of the debug video, e.g. 0.25 for quarter speed")
     s.add_argument("-v", "--verbose", action="store_true")
     s.set_defaults(func=cmd_analyze)
 
@@ -304,6 +326,9 @@ def main(argv=None):
     s.add_argument("--json-dir", help="also save each full result as JSON here")
     s.add_argument("--expect", choices=["real", "ai"],
                    help="what these clips are, to count the misses")
+    s.add_argument("--debug-dir", help="also write a debug video for every clip into this folder")
+    s.add_argument("--debug-speed", type=float, default=1.0,
+                   help="playback speed of the debug videos, e.g. 0.25 for quarter speed")
     s.set_defaults(func=cmd_batch)
 
     s = sub.add_parser("serve", help="web app and live tower loop")
