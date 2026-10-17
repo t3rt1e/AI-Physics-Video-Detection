@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Galileo: is this video real?</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%2314202b'/%3E%3Ccircle cx='16' cy='20' r='5' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#/" aria-label="Galileo, new analysis">
+    <svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true"><circle cx="16" cy="16" r="14" fill="currentColor"/><circle cx="16" cy="20" r="5" fill="var(--paper)"/></svg>
+    <span>Galileo</span>
+  </a>
+  <nav>
+    <a href="#/" class="nav-new">New video</a>
+    <a href="#/history" class="nav-hist">Past results</a>
+  </nav>
+</header>
+<main id="view" tabindex="-1"></main>
+<footer class="foot">
+  Galileo doesn't ask another AI. It measures how fast things in the video fall and checks that against Earth's gravity (9.8&nbsp;m/s²).
+  It needs something falling or bouncing on camera, with a known size.
+</footer>
+<script src="/static/app.js"></script>
+</body>
+</html>
