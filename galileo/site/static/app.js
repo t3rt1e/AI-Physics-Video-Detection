@@ -4,7 +4,7 @@
 const $ = (s, r = document) => r.querySelector(s);
 const view = $("#view");
 const VERDICT = {
-  REAL: "Real", AI: "AI-generated", SLOWMO: "Real, slow motion", UNSURE: "Can't tell",
+  REAL: "Likely real", AI: "Likely AI-generated", SLOWMO: "Real, slow motion", UNSURE: "Inconclusive",
 };
 let STATUS = null;
 let current = null;      // the open job page (so it can be torn down)
@@ -22,125 +22,139 @@ async function api(path, opts) {
   return r.json();
 }
 
+/* Shared, small UI helpers. The backend supplies every preset and verdict. */
+const icons = {
+  upload: '<path d="M12 16V4m-4 4 4-4 4 4M4 15v5h16v-5"/>',
+  arrow: '<path d="M4 12h16m-6-6 6 6-6 6"/>',
+  compare: '<rect x="3" y="5" width="7" height="14" rx="2"/><rect x="14" y="5" width="7" height="14" rx="2"/>',
+  play: '<path d="m9 5 11 7-11 7Z"/>',
+  file: '<path d="M14 3H5v18h14V8Zm0 0v5h5M8 12h8M8 16h5"/>',
+  check: '<path d="m5 12 4 4L19 6"/>',
+  orbit: '<circle cx="12" cy="12" r="3"/><ellipse cx="12" cy="12" rx="10" ry="5" transform="rotate(-35 12 12)"/>',
+};
+function icon(name, cls = '') { return `<svg class="icon ${cls}" viewBox="0 0 24 24" aria-hidden="true">${icons[name] || icons.file}</svg>`; }
+function toast(message) {
+  const box = $("#toast"); box.textContent = message; box.hidden = false;
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => { box.hidden = true; }, 3600);
+}
+function cssColor(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+function summaryText(v = {}) {
+  return { REAL: "The measured motion is consistent with real-world gravity.",
+    AI: "The detector found motion that does not match its physics checks.",
+    SLOWMO: "The motion fits real-world gravity after accounting for slow motion.",
+    UNSURE: "There isn't enough reliable evidence for a clear result." }[v.verdict]
+    || "The detector returned a result. Open the details to explore it.";
+}
+function stateLabel(j) { return j.status === "done" ? VERDICT[j.verdict] || j.verdict || "Inconclusive" : ({running:"Analyzing",queued:"In queue",error:"Couldn't analyze"}[j.status] || j.status); }
+function sampleLabel(s) {
+  return s.name.includes('floaty') ? 'Low-gravity drop' : s.name.includes('easing') ? 'Uneven motion' : s.name.includes('240') ? 'High frame rate' : 'Earth-gravity drop';
+}
+
 /* ---------------------------------------------------------------- router */
+let routeVersion = 0;
 window.addEventListener("hashchange", route);
 async function route() {
+  const version = ++routeVersion;
   if (current) { current.destroy(); current = null; }
   const h = location.hash.replace(/^#\/?/, "");
-  document.querySelectorAll(".top nav a").forEach((a) => a.classList.remove("on"));
-  if (!STATUS) { try { STATUS = await api("/api/status"); } catch (e) { STATUS = { presets: [], samples: [], auto: {} }; } }
+  document.querySelectorAll(".top nav a").forEach((a) => { a.classList.remove("on"); a.removeAttribute("aria-current"); });
+  view.innerHTML = '<div class="loading-state" role="status"><div class="skeleton"></div><p>Getting things ready…</p></div>';
+  if (!STATUS) {
+    try { STATUS = await api("/api/status"); }
+    catch (e) {
+      if (version !== routeVersion) return;
+      view.innerHTML = `<div class="empty"><h1>Can't reach Galileo</h1><p>Check that the local server is running, then try again.</p><button class="btn" id="retry">Try again</button></div>`;
+      $("#retry").onclick = route; return;
+    }
+  }
+  if (version !== routeVersion) return;
   window.scrollTo(0, 0);
-  if (h.startsWith("job/")) { current = new JobPage(h.slice(4)); }
-  else if (h === "history") { $(".nav-hist").classList.add("on"); await historyPage(); }
-  else { $(".nav-new").classList.add("on"); homePage(); }
+  let active = '.nav-new';
+  if (/^job\/[a-zA-Z0-9_-]+$/.test(h)) { current = new JobPage(h.slice(4)); }
+  else if (h === "history") { active = '.nav-hist'; current = historyPage(); }
+  else if (h === "compare" || /^compare\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+$/.test(h)) {
+    active = '.nav-compare'; current = h === 'compare' ? new CompareUpload() : new ComparePage(h.split('/').slice(1));
+  }
+  else { current = homePage(); }
+  $(active).classList.add("on"); $(active).setAttribute("aria-current", "page");
 }
 
 /* ------------------------------------------------------------------ home */
 function homePage() {
-  const presets = STATUS.presets || [];
-  const round = presets.filter((p) => p.shape === "round"), other = presets.filter((p) => p.shape !== "round");
-  const opt = (p) => `<option value="${esc(p.key)}">${esc(p.label)} (${p.size_mm} mm)</option>`;
-  const autoOk = STATUS.auto && STATUS.auto.available;
+  const controller = new AbortController();
   view.innerHTML = `
-  <div class="home">
-    <section class="lede">
-      <h1>Does it fall like it should?</h1>
-      <p>Upload a clip of something dropped, thrown or bouncing. Galileo measures its acceleration frame by frame and compares it with real gravity.</p>
-      <ul class="how">
-        <li><b>Real footage</b> falls at about 9.8 m/s². Slow motion is caught from the file's clock.</li>
-        <li><b>Generated footage</b> usually falls too slowly, speeds up unevenly, or tilts the wrong way.</li>
-        <li><b>You see the evidence:</b> the tracked ball on every frame, a debug video, and every number it recorded.</li>
-      </ul>
-      <div class="samples">
-        <h2>No clip handy? Try a rehearsal clip</h2>
-        <div class="chips" id="samples">${(STATUS.samples || []).map((s) =>
-          `<button class="chip" data-name="${esc(s.name)}" data-obj="${esc(s.object || "")}">${esc(s.description)}</button>`).join("") || '<span class="hint">None installed.</span>'}</div>
-      </div>
+    <div class="home">
+      <section class="lede">
+        <span class="eyebrow"><i></i> VIDEO ANALYSIS, GROUNDED IN PHYSICS</span>
+        <h1>Reality has<br>a <span>gravity</span> to it.</h1>
+        <p>Does that video move like the real world? Follow the fall, check the physics, and see the evidence for yourself.</p>
+        <div class="orbit-illustration" aria-hidden="true">
+          <svg viewBox="0 0 500 150"><defs><pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1" fill="currentColor" opacity=".15"/></pattern></defs>
+          <rect width="500" height="150" fill="url(#dots)"/><path d="M20 28Q170 28 420 120" stroke="var(--blue)" stroke-width="2" stroke-dasharray="4 7" fill="none"/>
+          <path d="M20 28Q170 28 420 70" stroke="var(--orange)" stroke-width="2" stroke-dasharray="4 7" fill="none"/>
+          <circle cx="20" cy="28" r="5" fill="var(--ink)"/><circle cx="145" cy="40" r="7" fill="var(--blue)" opacity=".35"/><circle cx="275" cy="74" r="9" fill="var(--blue)" opacity=".65"/><circle cx="420" cy="120" r="12" fill="var(--blue)"/>
+          <circle cx="420" cy="70" r="12" fill="var(--orange)"/><path d="M456 75v39m-4-4 4 4 4-4" fill="none" stroke="var(--ink2)" stroke-width="1.5"/></svg>
+          <span>Different motion. A different story.</span>
+        </div>
+        <div class="hero-note">${icon('orbit')}<span>Best with a clearly visible object falling or bouncing.</span></div>
+      </section>
+      <form class="drop" id="form" novalidate>
+        <div class="form-title"><span class="step-number">01</span><div><h2>Start with a clip</h2><p>A few seconds is all you need.</p></div></div>
+        ${uploadMarkup('single')}
+        <p class="err" id="err" role="alert" hidden></p>
+        <button class="btn primary" id="go" type="submit" disabled>Analyze video ${icon('arrow')}</button>
+        <span class="upload-note">Your file is processed by this Galileo server.</span>
+      </form>
+    </div>
+    <section class="sample-section" aria-labelledby="sample-heading">
+      <div class="section-heading"><div><span class="eyebrow">TAKE IT FOR A SPIN</span><h2 id="sample-heading">A little proof of concept.</h2></div><span class="hint">Synthetic examples · known motion</span></div>
+      <div class="sample-grid" id="samples">${(STATUS.samples || []).map((sample, i) => `<button class="sample-card" type="button" data-name="${esc(sample.name)}"><span class="sample-glyph ${sample.ai_generated ? 'orange' : ''}">${icon(sample.ai_generated ? 'orbit' : 'play')}</span><span><b>${esc(sampleLabel(sample))}</b><small>${sample.ai_generated ? 'Simulated physics anomaly' : 'Simulated natural motion'}</small></span><span class="sample-arrow">↗</span></button>`).join('') || '<p class="hint">No sample clips installed.</p>'}</div>
     </section>
-    <form class="drop" id="form">
-      <label class="zone" id="zone">
-        <input class="visually-hidden" type="file" id="file" accept="video/*,.mp4,.mov,.m4v,.webm,.mkv,.avi">
-        <strong id="zone-title">Choose a video or drop it here</strong>
-        <span id="zone-sub">MP4, MOV, WebM · up to 1.5 GB · a few seconds is plenty</span>
-      </label>
-      <label class="field">What is falling?
-        <select id="obj">
-          ${autoOk ? '<option value="auto">Let Galileo identify it</option>' : ""}
-          <optgroup label="Balls">${round.map(opt).join("")}</optgroup>
-          <optgroup label="Other objects">${other.map(opt).join("")}</optgroup>
-          <option value="custom">Something else (I'll enter its size)</option>
-        </select>
-        <small>${autoOk ? "Galileo works out what it is from how it looks. If it can't, you'll be asked to tell it." : "Its real size turns pixels into metres. Automatic naming isn't available: run pip install torch torchvision transformers pillow in the Python that runs this site, then restart it."}</small>
-      </label>
-      <label class="field" id="size-wrap" hidden>Size in millimetres
-        <input id="size" type="number" min="1" max="5000" step="any" placeholder="e.g. 220">
-        <small>The ball's diameter, or the longest side of anything else.</small>
-      </label>
-      <details class="adv"><summary>Advanced</summary>
-        <label class="field">Camera field of view, degrees (optional)
-          <input id="hfov" type="number" min="10" max="180" step="any" placeholder="auto">
-          <small>Across the long side. Helps when the camera looks steeply up or down.</small>
-        </label>
-      </details>
-      <p class="err" id="err" role="alert" hidden></p>
-      <button class="btn" id="go" type="submit" disabled>Check this video</button>
-    </form>
-  </div>`;
-  const file = $("#file"), go = $("#go"), err = $("#err");
-  const objSel = $("#obj");
-  objSel.value = autoOk ? "auto" : "tennis";
-  const sync = () => { $("#size-wrap").hidden = objSel.value !== "custom"; };
-  objSel.onchange = sync;
-  sync();
-  const picked = (f) => {
-    if (!f) return;
-    $("#zone-title").innerHTML = `<span class="picked">${esc(f.name)}</span>`;
-    $("#zone-sub").textContent = `${(f.size / 1e6).toFixed(1)} MB · choose another to replace it`;
-    go.disabled = false;
-  };
-  file.onchange = () => picked(file.files[0]);
-  const zone = $("#zone");
-  ["dragenter", "dragover"].forEach((e) => zone.addEventListener(e, (ev) => { ev.preventDefault(); zone.classList.add("over"); }));
-  ["dragleave", "drop"].forEach((e) => zone.addEventListener(e, (ev) => { ev.preventDefault(); zone.classList.remove("over"); }));
-  zone.addEventListener("drop", (ev) => { if (ev.dataTransfer.files[0]) { file.files = ev.dataTransfer.files; picked(file.files[0]); } });
-  const fail = (m) => { err.textContent = m; err.hidden = false; go.disabled = false; go.textContent = "Check this video"; };
+    <a class="compare-callout" href="#/compare"><span class="compare-callout-icon">${icon('compare')}</span><span><b>Two clips. One closer look.</b><small>Compare their motion and results side by side.</small></span>${icon('arrow')}</a>`;
+  const upload = new UploadInput('single', () => { $("#go").disabled = !upload.file; });
+  const go = $("#go"), err = $("#err");
+  const fail = (e) => { if (controller.signal.aborted) return; err.textContent = e.message; err.hidden = false; go.disabled = !upload.file; go.innerHTML = `Analyze video ${icon('arrow')}`; };
   $("#form").onsubmit = async (ev) => {
-    ev.preventDefault();
-    err.hidden = true;
-    if (objSel.value === "custom" && !$("#size").value) { fail("Enter the object's size in millimetres."); return; }
-    const fd = new FormData();
-    fd.append("file", file.files[0]);
-    fd.append("object", objSel.value);
-    fd.append("size_mm", $("#size").value);
-    fd.append("hfov", $("#hfov").value);
-    go.disabled = true; go.textContent = "Uploading…";
-    try { const r = await api("/api/jobs", { method: "POST", body: fd }); location.hash = `#/job/${r.id}`; }
-    catch (e) { fail(e.message); }
+    ev.preventDefault(); err.hidden = true;
+    if (!upload.validate()) return;
+    go.disabled = true; go.textContent = 'Uploading your clip…'; upload.setDisabled(true);
+    try { const r = await upload.submit(controller.signal); if (!controller.signal.aborted) location.hash = `#/job/${r.id}`; }
+    catch (e) { fail(e); }
+    finally { if (!controller.signal.aborted) upload.setDisabled(false); }
   };
-  $("#samples").addEventListener("click", async (ev) => {
-    const b = ev.target.closest(".chip"); if (!b) return;
+  $("#samples").onclick = async (ev) => {
+    const b = ev.target.closest('[data-name]'); if (!b || b.disabled) return;
+    document.querySelectorAll('[data-name]').forEach(x => x.disabled = true);
     try {
-      const r = await api("/api/jobs/sample", { method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ name: b.dataset.name }) });
-      location.hash = `#/job/${r.id}`;
-    } catch (e) { fail(e.message); }
-  });
+      const r = await api('/api/jobs/sample', {method:'POST', signal:controller.signal, headers:{'content-type':'application/json'}, body:JSON.stringify({name:b.dataset.name})});
+      if (!controller.signal.aborted) location.hash = `#/job/${r.id}`;
+    } catch (e) { fail(e); document.querySelectorAll('[data-name]').forEach(x => x.disabled = false); }
+  };
+  return { destroy() { controller.abort(); } };
 }
 
 /* --------------------------------------------------------------- history */
-async function historyPage() {
-  view.innerHTML = `<h1 style="font-size:30px">Past results</h1><div class="hist" id="hist"><p class="hint">Loading…</p></div>`;
-  const list = await api("/api/jobs");
-  const box = $("#hist");
-  if (!list.length) { box.innerHTML = `<div class="empty">Nothing here yet. <a href="#/">Check a video</a> and it will be kept here.</div>`; return; }
-  box.innerHTML = list.map((j) => {
-    const st = j.status === "done" ? (j.verdict || "UNSURE") : j.status;
-    const lab = j.status === "done" ? VERDICT[st] : ({ running: "Working", queued: "Waiting", error: "Failed" }[j.status] || j.status);
-    return `<a class="hrow" href="#/job/${j.id}"><span class="pill ${st}">${esc(lab)}</span>
-      <span><span class="nm">${esc(j.filename)}</span><br><span class="sub">${esc(j.error || j.headline || j.stage || "")}</span></span>
-      <span class="gg">${j.g != null ? num(j.g, 1) + " m/s²" : ""}</span>
-      <span class="sub">${new Date((j.created || 0) * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}</span></a>`;
-  }).join("");
+function historyPage() {
+  const controller = new AbortController();
+  view.innerHTML = `<div class="page-heading"><div><span class="eyebrow">YOUR WORKSPACE</span><h1>Past analyses</h1><p>Every clip, with its evidence ready to revisit.</p></div><a class="btn ghost" href="#/">${icon('upload')} New analysis</a></div><div class="history-toolbar" id="history-toolbar" hidden><span id="history-count">Choose two results to compare.</span><button class="btn small" id="compare-selected" disabled>Compare selected ${icon('compare')}</button></div><div class="hist" id="hist" role="status"><div class="skeleton"></div></div>`;
+  (async () => {
+    try {
+      const list = await api('/api/jobs', {signal:controller.signal});
+      if (controller.signal.aborted) return;
+      const box = $("#hist"); box.removeAttribute('role');
+      if (!list.length) { box.innerHTML = `<div class="empty">${icon('file')}<h2>Your first result belongs here.</h2><p>Analyze a clip to start building your collection.</p><a class="btn" href="#/">Analyze a video</a></div>`; return; }
+      $("#history-toolbar").hidden = false;
+      box.innerHTML = list.map(j => `<div class="hrow"><label class="history-select"><input type="checkbox" value="${esc(j.id)}" aria-label="Select ${esc(j.filename)} for comparison"></label><a class="history-link" href="#/job/${esc(j.id)}"><span class="file-glyph">${icon('file')}</span><span class="history-title"><b class="nm">${esc(j.filename)}</b><span class="sub">${new Date((j.created || 0) * 1000).toLocaleString([], {dateStyle:'medium',timeStyle:'short'})}</span></span><span class="pill ${esc(j.status === 'done' ? j.verdict : j.status)}">${esc(stateLabel(j))}</span><span class="sample-arrow">↗</span></a></div>`).join('');
+      box.onchange = () => {
+        const chosen = [...box.querySelectorAll('input:checked')];
+        box.querySelectorAll('input:not(:checked)').forEach(x => x.disabled = chosen.length >= 2);
+        $("#compare-selected").disabled = chosen.length !== 2;
+        $("#history-count").textContent = chosen.length ? `${chosen.length} of 2 clips selected` : 'Choose two results to compare.';
+      };
+      $("#compare-selected").onclick = () => { const ids = [...box.querySelectorAll('input:checked')].map(x => x.value); if (ids.length === 2) location.hash = `#/compare/${ids.join('/')}`; };
+    } catch(e) { if (!controller.signal.aborted) $("#hist").innerHTML = `<div class="empty"><p>${esc(e.message)}</p><button class="btn" id="history-retry">Try again</button></div>`, $("#history-retry") && ($("#history-retry").onclick = route); }
+  })();
+  return {destroy() {controller.abort();}};
 }
 
 /* ------------------------------------------------------------- job page */
@@ -148,24 +162,32 @@ class JobPage {
   constructor(id) {
     this.id = id; this.dead = false; this.data = null; this.frames = null; this.idx = 0;
     this.mode = "original"; this.playing = false; this.rate = 1; this.loop = true;
-    this.show = { ball: true, earth: true, trail: true };
+    this.show = { ball: false, earth: false, trail: false };
+    this.controller = new AbortController(); this.debugOpen = false;
+    this.redraw = () => { if (this.done && !this.dead) { this.drawStrip(); this.drawOverlay(); if (this.debugOpen) this.drawChart(); } };
+    window.addEventListener("resize", this.redraw); window.addEventListener("themechange", this.redraw);
     this.rendered = false; this.videosReady = false;
     this.keys = (e) => this.onKey(e);
     document.addEventListener("keydown", this.keys);
     view.innerHTML = `<p class="hint">Loading…</p>`;
     this.poll();
   }
-  destroy() { this.dead = true; clearTimeout(this.timer); document.removeEventListener("keydown", this.keys); cancelAnimationFrame(this.raf); }
+  destroy() {
+    this.dead = true; this.controller.abort(); clearTimeout(this.timer);
+    document.removeEventListener("keydown", this.keys); window.removeEventListener("resize", this.redraw); window.removeEventListener("themechange", this.redraw);
+    cancelAnimationFrame(this.raf); cancelAnimationFrame(this.countRaf);
+    [this.vo, this.vd, this.independentVideo].filter(Boolean).forEach(v => {v.pause(); v.removeAttribute('src'); v.load();});
+  }
 
   async poll() {
     if (this.dead) return;
     let d;
-    try { d = await api(`/api/jobs/${this.id}`); }
-    catch (e) { view.innerHTML = `<div class="empty">${esc(e.message)}. <a href="#/">Start a new check</a></div>`; return; }
+    try { d = await api(`/api/jobs/${this.id}`, { signal: this.controller.signal }); }
+    catch (e) { if (this.dead) return; view.innerHTML = `<div class="empty"><h2>Could not load this analysis</h2><p>${esc(e.message)}</p><button class="btn" id="job-retry">Try again</button></div>`; this.rendered = false; this.videosReady = false; $("#job-retry").onclick = () => route(); return; }
     if (this.dead) return;
     this.data = d;
     const j = d.job;
-    if (j.status === "error") { view.innerHTML = `<div class="card"><h2>This video couldn't be checked</h2><p class="err">${esc(j.error)}</p><p>Try a different file, or a shorter clip with the falling object clearly visible. <a href="#/">Start over</a></p></div>`; return; }
+    if (j.status === "error") { view.innerHTML = `<div class="card workcard"><span class="eyebrow">ANALYSIS INTERRUPTED</span><h2>This clip needs another look.</h2><p>Try a shorter clip with the falling object clearly visible.</p><details class="adv"><summary>Technical details</summary><p class="err">${esc(j.error)}</p></details><p><a class="btn" href="#/">Try another video</a></p></div>`; return; }
     if (d.frames && !this.frames) { this.frames = d.frames; }
     if (!this.rendered && (j.status === "done" || j.preview)) { this.render(); }
     else if (this.rendered) { this.update(); }
@@ -180,7 +202,7 @@ class JobPage {
     return `<ol class="steps" role="status">${L.map((l, i) => `<li class="${i < k ? "done" : i === k ? "now" : ""}">${l}</li>`).join("")}</ol>`;
   }
   working(j) {
-    return `<div class="card workcard"><h2>${esc(j.filename)}</h2>${this.stepsHtml(j)}<p class="hint">This usually takes under a minute.</p></div>`;
+    return `<div class="card workcard"><h2>${esc(j.filename)}</h2>${this.stepsHtml(j)}<p class="hint">You can leave this page and find the result in History.</p></div>`;
   }
 
   /* ---- layout ---- */
@@ -188,19 +210,21 @@ class JobPage {
     this.rendered = true;
     const j = this.data.job;
     view.innerHTML = `
+      <div class="result-page-heading"><a href="#/history">← All analyses</a><span>${esc(j.filename)}</span><a href="#/compare">Compare clips ↗</a></div>
       <div id="verdict"></div>
       <div class="bench">
         <section class="player" aria-label="Video player">
-          <div class="ptabs">
+          <div class="player-heading"><b>Video playback</b><span class="hint">One frame at a time.</span></div>
+          <div class="ptabs" id="analysis-tools" hidden>
             <div class="seg" role="group" aria-label="What to show">
               <button data-mode="original" aria-pressed="true">Video</button>
               <button data-mode="debug" aria-pressed="false">Debug view</button>
-              <button data-mode="both" aria-pressed="false">Side by side</button>
+              <button data-mode="both" aria-pressed="false">Video + debug</button>
             </div>
             <div class="opts" id="ovopts">
-              <label><input type="checkbox" data-ov="ball" checked><span class="sw" style="border-color:#3ea6ff"></span>Tracked ball</label>
-              <label><input type="checkbox" data-ov="trail" checked><span class="sw" style="border-color:#8fd0ff;border-style:dotted"></span>Path</label>
-              <label><input type="checkbox" data-ov="earth" checked><span class="sw" style="border-color:#ffc400"></span>Where real gravity puts it</label>
+              <label><input type="checkbox" data-ov="ball"><span class="sw" style="border-color:#3ea6ff"></span>Tracked object</label>
+              <label><input type="checkbox" data-ov="trail"><span class="sw" style="border-color:#8fd0ff;border-style:dotted"></span>Path</label>
+              <label><input type="checkbox" data-ov="earth"><span class="sw" style="border-color:#ffc400"></span>Where real gravity puts it</label>
             </div>
           </div>
           <div class="stage" id="stage">
@@ -211,18 +235,18 @@ class JobPage {
           <div class="ctl">
             <div class="scrub" id="scrub"><canvas id="strip" height="22"></canvas><input type="range" id="range" min="0" max="0" value="0" aria-label="Frame"><div class="head" id="head"></div></div>
             <div class="btns">
-              <button class="ib" id="b-start" title="First frame (Home)" aria-label="First frame">⏮</button>
-              <button class="ib" id="b-m10" title="Back 10 frames (Shift+←)" aria-label="Back 10 frames">−10</button>
+              <button class="ib expert-control" id="b-start" hidden title="First frame (Home)" aria-label="First frame">⏮</button>
+              <button class="ib expert-control" id="b-m10" hidden title="Back 10 frames (Shift+←)" aria-label="Back 10 frames">−10</button>
               <button class="ib" id="b-prev" title="Previous frame (←)" aria-label="Previous frame"><svg viewBox="0 0 24 24"><path d="M15.4 5.4 14 4l-8 8 8 8 1.4-1.4L8.8 12z"/></svg></button>
               <button class="ib play" id="b-play" title="Play / pause (Space)" aria-label="Play"><svg id="ico-play" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></button>
               <button class="ib" id="b-next" title="Next frame (→)" aria-label="Next frame"><svg viewBox="0 0 24 24"><path d="m8.6 5.4 1.4-1.4 8 8-8 8-1.4-1.4 6.6-6.6z"/></svg></button>
-              <button class="ib" id="b-p10" title="Forward 10 frames (Shift+→)" aria-label="Forward 10 frames">+10</button>
-              <button class="ib" id="b-end" title="Last frame (End)" aria-label="Last frame">⏭</button>
+              <button class="ib expert-control" id="b-p10" hidden title="Forward 10 frames (Shift+→)" aria-label="Forward 10 frames">+10</button>
+              <button class="ib expert-control" id="b-end" hidden title="Last frame (End)" aria-label="Last frame">⏭</button>
               <label class="speed">Speed <select id="rate"><option value="0.05">0.05×</option><option value="0.1">0.1×</option><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option></select></label>
-              <label class="speed"><input type="checkbox" id="loop" checked> Loop</label>
+              <label class="speed expert-control" hidden><input type="checkbox" id="loop" checked> Loop</label>
               <div class="fr"><b id="fr-n">–</b><small id="fr-t"></small></div>
             </div>
-            <p class="hint"><kbd>←</kbd> <kbd>→</kbd> step a frame · <kbd>Shift</kbd> jumps 10 · <kbd>Space</kbd> plays · click the chart to jump to a time</p>
+            <p class="hint expert-control" hidden><kbd>←</kbd> <kbd>→</kbd> step a frame · <kbd>Shift</kbd> jumps 10 · <kbd>Space</kbd> plays · click the chart to jump to a time</p>
           </div>
         </section>
         <aside class="side">
@@ -253,8 +277,9 @@ class JobPage {
       $("#chartcard").hidden = false;
       this.drawVerdict();
       this.drawSections();
-      if (j.debug) { this.vd.src = `/media/${this.id}/debug.mp4`; }
-      else $("[data-mode=debug]").disabled = $("[data-mode=both]").disabled = true;
+      const sync = !!this.frames.debug_times;
+      $("[data-mode=debug]").disabled = $("[data-mode=both]").disabled = !sync;
+      if (j.debug && sync) this.vd.src = `/media/${this.id}/debug.mp4`;
       this.drawStrip(); this.go(this.idx, true);
     } else if (!this.done) {
       $("#verdict").innerHTML = "";
@@ -267,11 +292,12 @@ class JobPage {
   /* Browsers without H.264 get the same video as WebM (made on first use). */
   fallbackOnError(v, which) {
     v.addEventListener("error", () => {
+      if (this.dead) return;
       if (v.dataset.fb || !v.getAttribute("src") || !v.getAttribute("src").endsWith(".mp4")) return;
       v.dataset.fb = "1";
       const w = $("#working"); if (w && this.done) { $("#working-t").textContent = "Converting the video for this browser…"; w.hidden = false; }
       v.src = `/media/${this.id}/${which}.webm`;
-      v.addEventListener("loadeddata", () => { if (w && this.done) w.hidden = true; this.go(this.idx, true); }, { once: true });
+      v.addEventListener("loadeddata", () => { if (this.dead) return; if (w && this.done) w.hidden = true; this.go(this.idx, true); }, { once: true });
     });
   }
 
@@ -286,9 +312,8 @@ class JobPage {
     const rg = $("#range"); rg.max = this.n - 1;
     const box = $("#box-o");
     box.style.aspectRatio = `${this.frames.width} / ${this.frames.height}`;
-    this.vo.addEventListener("loadeddata", () => this.go(this.idx, true), { once: true });
+    this.vo.addEventListener("loadeddata", () => { if (!this.dead) this.go(this.idx, true); }, { once: true });
     this.vo.addEventListener("ended", () => { if (this.loop) this.go(0, true), this.play(); else this.pause(); });
-    window.addEventListener("resize", () => this.drawOverlay());
     this.go(0, true);
   }
 
@@ -323,15 +348,9 @@ class JobPage {
 
   /* ---- verdict ---- */
   drawVerdict() {
-    const r = this.result, v = r.verdict || {}, j = this.data.job;
-    const st = v.verdict || "UNSURE";
-    const conf = v.confidence ? `${Math.round(v.confidence * 100)}% confident` : "";
-    $("#verdict").innerHTML = `<section class="verdict ${st}">
-      <div><h1 class="vword">${VERDICT[st] || st}</h1>
-        <p class="vhead">${esc(v.headline || "")}</p>
-        <p class="vmeta">${[conf, j.filename, j.elapsed ? `measured in ${num(j.elapsed, 0)} s` : ""].filter(Boolean).map(esc).join("  ·  ")}</p></div>
-      <div class="gauge">${this.gauge(v)}</div></section>`;
-    this.countUp();
+    const v = this.result.verdict || {}, st = v.verdict || "UNSURE";
+    const obj = this.result.objects?.[0]?.identity?.label || this.result.objects?.[0]?.label;
+    $("#verdict").innerHTML = `<section class="verdict ${esc(st)}"><div><span class="eyebrow">ANALYSIS COMPLETE</span><h1 class="vword">${esc(VERDICT[st] || st)}</h1><p class="vhead">${esc(summaryText(v))}</p>${obj ? `<p class="vmeta">Object measured <b>${esc(obj)}</b></p>` : ''}</div><div class="gravity-summary"><span>Measured gravity</span><strong>${v.g != null ? num(v.g, 2) : '—'} <small>${v.g != null ? 'm/s²' : ''}</small></strong><span>${v.g != null ? `Earth reference: ${num(v.g_ref ?? STATUS.g_ref ?? 9.8, 2)} m/s²` : 'No reliable measurement available'}</span></div></section>`;
     this.drawWhy();
   }
   countUp() {
@@ -339,21 +358,20 @@ class JobPage {
     const to = +el.dataset.v;
     if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     const t0 = performance.now(), D = 900;
-    const f = (t) => { const p = Math.min(1, (t - t0) / D), e = 1 - Math.pow(1 - p, 3); el.textContent = (to * e).toFixed(1); if (p < 1) requestAnimationFrame(f); };
-    requestAnimationFrame(f);
+    const f = (t) => { const p = Math.min(1, (t - t0) / D), e = 1 - Math.pow(1 - p, 3); el.textContent = (to * e).toFixed(1); if (p < 1 && !this.dead) this.countRaf = requestAnimationFrame(f); };
+    this.countRaf = requestAnimationFrame(f);
   }
   drawWhy() {
     const v = this.result.verdict || {};
-    const rs = (v.reasons || []).slice(0, 4);
-    $("#why").innerHTML = `<h2>Why</h2><ul class="whylist">${rs.map((x) => `<li>${esc(x)}</li>`).join("") || "<li>No reasons recorded.</li>"}</ul>
-      <button class="linkbtn" type="button" data-open="checks">See every check</button>`;
-    $("#why").querySelector("[data-open]").onclick = () => this.openDebug("checks");
+    const explanation = v.verdict === 'UNSURE' ? "The clip may need a clearer view, a longer fall, or a more accurate object size." : v.verdict === 'AI' ? "An unusual fall is a reason to look closer. It doesn't establish how the video was made." : "The measured fall passes the detector's checks. That alone can't establish the video's origin.";
+    $("#why").innerHTML = `<span class="eyebrow">MAKING SENSE OF IT</span><h2>What this means</h2><p>${explanation}</p><div class="why-divider"></div><h3>Curious about the evidence?</h3><p class="hint">Explore the tracking, physics checks, and every measurement behind this result.</p><button class="btn ghost small" type="button" data-open="overview">Technical details ${icon('arrow')}</button>`;
+    $("#why [data-open]").onclick = () => this.openDebug('overview');
   }
   gauge(v) {
-    if (v.g == null) return `<p class="nog"><b>No acceleration measured.</b> ${esc(v.stage ? "Stopped at: " + v.stage + "." : "")} Open “What it did” below for the reasons, or pick the ball by name and size when you upload.</p>`;
+    if (v.g == null) return `<p class="nog"><b>No acceleration measured.</b> ${esc(v.stage ? "Stopped at: " + v.stage + "." : "")} Review the checks for the reasons, or confirm the object and its size.</p>`;
     const MAXG = Math.max(14, Math.ceil((v.g + (v.sigma || 0)) / 2) * 2 + 2), W = 640, L = 12, R = 628;
     const X = (g) => L + (R - L) * Math.min(g, MAXG) / MAXG;
-    const ref = v.g_ref || 9.8, tol = v.tol || 0.15;
+    const ref = v.g_ref ?? STATUS.g_ref ?? 9.8, tol = v.tol ?? 0.15;
     const col = { REAL: "var(--real)", AI: "var(--ai)", SLOWMO: "var(--slow)", UNSURE: "var(--unsure)" }[v.verdict] || "var(--ink)";
     let ticks = "";
     for (let g = 0; g <= MAXG; g += 2) ticks += `<line x1="${X(g)}" x2="${X(g)}" y1="62" y2="68" stroke="var(--line2)"/><text x="${X(g)}" y="82" text-anchor="middle">${g}</text>`;
@@ -377,6 +395,8 @@ class JobPage {
     const raw = `<section class="card"><h2>Everything it recorded</h2><p class="hint">The full result, exactly as saved.</p><div class="tree" id="tree"></div>
       <div class="dl"><a class="btn ghost small" href="/download/${this.id}/result.json">Download result.json</a><a class="btn ghost small" href="/download/${this.id}/track.csv">Download tracked points (CSV)</a>${this.data.job.debug ? `<a class="btn ghost small" href="/media/${this.id}/debug.mp4" download>Download debug video</a>` : ""}</div></section>`;
     const tabs = [
+      ["overview", "Overview", `<div class="grid2"><section class="card"><h3>Gravity measurement</h3><div class="gauge">${this.gauge(r.verdict || {})}</div><h3>From the detector</h3><p>${esc(r.verdict?.headline || 'No headline provided.')}</p><ul class="reasons">${(r.verdict?.reasons || []).map(x => `<li>${esc(x)}</li>`).join('')}</ul><p class="hint">${r.verdict?.confidence != null ? `Detector confidence: ${num(r.verdict.confidence * 100, 0)}% · not a calibrated probability of origin` : ''}</p>${this.frames.truncated ? '<p class="note">The playback preview contains the first 6,000 frames. The detector analyzes the original file using its own limits.</p>' : ''}</section><div id="chart-slot"></div></div>`],
+      ["debugvideo", "Debug video", this.data.job.debug && !this.frames.debug_times ? `<p class="hint">This debug render has its own timeline. Use these controls to inspect it without guessing how it aligns with the original.</p><video id="independent-debug" class="independent-debug" controls playsinline muted preload="metadata"></video><div class="btns"><button class="ib" id="debug-back" aria-label="Previous debug frame">←</button><button class="ib" id="debug-next" aria-label="Next debug frame">→</button><span id="debug-frame-count" class="hint"></span></div>` : ''],
       ["frame", "This frame", `<div class="card live" id="live"></div>`],
       ["checks", "Checks", `<section class="card"><h2>Checks gravity can't fake</h2>${this.testsTable(r.tests || [])}</section>`],
       ["fall", "The fall", this.fitCard(r)],
@@ -393,15 +413,28 @@ class JobPage {
     $("#sections").innerHTML = `${this.remeasureCard(r)}
       <section class="debug" id="debug">
         <button class="dbg-toggle" id="dbg-toggle" type="button" aria-expanded="false" aria-controls="dbg-body">
-          <span><b>Debug details</b><small>Checks, fit, camera, tracked points and raw data</small></span>
+          <span><b>Technical details</b><small>Debug video, physics checks, charts, and all recorded data</small></span>
           <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
         <div id="dbg-body" hidden>
-          <div class="tabs" role="tablist" aria-label="Debug details">${tabs.map((t, i) => `<button role="tab" id="tab-${t[0]}" aria-controls="panel-${t[0]}" aria-selected="${i === 0}" tabindex="${i === 0 ? 0 : -1}" data-tab="${t[0]}">${esc(t[1])}${t[3] ? `<span class="badge">${t[3]}</span>` : ""}</button>`).join("")}</div>
+          <div class="tabs" role="tablist" aria-label="Technical details">${tabs.map((t, i) => `<button role="tab" id="tab-${t[0]}" aria-controls="panel-${t[0]}" aria-selected="${i === 0}" tabindex="${i === 0 ? 0 : -1}" data-tab="${t[0]}">${esc(t[1])}${t[3] ? `<span class="badge">${t[3]}</span>` : ""}</button>`).join("")}</div>
           ${tabs.map((t, i) => `<div class="panel" role="tabpanel" id="panel-${t[0]}" aria-labelledby="tab-${t[0]}" ${i ? "hidden" : ""} tabindex="0">${t[2]}</div>`).join("")}
         </div>
       </section>`;
     $("#tree").appendChild(this.tree(r, true));
+    $("#chart-slot").appendChild($("#chartcard"));
+    const independent = $("#independent-debug");
+    if (independent) {
+      this.independentVideo = independent;
+      independent.src = `/media/${this.id}/debug.mp4`;
+      independent.onerror = () => { if (!independent.dataset.fb && !this.dead) {independent.dataset.fb = '1'; independent.src = `/media/${this.id}/debug.webm`;} };
+      const times = this.frames.debug_frame_times || [];
+      const index = () => { let lo=0,hi=times.length-1; while(lo<hi) {const m=(lo+hi+1)>>1;if(times[m]<=independent.currentTime+1e-6)lo=m;else hi=m-1;}return lo; };
+      const step = delta => {independent.pause();const i=Math.max(0,Math.min(times.length-1,index()+delta));independent.currentTime=times[i]+((times[i+1] ?? times[i]+1/30)-times[i])/2;};
+      $("#debug-back").disabled = $("#debug-next").disabled = !times.length;
+      $("#debug-back").onclick = () => step(-1); $("#debug-next").onclick = () => step(1);
+      independent.ontimeupdate = () => { if(!this.dead) $("#debug-frame-count").textContent = times.length ? `Frame ${index()+1} of ${times.length}` : ''; };
+    }
     $("#dbg-toggle").onclick = () => this.openDebug(null, true);
     const list = $(".tabs");
     list.addEventListener("click", (e) => { const b = e.target.closest("[data-tab]"); if (b) this.selectTab(b.dataset.tab); });
@@ -434,12 +467,21 @@ class JobPage {
     document.querySelectorAll("[data-tab]").forEach((b) => { const on = b.dataset.tab === id; b.setAttribute("aria-selected", on); b.tabIndex = on ? 0 : -1; if (on && focus) b.focus(); });
     document.querySelectorAll(".panel").forEach((p) => { p.hidden = p.id !== "panel-" + id; });
     if (id === "frame") this.drawLive();
+    if (id === "overview") { this.drawChart(); }
+    if (id !== "debugvideo") this.independentVideo?.pause();
   }
   openDebug(tab, toggle) {
     const body = $("#dbg-body"), btn = $("#dbg-toggle");
     const open = toggle ? body.hidden : true;
+    this.debugOpen = open;
+    $("#analysis-tools").hidden = !open;
+    document.querySelectorAll('.expert-control').forEach(x => x.hidden = !open);
+    if (!open) { this.setMode('original'); this.independentVideo?.pause(); }
+    this.drawOverlay(); this.drawStrip();
+    if(open) {this.drawChart();this.drawLive();}
     body.hidden = !open; btn.setAttribute("aria-expanded", open);
-    if (open && tab) { this.selectTab(tab); body.scrollIntoView({ behavior: "smooth", block: "start" }); }
+    if(open) requestAnimationFrame(() => {if(!this.dead) this.drawChart();});
+    if (open && tab) { this.selectTab(tab); body.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" }); }
   }
   kv(rows, cls = "") {
     const rs = rows.filter((x) => x && x[1] !== undefined && x[1] !== null && x[1] !== "");
@@ -486,7 +528,7 @@ class JobPage {
     const rulers = s && s.rulers ? `<h3>Rulers</h3>${s.rulers.map((x) => `<p style="margin:4px 0"><b>${esc(x.name)}</b>: ${esc(x.detail)}</p>`).join("")}` : "";
     const ev = c && c.evidence && c.evidence.length ? `<h3>Clock evidence</h3>${c.evidence.map((x) => `<p style="margin:4px 0"><b>${esc(x.name)}</b> (${num(x.k, 2)}×, ${num((x.confidence || 0) * 100, 0)}%): ${esc(x.detail)}</p>`).join("")}` : "";
     return `<section class="card"><h2>Scale and clock</h2>${this.kv([
-      ["Metres per pixel", s ? `${(s.s * 1000).toFixed(3)} mm` : null],
+      ["Metres per pixel", s?.s != null ? `${(s.s * 1000).toFixed(3)} mm` : null],
       ["Ruler uncertainty", s ? `±${num(s.rel_sigma * 100, 1)}%` : null],
       ["Rulers agree", s ? this.fmt(s.agree) : null],
       ["Real seconds per video second", c ? `${num(c.k, 2)}×` : null],
@@ -599,7 +641,7 @@ class JobPage {
     $("#chart").onclick = (e) => this.chartClick(e);
   }
   onKey(e) {
-    if (/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName) && document.activeElement.type !== "checkbox") return;
+    if (e.defaultPrevented || /INPUT|SELECT|TEXTAREA|BUTTON|A|SUMMARY/.test(document.activeElement.tagName) || document.activeElement.isContentEditable) return;
     if (!this.videosReady) return;
     const k = e.key;
     if (k === "ArrowRight" || k === ".") { e.preventDefault(); this.step(e.shiftKey ? 10 : 1); }
@@ -610,6 +652,7 @@ class JobPage {
   }
   setMode(m) {
     this.mode = m;
+    if (m === "original") this.vd.pause();
     document.querySelectorAll("[data-mode]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.mode === m)));
     $("#stage").classList.toggle("both", m === "both");
     $("#pane-o").classList.toggle("vis0", m === "debug");
@@ -681,11 +724,11 @@ class JobPage {
     const i = this.idx, T = this.frames.times;
     $("#range").value = i;
     $("#fr-n").textContent = `Frame ${i + 1} of ${this.n}`;
-    $("#fr-t").textContent = `${T[i].toFixed(3)} s · source frame ${this.frames.nums[i]}`;
+    $("#fr-t").textContent = `${T[i].toFixed(3)} s`;
     const head = $("#head"), w = $("#scrub").clientWidth;
     head.style.left = `${(this.n > 1 ? i / (this.n - 1) : 0) * (w - 3)}px`;
     if (!this.done) return;
-    this.drawOverlay(); this.drawLive(); this.drawChart();
+    this.drawOverlay(); if (this.debugOpen) { this.drawLive(); this.drawChart(); }
     const row = document.getElementById("pt-" + i);
     document.querySelectorAll("#pts tr.cur").forEach((r) => r.classList.remove("cur"));
     if (row) { row.classList.add("cur"); if (this.playing === false) { const sc = $("#pts"); if (sc && sc.contains(row)) sc.scrollTop = row.offsetTop - sc.clientHeight / 2; } }
@@ -695,6 +738,7 @@ class JobPage {
     const b = cv.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
     cv.width = Math.round(b.width * dpr); cv.height = Math.round(b.height * dpr);
     const c = cv.getContext("2d"); c.setTransform(dpr, 0, 0, dpr, 0, 0); c.clearRect(0, 0, b.width, b.height);
+    if (!this.debugOpen) return;
     const W = b.width, H = b.height, i = this.idx;
     const ti = this.trackAt[i], gi = this.ghostAt[i];
     c.lineWidth = 2;
@@ -714,6 +758,7 @@ class JobPage {
     }
   }
   drawLive() {
+    if (!$("#live")) return;
     const i = this.idx, ti = this.trackAt[i], gi = this.ghostAt[i], T = this.frames.times, r = this.result, v = r.verdict || {};
     const p = ti !== null ? this.track[ti] : null, g = gi !== null ? this.ghost[gi] : null;
     const fl = this.flights.findIndex((f) => T[i] >= f.t0 - 1e-6 && T[i] <= f.t1 + 1e-6);
@@ -745,7 +790,8 @@ class JobPage {
     cv.width = w * dpr; cv.height = 22 * dpr;
     const c = cv.getContext("2d"); c.scale(dpr, dpr);
     const n = this.n, X = (i) => (n > 1 ? i / (n - 1) : 0) * w;
-    c.fillStyle = "#e7eaee"; c.beginPath(); c.roundRect(0, 0, w, 22, 5); c.fill();
+    c.fillStyle = cssColor("--line"); c.beginPath(); c.roundRect(0, 0, w, 22, 5); c.fill();
+    if (!this.debugOpen) return;
     const d = this.frames.debug_times;
     if (d) { // analysed window
       let a = d.findIndex((x) => x !== null), b = d.length - 1 - [...d].reverse().findIndex((x) => x !== null);
@@ -760,11 +806,13 @@ class JobPage {
   /* ---- chart ---- */
   chartGeom() {
     const p = this.result && this.result.plot; if (!p) return null;
+    if (!Array.isArray(p.points) || !p.points.length || !Array.isArray(p.earth) || !Array.isArray(p.fit)) return null;
     const pts = p.points, all = pts.map((q) => q[0]).concat(p.earth.map((q) => q[0])), ys = pts.map((q) => q[1]).concat(p.earth.map((q) => q[1]), p.fit.map((q) => q[1]));
-    const x1 = Math.max(...all), y1 = Math.max(...ys, 0.01), y0 = Math.min(0, ...ys);
+    const x1 = Math.max(...all, 0.001), y1 = Math.max(...ys, 0.01), y0 = Math.min(0, ...ys);
     return { p, x0: 0, x1, y0, y1 };
   }
   drawChart() {
+    if (!$("#chart") || !this.debugOpen) return;
     const cv = $("#chart"), g = this.chartGeom();
     if (!g) { $("#chartcard").hidden = true; return; }
     const dpr = window.devicePixelRatio || 1, cssW = cv.clientWidth || 560, cssH = cssW * 0.6;
@@ -773,7 +821,7 @@ class JobPage {
     const m = { l: 46, r: 10, t: 8, b: 34 }, w = cssW - m.l - m.r, h = cssH - m.t - m.b;
     const X = (t) => m.l + (t - g.x0) / (g.x1 - g.x0) * w, Y = (d) => m.t + h - (d - g.y0) / (g.y1 - g.y0) * h;
     this.cg = { m, w, h, g, cssW };
-    c.font = "12px " + getComputedStyle(document.body).fontFamily; c.fillStyle = "#51606e"; c.strokeStyle = "#dde2e7"; c.lineWidth = 1;
+    c.font = "12px " + getComputedStyle(document.body).fontFamily; c.fillStyle = cssColor("--ink2"); c.strokeStyle = cssColor("--line"); c.lineWidth = 1;
     const nice = (span, n) => { const raw = span / n, mag = 10 ** Math.floor(Math.log10(raw)), f = raw / mag; return (f < 1.5 ? 1 : f < 3.5 ? 2 : f < 7.5 ? 5 : 10) * mag; };
     const sx = nice(g.x1, 5), sy = nice(g.y1 - g.y0, 4);
     c.textAlign = "center";
@@ -783,8 +831,8 @@ class JobPage {
     c.textAlign = "center"; c.fillText("time (s of real time)", m.l + w / 2, cssH - 4);
     c.save(); c.translate(11, m.t + h / 2); c.rotate(-Math.PI / 2); c.fillText("fallen (m)", 0, 0); c.restore();
     const line = (arr, col, dash) => { c.strokeStyle = col; c.lineWidth = 2.5; c.setLineDash(dash || []); c.beginPath(); arr.forEach((q, k) => (k ? c.lineTo(X(q[0]), Y(q[1])) : c.moveTo(X(q[0]), Y(q[1])))); c.stroke(); c.setLineDash([]); };
-    line(g.p.earth, "#d9a400", [7, 5]);
-    line(g.p.fit, "#14202b");
+    line(g.p.earth, cssColor("--orange"), [7, 5]);
+    line(g.p.fit, cssColor("--ink"));
     const cols = ["#1f5fd1", "#16795a", "#8a6410", "#bf3b27", "#7a4fd1"];
     g.p.points.forEach((q) => { c.fillStyle = cols[q[2] % cols.length]; c.beginPath(); c.arc(X(q[0]), Y(q[1]), 3, 0, 7); c.fill(); });
     if (this.plotOrigin !== null) {
@@ -800,4 +848,5 @@ class JobPage {
   }
 }
 
+$(".skip-link").onclick = e => { e.preventDefault(); view.focus(); };
 route();

@@ -87,8 +87,12 @@ def make_preview(src: str, out: Path, info, max_side: int = 960, on_progress=Non
     times, nums = [], []
     writer = None
     first = 0.0
+    truncated = False
     tmp = out.with_suffix(".part.mp4")
     for img, t, num in iter_frames(src, info, scale=s):
+        if len(times) >= MAX_PREVIEW_FRAMES:
+            truncated = True
+            break
         if writer is None:
             h, w = img.shape[:2]
             writer = Writer(str(tmp), float(info.fps or 30.0), (w, h), crf=21)
@@ -102,15 +106,13 @@ def make_preview(src: str, out: Path, info, max_side: int = 960, on_progress=Non
         nums.append(int(num))
         if on_progress and len(times) % 100 == 0:
             on_progress(len(times))
-        if len(times) >= MAX_PREVIEW_FRAMES:
-            break
     if writer is None:
         raise RuntimeError("No frames could be decoded from this file")
     writer.close()
     os.replace(tmp, out)
     t0 = times[0]
     return {"times": [round(t - t0, 6) for t in times], "nums": nums,
-            "width": writer.w, "height": writer.h}
+            "width": writer.w, "height": writer.h, "truncated": truncated}
 
 
 def to_webm(src: Path, out: Path) -> None:
@@ -140,39 +142,7 @@ def to_webm(src: Path, out: Path) -> None:
     os.replace(tmp, out)
 
 
-def analyse(job_dir: Path, src: Path, opts: dict, say):
-    """The repo's analyze(), but keeping the frame map of the debug video."""
-    from ..analyze import _run
-    from ..debugvideo import render_debug_video
-    kw = {"use_gemini": bool(opts.get("gemini")), "seed": None}
-    obj = opts.get("object") or "auto"
-    size_mm = opts.get("size_mm")
-    if opts.get("seed"):
-        sd = opts["seed"]
-        kw["seed"] = (float(sd["t"]), float(sd["x"]), float(sd["y"]))
-    if obj == "custom" and size_mm:
-        kw.update(size_m=float(size_mm) / 1000.0, size_rel_unc=0.01, label="object")
-    elif obj == "gemini":
-        kw["use_gemini"] = True
-    elif obj in ("auto", "", None):
-        kw["preset"] = None
-    else:
-        kw["preset"] = obj
-    if opts.get("hfov"):
-        kw["hfov"] = float(opts["hfov"])
-    dbg: dict = {}
-    result = _run(str(src), dbg=dbg, progress=say, **kw)
-    debug_map = None
-    say("drawing the debug video")
-    try:
-        render_debug_video(str(src), dbg, result, str(job_dir / "debug.mp4"), speed=1.0)
-        p1 = dbg["pass1"]
-        debug_map = {"nums": [int(n) for n in p1["nums"]],
-                     "t0": float(p1["times"][0])}
-        result["debug_video"] = "debug.mp4"
-    except Exception as e:  # never lose the measurement over the picture
-        result.setdefault("notes", []).append(f"Debug video failed: {e}")
-    return result, debug_map
+from .pipeline import analyse, debug_timing
 
 
 # ---------------------------------------------------------------------------
@@ -249,29 +219,17 @@ class Jobs:
                 self.update(jid, stage=str(msg).strip().capitalize())
 
             self.update(jid, stage="Measuring the fall")
-            result, dmap = analyse(d, src, job["options"], say)
+            result = analyse(d, src, job["options"], say)
             result = clean(result)
             _write_json(d / "result.json", result)
 
-            # Frame map: for every preview frame, where it sits in the debug video.
-            debug = None
-            if dmap and (d / "debug.mp4").exists():
-                by_num = {n: t for n, t in zip(fr["nums"], fr["times"])}
-                first = by_num.get(dmap["nums"][0])
-                dt = [None] * len(fr["nums"])
-                if first is not None:
-                    inside = set(dmap["nums"])
-                    for i, n in enumerate(fr["nums"]):
-                        if n in inside:
-                            dt[i] = round(by_num[n] - first, 6)
-                debug = dt
-            fr["debug_times"] = debug
+            fr.update(debug_timing(d / "debug.mp4", fr))
             _write_json(d / "frames.json", fr)
             v = result.get("verdict") or {}
             self.update(jid, status="done", stage="Done", finished=time.time(),
                         elapsed=time.time() - t_wall, verdict=v.get("verdict"),
                         g=v.get("g"), sigma=v.get("sigma"), confidence=v.get("confidence"),
-                        headline=v.get("headline"), debug=debug is not None)
+                        headline=v.get("headline"), debug=(d / "debug.mp4").is_file(), debug_sync=fr["debug_sync"])
         except Exception as e:
             traceback.print_exc()
             self.update(jid, status="error", stage="Failed", error=str(e) or type(e).__name__)
@@ -482,6 +440,8 @@ def _options(obj: str, size_mm, seed, hfov) -> dict:
     if hfov:
         try:
             opts["hfov"] = float(hfov)
-        except ValueError:
-            raise HTTPException(400, "Field of view is a number of degrees.")
+            if not math.isfinite(opts["hfov"]) or not 10 <= opts["hfov"] < 180:
+                raise ValueError
+        except (ValueError, TypeError):
+            raise HTTPException(400, "Field of view must be from 10 to less than 180 degrees.")
     return opts
