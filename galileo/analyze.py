@@ -26,7 +26,8 @@ import numpy as np
 from . import checks, clocks
 from . import config as C
 from .physics import (_noise_px, drag_factor, drag_path, fit_flights, gravity_direction,
-                      rolling_shutter_effect, split_flights)
+                      launch_velocity, robust_fit_2d, rolling_shutter_effect, split_flights,
+                      trim_release)
 from .scale import Ruler, fuse, ruler_from_size, ruler_manual
 from .stabilize import rescale_transforms, stabilize, warp
 from .track import track_falling_object
@@ -72,29 +73,67 @@ class Geom:
                 A[1, 0] * lx + A[1, 1] * ly + A[1, 2] + self.oy)
 
 
-def _depth_factors(t, d, flight_idx):
-    """Relative scale per frame if the object moves toward or away from the camera."""
-    m = np.ones(len(t))
-    if len(flight_idx) < 8:
+def _depth_factors(t, d, flights):
+    """Scale per frame (distance now / reference distance) from the ball's apparent size.
+
+    A ball that moves toward or away from the camera grows or shrinks in the
+    picture, and its pixel motion with it. A bounce can kick it toward or
+    away from the camera, so each flight gets its own distance, and a
+    distance that changes steadily during the flight when its size clearly
+    trends. Positions times this factor are pixels at one reference
+    distance, where the ruler applies. Uses the careful widths (the quick
+    blob width swells when the ball meets its own shadow near the floor), and
+    only clear differences count. Returns (m, biggest change).
+    """
+    n = len(t)
+    m = np.ones(n)
+    d = np.asarray(d, float)
+    inv = np.where(np.isfinite(d) & (d > 2), 1.0 / np.where(d > 0, d, 1.0), np.nan)
+    models = []
+    for idx in flights:
+        tt, vv = t[idx], inv[idx]
+        ok = np.isfinite(vv)
+        if ok.sum() < 6:
+            models.append(None)
+            continue
+        tc = float(tt[ok].mean())
+        A = np.vstack([np.ones(ok.sum()), tt[ok] - tc]).T
+        keep = np.ones(ok.sum(), bool)
+        for _ in range(2):
+            coef, *_ = np.linalg.lstsq(A[keep], vv[ok][keep], rcond=None)
+            res = vv[ok] - A @ coef
+            sc = 1.4826 * np.median(np.abs(res[keep])) + 1e-12
+            keep = np.abs(res) < 3.5 * sc
+        nk = int(keep.sum())
+        se_a = sc / np.sqrt(max(nk, 1))
+        se_b = sc / np.sqrt(max(np.sum((tt[ok][keep] - tc) ** 2), 1e-12))
+        change = abs(coef[1]) * float(np.ptp(tt)) / coef[0]
+        slope = float(coef[1]) if (change > 0.08 and abs(coef[1]) / se_b > 6) else 0.0
+        models.append((float(coef[0]), slope, tc, float(se_a), len(idx)))
+    good = [md for md in models if md]
+    if not good:
         return m, 0.0
-    tt, dd = t[flight_idx], d[flight_idx]
-    ok = np.isfinite(dd) & (dd > 2)
-    if ok.sum() < 8:
-        return m, 0.0
-    inv = 1.0 / dd[ok]
-    A = np.vstack([np.ones(ok.sum()), tt[ok] - tt[ok].mean()]).T
-    coef, *_ = np.linalg.lstsq(A, inv, rcond=None)
-    res = inv - A @ coef
-    s = 1.4826 * np.median(np.abs(res)) + 1e-12
-    se = s / np.sqrt(np.sum((tt[ok] - tt[ok].mean()) ** 2))
-    change = abs(coef[1]) * np.ptp(tt) / coef[0]
-    # Width estimates wobble a few percent with blur, so only a clear trend counts.
-    if change > 0.12 and abs(coef[1]) / se > 6:
-        fit_inv = coef[0] + coef[1] * (t - tt[ok].mean())
-        d_ref = 1.0 / coef[0]
-        m = d_ref * fit_inv  # d_ref / d_fit
-        return m, float(change)
-    return m, float(change)
+    # Reference distance: the flights' typical size, weighted by their length.
+    levels = np.concatenate([np.full(md[4], md[0]) for md in good])
+    inv_ref = float(np.median(levels))
+    in_flight = np.zeros(n, bool)
+    for idx, md in zip(flights, models):
+        if not md:
+            continue
+        a, b, tc, se_a, _ = md
+        lvl = a / inv_ref
+        if b == 0.0 and (abs(lvl - 1) < 0.04 or abs(a - inv_ref) < 5 * se_a):
+            continue                     # same distance as the reference, within the wobble
+        m[idx] = (a + b * (t[idx] - tc)) / inv_ref
+        in_flight[idx] = True
+    if in_flight.any():
+        # Frames between flights (held, bounce contact) take the nearest flight's value.
+        allf = np.concatenate([np.asarray(i) for i in flights])
+        allf = allf[np.argsort(t[allf])]
+        out = np.setdiff1d(np.arange(n), allf)
+        if len(out):
+            m[out] = np.interp(t[out], t[allf], m[allf])
+    return m, float(np.max(np.abs(m - 1.0)))
 
 
 def _arrays(tr, times, geo, notes=None):
@@ -304,7 +343,7 @@ def _run(path: str, *, dbg: dict | None = None, preset: str | None = None,
     # ---- fit ----------------------------------------------------------------------
     say("fitting")
     gdir = DOWN.copy()
-    m_fac, depth_change = _depth_factors(t, d, np.concatenate(fl))
+    m_fac, depth_change = _depth_factors(t, d, fl)
     cxp, cyp = geo.W / 2.0, geo.H / 2.0
     xs = cxp + (x - cxp) * m_fac
     ys = cyp + (y - cyp) * m_fac
@@ -318,6 +357,11 @@ def _run(path: str, *, dbg: dict | None = None, preset: str | None = None,
         fl = split_flights(t, xs, ys, gdir, diam_px=d_ref) or fl
         fit_kw["gdir"] = gdir
         jf = fit_flights(t, xs, ys, w0, fl, **fit_kw)
+    # The first flight starts in the hand: cut the push, and if the ball was
+    # thrown, let the bounces measure gravity instead.
+    fl, launch = _launch(t, xs, ys, fl, jf, gdir)
+    fit_kw["exclude"] = launch["exclude"]
+    jf = fit_flights(t, xs, ys, w0, fl, **fit_kw)
     rs_rel = rolling_shutter_effect(jf, t, xs, ys, w0)
     naive = {"a_px": jf.a_px, "a_sigma": jf.a_sigma}
 
@@ -346,6 +390,9 @@ def _run(path: str, *, dbg: dict | None = None, preset: str | None = None,
             if fl2:
                 fl2 = [ii[s_] for s_ in fl2]
                 fit_kw["fps"] = fps_file / clock["k"]
+                jf2 = fit_flights(t, xs, ys, w0, fl2, **{**fit_kw, "exclude": ()})
+                fl2, launch = _launch(t, xs, ys, fl2, jf2, gdir)
+                fit_kw["exclude"] = launch["exclude"]
                 jf = fit_flights(t, xs, ys, w0, fl2, **fit_kw)
                 fl = fl2
                 refit_note = (f"Refit on the {len(ii)} original frames "
@@ -356,9 +403,10 @@ def _run(path: str, *, dbg: dict | None = None, preset: str | None = None,
     rulers = []
     obj_label = label
     used = np.concatenate([fl_i for fl_i in fl])
-    d_samples = [v for v in d[used] if np.isfinite(v)]
+    d_norm = d * m_fac                 # widths at the reference distance
+    d_samples = [v for v in d_norm[used] if np.isfinite(v)]
     if len(d_samples) < 5:
-        d_samples = [v for v in d if np.isfinite(v)]
+        d_samples = [v for v in d_norm if np.isfinite(v)]
     if tr.rest_d:
         d_samples += [tr.rest_d] * 3
     vt = drag_vt
@@ -437,7 +485,7 @@ def _run(path: str, *, dbg: dict | None = None, preset: str | None = None,
             jf = jf_free
             rs_rel = rolling_shutter_effect(jf, t, xs_f, ys_f, w0)
             drag = {"factor": float(factor), "vt": float(vt), "v_scale": float(v_scale),
-                    "flights": [float(ff.a_along / fo.a_along) if fo.a_along else 1.0
+                    "flights": [float(ff.a_along / fo.a_along) if fo.a_along > 0 else 1.0
                                 for fo, ff in zip(jf_obs.flights, jf.flights)],
                     "max_shift_px": float(np.abs(D).max())}
         else:
@@ -468,7 +516,24 @@ def _run(path: str, *, dbg: dict | None = None, preset: str | None = None,
         lx, ly = xs[lead][-6:], ys[lead][-6:]
         if np.ptp(lx) < 0.3 * d_ref and np.ptp(ly) < 0.3 * d_ref:
             rest_xy = (float(np.median(lx)), float(np.median(ly)))
-    tests.append(checks.release_check(jf, rest_xy, d_ref))
+    tests.append(checks.release_check(jf, rest_xy, d_ref, thrown=launch["thrown"]))
+    if launch["thrown"]:
+        v0 = abs(launch["v0_px"]) * scale["s"] * k_clock if scale else None
+        n_after = len(jf.flights) - 1
+        if v0 is not None and v0 >= 2.5:
+            first = (f"Thrown, not dropped: the ball was already moving at {v0:.1f} m/s when "
+                     "first seen")
+        else:
+            first = "The ball was already falling fast when it was first tracked"
+        if launch["exclude"]:
+            result["notes"].append(f"{first}, so that first flight is left out and the "
+                                   f"{n_after} flight(s) after the first bounce measure gravity.")
+        else:
+            result["notes"].append(f"{first}. That's fine for measuring g; it just doesn't "
+                                   "start from rest.")
+    if launch["trim_s"] > 0:
+        result["notes"].append(f"Left out the first {1000 * launch['trim_s']:.0f} ms of the first "
+                               "flight, where the hand was still pushing the ball.")
 
     mf = jf.flights[jf.main]
     # Tracking quality is judged on jitter around a smooth path (third
@@ -508,6 +573,7 @@ def _run(path: str, *, dbg: dict | None = None, preset: str | None = None,
                         "jf_free": jf, "drag_shift": D, "gdir": gdir,
                         "scale": scale, "k": k_used, "drag": drag, "g_ref": g_ref,
                         "d_ref": d_ref, "flights": [fr_.idx for fr_ in jf.flights],
+                        "excluded": tuple(jf.excluded), "launch": launch,
                         "ghost": _ghost_path(jf_obs, times, gdir, scale, k_used, g_ref, geo.H,
                                              t, xs, ys, vt_plot)}
     result.update({
@@ -532,6 +598,8 @@ def _run(path: str, *, dbg: dict | None = None, preset: str | None = None,
                         for fr_, fo in zip(jf.flights, jf_obs.flights)],
             "main": jf.main, "diam_px": d_ref, "refit": refit_note,
             "jitter_px": jitter, "fall_diameters": travel / d_ref if d_ref else None,
+            "launch": {k_: v_ for k_, v_ in launch.items() if k_ != "exclude"},
+            "excluded_flights": [int(j) for j in jf.excluded],
         },
         "track": _track_payload(tr.main, times, geo),
         "plot": _plot_payload(jf_obs, t, xs, ys, gdir, scale, k_used, g_ref, d_ref, vt_plot,
@@ -553,6 +621,55 @@ def _run(path: str, *, dbg: dict | None = None, preset: str | None = None,
 
 
 # ---------------------------------------------------------------------------
+def _launch(t, xs, ys, fl, jf, gdir):
+    """The first flight begins in the hand. Cut the push; spot a throw.
+
+    Flights that start at a bounce are clean free flights: nothing but the
+    floor touched the ball. The first flight (and any that starts after the
+    ball was lost) may begin with the hand still pushing, so those frames are
+    cut until the rest agrees with the bounces' acceleration. A throw adds
+    speed, not acceleration, so a thrown ball is in free fall once it leaves
+    the hand; but a throw is fast, short and often near the edge of the
+    picture, so when bounces exist they measure gravity and the throw's own
+    acceleration isn't held against the clip.
+    """
+    info = {"thrown": False, "trim_s": 0.0, "v0_px": 0.0, "since_vertex_s": 0.0,
+            "exclude": ()}
+    if not fl:
+        return fl, info
+    hop = [False] + [float(t[b[0]] - t[a[-1]]) <= 0.12 for a, b in zip(fl, fl[1:])]
+    hops = [j for j in range(len(fl)) if hop[j] and len(fl[j]) >= 8
+            and jf.flights[j].a_along > 0 and np.isfinite(jf.flights[j].a_sigma)
+            and jf.flights[j].a_sigma > 0]
+    a_ref = s_ref = None
+    if hops:
+        w = np.array([1.0 / jf.flights[j].a_sigma ** 2 for j in hops])
+        a_ref = float(np.sum(w * np.array([jf.flights[j].a_along for j in hops])) / w.sum())
+        s_ref = float(1.0 / np.sqrt(w.sum()))
+    fl = list(fl)
+    for j in range(len(fl)):
+        if hop[j]:
+            continue
+        idx2, k = trim_release(t, xs, ys, fl[j], gdir, a_ref, s_ref)
+        if k:
+            if j == 0:
+                info["trim_s"] = float(t[idx2[0]] - t[fl[j][0]])
+            fl[j] = idx2
+    f0 = fl[0]
+    if len(f0) >= 5:
+        fit0 = robust_fit_2d(t[f0], xs[f0], ys[f0])
+        v0, since = launch_velocity(fit0, float(t[f0[0]]), gdir)
+        dt = float(np.median(np.diff(t[f0]))) if len(f0) > 1 else 0.0
+        info["v0_px"], info["since_vertex_s"] = float(v0), float(min(since, 99.0))
+        # Already moving down fast when first seen: a drop that tracking picks
+        # up a moment late has fallen for ~0.1 s; a throw looks like a quarter
+        # second or more of falling at the moment it's first seen.
+        info["thrown"] = bool(v0 > 0 and since > max(0.25, 6 * dt))
+    if info["thrown"] and hops:
+        info["exclude"] = (0,)
+    return fl, info
+
+
 def _aim_gravity(jf):
     """Which way is down? The picture's own down, unless the camera is clearly tilted.
 

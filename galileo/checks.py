@@ -80,14 +80,20 @@ def _u_poly(fit, g):
 
 
 def bounce_check(t, jf: JointFit, frame_dt: float) -> dict:
-    """Bounce law: same gravity every hop, and hops never gain energy."""
+    """Bounce law: same gravity every hop, and hops never gain energy.
+
+    Flights left out of the measurement (a thrown first flight) still count
+    for energy, but not for "same gravity": their acceleration is the
+    throw's, not gravity's.
+    """
     name = "Bounce law"
     fl = jf.flights
     if len(fl) < 2:
         return _result(name, "skip", "No bounces to test.")
     g = jf.gdir
+    excluded = set(getattr(jf, "excluded", ()) or ())
     pairs = []
-    for a, b in zip(fl, fl[1:]):
+    for j, (a, b) in enumerate(zip(fl, fl[1:])):
         gap = t[b.idx[0]] - t[a.idx[-1]]
         if gap > 6 * frame_dt + 1e-9:
             continue  # not neighbours across a single bounce
@@ -105,11 +111,13 @@ def bounce_check(t, jf: JointFit, frame_dt: float) -> dict:
         if not (va > 0 and vb < 0):
             continue  # not a bounce (coming in down, going out up): a gap or a glitch
         e = -vb / va
+        compare = j not in excluded and (j + 1) not in excluded and a.a_along != 0
         pairs.append({"t_bounce": float(tb), "v_in": float(va), "v_out": float(vb),
                       "restitution": float(e),
-                      "a_ratio": float(b.a_along / a.a_along) if a.a_along else float("nan"),
+                      "a_ratio": float(b.a_along / a.a_along) if compare else float("nan"),
                       "a_ratio_z": float((b.a_along - a.a_along) /
-                                         max(np.hypot(a.a_sigma, b.a_sigma), 1e-9)),
+                                         max(np.hypot(a.a_sigma, b.a_sigma), 1e-9))
+                      if compare else float("nan"),
                       "n_after": int(len(b.idx))})
     if not pairs:
         return _result(name, "skip", "Bounces found but the hops around them weren't tracked.")
@@ -122,8 +130,8 @@ def bounce_check(t, jf: JointFit, frame_dt: float) -> dict:
                        f"{max(gain):.2f} > 1). Real bounces lose energy; this looks reversed "
                        "or generated.", **detail)
     lo, hi = C.PARABOLA_RATIO_FAIL
-    bad = [p for p in pairs if p["n_after"] >= 8 and (p["a_ratio"] < lo or p["a_ratio"] > hi)
-           and abs(p["a_ratio_z"]) > 4]
+    bad = [p for p in pairs if p["n_after"] >= 8 and np.isfinite(p["a_ratio"])
+           and (p["a_ratio"] < lo or p["a_ratio"] > hi) and abs(p["a_ratio_z"]) > 4]
     if bad:
         r = bad[0]["a_ratio"]
         return _result(name, "fail",
@@ -161,9 +169,12 @@ def equal_falls_check(a_main: tuple[float, float], others: list[tuple[float, flo
     return _result(name, "pass", f"Falling objects keep pace ({r:.2f}x).", **detail)
 
 
-def release_check(jf: JointFit, rest_xy, diam_px) -> dict:
+def release_check(jf: JointFit, rest_xy, diam_px, thrown: bool = False) -> dict:
     """A dropped object starts from rest at the spot where it was held."""
     name = "Starts from rest"
+    if thrown:
+        return _result(name, "skip", "Already moving fast when first seen (thrown), so it "
+                       "doesn't start from rest.")
     if rest_xy is None or not jf.flights:
         return _result(name, "skip", "Didn't see the object held still before the drop.")
     fl = jf.flights[0]

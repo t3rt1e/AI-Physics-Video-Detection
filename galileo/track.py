@@ -572,7 +572,7 @@ def track_falling_object(frames, times, *, roi=None, bg=None, seed=None) -> Trac
         main = moving[0]
     others = [t for t in moving if t is not main and t.score > 0.3 * main.score
               and len(set(t.f) & set(main.f)) >= 6]
-    d_fine = refine_widths(frames, bg, main, times)
+    d_fine = refine_widths(frames, bg, main, times, max_n=120)
     # A static blob where the fall begins = the object's resting spot (ghost).
     rest, rest_d = None, None
     f0 = main.dets[0]

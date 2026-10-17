@@ -51,6 +51,8 @@ class Motion:
     kick: float = 0.0               # random sideways speed change at each bounce, m/s (sd)
     hand: bool = False              # a hand that holds the ball, then pulls away
     shake: float = 0.0              # handheld camera sway, px (rough amplitude)
+    vy0: float = 0.0                # thrown: downward speed at release, m/s
+    push: float = 0.0               # thrown: seconds the hand accelerates it before release
 
 
 def _integrate(m: Motion, sc: Scene, t_end: float):
@@ -62,7 +64,7 @@ def _integrate(m: Motion, sc: Scene, t_end: float):
     X = np.empty(n)
     Y = np.empty(n)
     px = py = 0.0
-    vx, vy = m.vx, 0.0
+    vx, vy = m.vx, m.vy0
     floor = None if sc.floor_y is None or m.restitution is None else (sc.floor_y - sc.y0) / ppm
     kdrag = m.g / m.vt**2 if m.vt else 0.0
     rng = np.random.default_rng(sc.seed + 17)
@@ -84,8 +86,25 @@ def _integrate(m: Motion, sc: Scene, t_end: float):
 def _trajectory(m: Motion, sc: Scene, t: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Ball centre (x, y) in px at times t (s)."""
     x0 = sc.width / 2 if sc.x0 is None else sc.x0
+    t = np.asarray(t, float)
+    if m.vy0 and m.push:
+        # Thrown: held still, then pushed down by the hand for `push` seconds
+        # (uniformly speeding up to vy0), then free.
+        xx, yy = _trajectory_free(m, sc, t, x0)
+        ap = m.vy0 / m.push
+        tb = t - m.t_release                              # < 0 before release
+        before = tb < 0
+        tp = np.clip(tb + m.push, 0, None)                # time into the push
+        y_held = sc.y0 - 0.5 * ap * m.push**2 * sc.px_per_m
+        yy = np.where(before, y_held + 0.5 * ap * np.minimum(tp, m.push) ** 2 * sc.px_per_m, yy)
+        xx = np.where(before, x0, xx)
+        return xx, yy
+    return _trajectory_free(m, sc, t, x0)
+
+
+def _trajectory_free(m: Motion, sc: Scene, t: np.ndarray, x0: float):
     tr = np.clip(t - m.t_release, 0, None)
-    if m.vt or m.kick:
+    if m.vt or m.kick or m.vy0:
         path = getattr(m, "_path", None)
         if path is None or path[0][-1] < float(np.max(tr)):
             path = _integrate(m, sc, max(float(np.max(tr)) + 0.5, 3.0))

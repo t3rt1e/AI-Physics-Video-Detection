@@ -297,6 +297,7 @@ class JointFit:
     main: int = 0
     notes: list[str] = field(default_factory=list)
     used: list[int] = field(default_factory=list)   # flights that went into a_px
+    excluded: tuple = ()                            # flights left out of a_px (e.g. a throw)
 
 
 def _fit_all(flights, t, x, y, w0, alpha, r, rc, fixed=None):
@@ -309,12 +310,14 @@ def _fit_all(flights, t, x, y, w0, alpha, r, rc, fixed=None):
 
 
 def fit_flights(t, x, y, w0, flights, *, fps, n_px_axis, rs_axis="y",
-                rs_mode="auto", gdir=(0.0, 1.0)) -> JointFit:
+                rs_mode="auto", gdir=(0.0, 1.0), exclude=()) -> JointFit:
     """Fit every flight; optionally estimate one rolling-shutter alpha for all.
 
     The rolling-shutter term can only be as large as one full frame of
     readout (alpha_max = 1/(fps * lines)), which keeps it from absorbing an
     arbitrary trajectory. It is kept only if it clearly improves the fit.
+    exclude: positions in `flights` to leave out of the combined a_px (they
+    are still fitted, e.g. a thrown first flight when bounces measure g).
     """
     t = np.asarray(t, float)
     x = np.asarray(x, float)
@@ -371,20 +374,27 @@ def fit_flights(t, x, y, w0, flights, *, fps, n_px_axis, rs_axis="y",
         out.append(FlightResult(idx=np.asarray(idx), fit=f, a_along=a, a_sigma=s,
                                 duration=float(t[idx][-1] - t[idx][0])))
     jf = JointFit(flights=out, alpha=alpha, alpha_max=alpha_max, rs_axis=rs_axis,
-                  rs_significance=signif, gdir=g, notes=notes)
+                  rs_significance=signif, gdir=g, notes=notes, excluded=tuple(exclude))
     _combine(jf)
     return jf
 
 
 def _combine(jf: JointFit):
-    """Main flight = most points. a_px = weighted mean of flights that agree with it."""
+    """Main flight = most points. a_px = weighted mean of flights that agree with it.
+
+    Excluded flights are left out unless nothing usable would remain.
+    """
     if not jf.flights:
         return
-    sizes = [len(f.idx) for f in jf.flights]
-    jf.main = int(np.argmax(sizes))
+    cand = [j for j, f in enumerate(jf.flights) if j not in jf.excluded and len(f.idx) >= 6]
+    if not cand:
+        cand = list(range(len(jf.flights)))
+    jf.main = int(max(cand, key=lambda j: len(jf.flights[j].idx)))
     m = jf.flights[jf.main]
     vals, wts, used = [], [], []
     for j, f in enumerate(jf.flights):
+        if j not in cand:
+            continue
         if len(f.idx) < 6 or not np.isfinite(f.a_sigma) or f.a_sigma <= 0:
             continue
         # Hops are weighed in only if they agree with the main flight to 25%.
@@ -412,6 +422,77 @@ def rolling_shutter_effect(jf: JointFit, t, x, y, w0) -> float:
     if plain.a_px == 0:
         return 0.0
     return float(jf.a_px / plain.a_px - 1.0)
+
+
+def trim_release(t, x, y, idx, gdir=(0.0, 1.0), a_ref=None, s_ref=None, *,
+                 max_s: float = 0.2, max_frac: float = 0.4):
+    """Cut the start of a flight that the hand was still pushing.
+
+    A thrown or tossed ball is in free fall only once it leaves the hand.
+    While the hand pushes, the ball's acceleration is the hand's, far from
+    gravity's. The local acceleration (a parabola through about 60 ms of
+    frames, with its own error bar) is compared with a_ref, the bounces' acceleration when there are
+    any, otherwise the flight's own later part. Leading frames that are way
+    off (by half of a_ref or more) are cut, plus the window around them. Air
+    drag only bends the path gently, so it never trips this. If the trouble
+    runs past max_s seconds or max_frac of the flight, nothing is cut: a
+    whole flight that misbehaves is evidence, not a hand. Returns (idx, n_cut).
+    """
+    idx = np.asarray(idx)
+    n = len(idx)
+    if n < 15:
+        return idx, 0
+    g = np.asarray(gdir, float)
+    g = g / np.linalg.norm(g)
+    tt = t[idx]
+    u = x[idx] * g[0] + y[idx] * g[1]
+    dt = float(np.median(np.diff(tt))) if n > 1 else 1.0
+    k_max = min(int(max_s / max(dt, 1e-6)), int(max_frac * n))
+    if k_max < 2:
+        return idx, 0
+    if a_ref is None:
+        tail = idx[int(0.4 * n):]
+        a_ref, _ = robust_fit_2d(t[tail], x[tail], y[tail]).accel_along(g)
+    if not (np.isfinite(a_ref) and a_ref > 0):
+        return idx, 0
+    w = max(3, int(round(0.03 / max(dt, 1e-6))))
+    off = np.zeros(k_max + 1, bool)
+    for j in range(k_max + 1):
+        sel = slice(max(0, j - w), min(n, j + w + 1))
+        if sel.stop - sel.start < 6:
+            continue
+        try:
+            c, cov = np.polyfit(tt[sel] - tt[j], u[sel], 2, cov=True)
+        except (ValueError, np.linalg.LinAlgError):
+            continue
+        s_loc = 2 * float(np.sqrt(max(cov[0, 0], 0.0)))
+        # Way off, and not just noise (a handful of frames at 240 fps barely curve).
+        off[j] = abs(2 * c[0] - a_ref) > max(0.5 * a_ref, 4 * s_loc)
+    if not off.any():
+        return idx, 0
+    last = int(np.flatnonzero(off)[-1])
+    if last >= k_max - 1:
+        return idx, 0
+    k = min(last + w, k_max)
+    return idx[k:], k
+
+
+def launch_velocity(fit: Fit2D, t_first: float, gdir=(0.0, 1.0)) -> tuple[float, float]:
+    """(speed along gravity, time since the vertex) at the first tracked point.
+
+    A ball dropped from rest has its parabola's vertex at, or just before,
+    the first tracked frame. A thrown one is already moving fast when first
+    seen: its vertex lies well before (or it has none).
+    """
+    g = np.asarray(gdir, float)
+    g = g / np.linalg.norm(g)
+    pu = fit.cx * g[0] + fit.cy * g[1]
+    tau = t_first - fit.t0
+    v = float(pu[1] + 2 * pu[2] * tau)
+    if pu[2] <= 0:
+        return v, float("inf")
+    tau_v = -pu[1] / (2 * pu[2])
+    return v, float(tau - tau_v)
 
 
 def drag_path(fit: Fit2D, ta: float, tb: float, v_scale: float, vt: float, g: float,

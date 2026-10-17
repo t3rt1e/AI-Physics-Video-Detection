@@ -171,6 +171,27 @@ def test_drag_correction_recovers_g_for_a_ping_pong_ball():
     assert abs(g_raw * fac / 9.81 - 1) < 0.015     # ...and the correction brings it back
 
 
+def test_hand_push_is_cut_from_a_throw():
+    from galileo.physics import robust_fit_2d, trim_release
+    rng = np.random.default_rng(5)
+    fps, a_push, push, g = 240.0, 60.0 * 520, 0.06, 9.81 * 520     # px/s^2
+    t = np.arange(0, 0.45, 1 / fps)
+    v1, y1 = a_push * push, 0.5 * a_push * push**2                 # at release
+    tf = np.clip(t - push, 0, None)
+    y = np.where(t < push, 0.5 * a_push * t**2, y1 + v1 * tf + 0.5 * g * tf**2)
+    y = 50 + y + rng.normal(0, 0.3, len(t))
+    x = 300 + rng.normal(0, 0.3, len(t))
+    idx = np.arange(len(t))
+    whole = 2 * np.polyfit(t, y, 2)[0]
+    kept, k = trim_release(t, x, y, idx)
+    cut = robust_fit_2d(t[kept], x[kept], y[kept]).accel_along((0, 1))[0]
+    assert abs(whole / g - 1) > 0.1                 # the push spoils a plain fit of it all
+    assert t[kept[0]] >= push and abs(cut / g - 1) < 0.02
+    # A clean drop is left alone.
+    yd = 50 + 0.5 * g * t**2 + rng.normal(0, 0.3, len(t))
+    assert trim_release(t, x, yd, idx)[1] == 0
+
+
 def test_verdict_guards():
     from galileo.verdict import decide
     scale = {"s": 1 / 400.0, "rel_sigma": 0.02}
@@ -272,6 +293,21 @@ def test_panelled_ball_is_measured_whole(tmp_path):
     r = analyze(clip, preset="volleyball")
     assert r["fit"]["diam_px"] == pytest.approx(0.21 * 200.0, rel=0.06)
     assert r["verdict"]["verdict"] == "REAL"
+
+
+def test_thrown_ball_is_measured_on_its_bounces(tmp_path):
+    # Thrown down hard: the hand's push and the fast first flight must not
+    # read as fake gravity; the bounce after it measures g.
+    sc = Scene(width=640, height=360, px_per_m=200.0, ball_d_m=0.067, ball_bgr=(60, 220, 210),
+               y0=40.0, floor_y=330.0, seed=21)
+    m = Motion(g=9.81, restitution=0.75, vy0=4.0, push=0.06, t_release=0.15, vx=0.3, vt=21.0)
+    clip = make_clip(str(tmp_path / "throw.mp4"), scene=sc, motion=m, capture_fps=120,
+                     duration=1.2, rolling_shutter=0.4)["path"]
+    r = analyze(clip, preset="tennis")
+    v = r["verdict"]
+    assert v["verdict"] == "REAL"
+    assert v["g"] == pytest.approx(9.81, rel=0.06)
+    assert r["fit"]["launch"]["thrown"] and r["fit"]["excluded_flights"] == [0]
 
 
 def test_small_fast_ball_gets_zoomed_and_drag_corrected(tmp_path, monkeypatch):

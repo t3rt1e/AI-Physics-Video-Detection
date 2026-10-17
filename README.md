@@ -70,6 +70,16 @@ python -m galileo batch path/to/real_clips --object ping-pong --expect real --cs
   smaller than about 40 px, Galileo decodes just the patch and stretch of time where it
   flew at up to full resolution and measures it again (`--no-zoom` turns this off).
 
+- **Throws are fine.** A throw adds speed, not acceleration: the ball is in free fall the
+  moment it leaves the hand. Galileo cuts the frames where the hand is still pushing (it
+  spots them by their acceleration, far from gravity's). If the ball was already moving
+  fast when first seen and it bounces, the flights after the first bounce measure g and
+  the throw is shown (dashed in the debug video) but not counted: a hard throw is short,
+  fast and often at the edge of the picture. A drop from rest uses every flight.
+- **Distance changes are allowed.** A bounce can kick the ball toward or away from the
+  camera. Each flight gets its own distance from the ball's apparent size (and a steadily
+  changing one when its size clearly trends), so hops at different distances agree.
+
 **Reading "Can't tell".** The verdict says where it stopped (`stage` in the JSON, and
 in the CSV):
 

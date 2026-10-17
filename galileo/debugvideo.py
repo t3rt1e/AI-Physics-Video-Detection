@@ -201,8 +201,12 @@ def render_debug_video(path, dbg, result, out_path, *, speed=1.0, max_side=1280)
             tt, px, py = _fit_curve(fr_.fit, t[idx[0]], t[idx[-1]])
             px, py = raw(tt, px, py)
             curves.append((tt, px / r, py / r))
+        launch = fin.get("launch") or {}
         T = dict(t=t, X=x / r, Y=y / r, D=d_q / r, flight_of=flight_of, good=good, u=u,
-                 a_loc=a_loc, a_loc_s=a_loc_s, curves=curves, ghost=ghost1, r=r)
+                 a_loc=a_loc, a_loc_s=a_loc_s, curves=curves, ghost=ghost1, r=r,
+                 excluded=set(fin.get("excluded") or ()),
+                 push_from=(t[flights[0][0]] - launch.get("trim_s", 0.0) - 0.5 * dt)
+                 if flights and launch.get("trim_s") else None)
 
     # ---- decode and draw ---------------------------------------------------------
     out_scale = min(1.0, max_side / max(info.width, info.height, 1))
@@ -285,7 +289,10 @@ def render_debug_video(path, dbg, result, out_path, *, speed=1.0, max_side=1280)
                 col = FLIGHT_COLORS[q % len(FLIGHT_COLORS)]
                 active = tt[0] - dt / 2 <= t_cur <= tt[-1] + dt / 2
                 pts = np.stack([ox_, oy_], 1).astype(np.int32)
-                cv2.polylines(frame, [pts], False, col, 2 if active else 1, cv2.LINE_AA)
+                if q in T["excluded"]:
+                    _dashed(frame, pts, col, 2 if active else 1)   # fitted, but not counted
+                else:
+                    cv2.polylines(frame, [pts], False, col, 2 if active else 1, cv2.LINE_AA)
             past = T["t"] <= t_cur + 1e-9
             if past.any():
                 ox_, oy_ = to_out(T["X"][past], T["Y"][past])
@@ -312,10 +319,16 @@ def render_debug_video(path, dbg, result, out_path, *, speed=1.0, max_side=1280)
                 fxo, fyo = g1.to_frame(fi1, T["X"][j], T["Y"][j])
                 hud.append(f"ball at x = {fxo / g1.W:.3f}, y = {fyo / g1.H:.3f} of the frame, "
                            f"{T['D'][j] * T['r']:.1f} px wide")
-                if q >= 0:
+                if q >= 0 and q in T["excluded"]:
+                    state = (f"flight {q + 1} of {len(T['curves'])} (thrown: fitted, but the "
+                             "bounces measure g)")
+                elif q >= 0:
                     state = f"flight {q + 1} of {len(T['curves'])} (fitted)"
                 elif not T["good"][j]:
                     state = "glitch: jumped off the path, left out"
+                elif flights and j < flights[0][0] and T["push_from"] is not None \
+                        and T["t"][j] >= T["push_from"]:
+                    state = "hand still pushing the ball, left out"
                 elif flights and j < flights[0][0]:
                     state = "before the first flight (held or just let go)"
                 elif flights and j > flights[-1][-1]:
@@ -494,8 +507,11 @@ def _chart_panel(W, P, fs, times1, T, fin, verdict):
         pts = np.stack([c1.X(tt), c1.Y((T["u_ref"] - uu) * us)], 1).astype(np.int32)
         cv2.polylines(panel, [pts], False, col, 1, cv2.LINE_AA)
         a_show = fb.a_along * au
-        cv2.line(panel, _pt(c2.X(tt[0]), c2.Y(a_show)), _pt(c2.X(tt[-1]), c2.Y(a_show)), col, 2,
-                 cv2.LINE_AA)
+        bar = [(c2.X(tt[0]), c2.Y(a_show)), (c2.X(tt[-1]), c2.Y(a_show))]
+        if q in set(fin.get("excluded") or ()):
+            _dashed(panel, bar, col, 2)          # a throw: shown, not counted
+        else:
+            cv2.line(panel, _pt(*bar[0]), _pt(*bar[1]), col, 2, cv2.LINE_AA)
     gh = fin.get("ghost")
     if gh is not None and len(gh[0]) > 1:
         gtt, gx, gy = (np.asarray(v_, float) for v_ in gh)
@@ -514,6 +530,8 @@ def _chart_panel(W, P, fs, times1, T, fin, verdict):
     _text(panel, "time (s)", (W // 2 - 30, P - legend_h - 4), fs * 0.75, (180, 180, 180))
     drag = fin.get("drag")
     bars = "bars: each flight's fit" + (" after air drag" if drag else "")
+    if fin.get("excluded"):
+        bars += " (dashed: thrown, not counted)"
     legend = (f"dots: tracked ball (colour = flight, grey = left out)   lines: fitted path   "
               f"{bars}   gold: Earth   right dots: local fit over a few frames")
     lf = fs * 0.72

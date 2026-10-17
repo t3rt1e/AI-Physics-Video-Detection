@@ -126,7 +126,7 @@ def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_
 
     if fails:
         out.update(verdict="AI", confidence=0.85, stage=f"physics: {fails[0]['name']} failed")
-        out["headline"] = f"Physics breaks: {fails[0]['summary'].split('.')[0]}."
+        out["headline"] = f"Physics breaks: {fails[0]['summary'].split('. ')[0].rstrip('.')}."
         reasons.extend(t["summary"] for t in fails)
         reasons.append(f"The best constant-gravity fit gives g = {gtxt} ({pct:.0f}% of Earth's), "
                        "but the path isn't a free fall.")
