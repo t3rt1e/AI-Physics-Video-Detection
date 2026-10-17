@@ -235,16 +235,28 @@ def split_flights(t, x, y, gdir=(0.0, 1.0), *, min_pts=5, max_gap_s=0.2,
                 b = lo + int(np.argmax(uu[lo:hi + 1]))
                 if not bounces or b > bounces[-1] + 1:
                     bounces.append(b)
-        # A bounce is where the object is lowest. A tracking hiccup near the
-        # top of a hop (the blob meeting something on the wall for a few
-        # frames) can also turn down-then-up there; that isn't one.
+        # A bounce is low in its hop and the object arrives fast. A tracking
+        # hiccup near the top of a hop (the blob meeting something on the
+        # wall for a few frames) can also turn down-then-up, but high up and
+        # slowly; that isn't one. The floor needn't look level: a ball
+        # bouncing away from the camera lands higher in the picture each
+        # time, so anywhere in the lower half of the hop counts.
         keep = []
         for j, b in enumerate(bounces):
             a0 = bounces[j - 1] if j > 0 else 0
             b1 = bounces[j + 1] if j + 1 < len(bounces) else len(uu) - 1
             seg = uu[a0:b1 + 1]
             span = float(np.ptp(seg)) if len(seg) else 0.0
-            if uu[b] >= float(np.max(seg)) - max(0.25 * span, 2.0 * eps):
+            low = (uu[b] >= float(np.min(seg)) + 0.5 * span
+                   or uu[b] >= float(np.max(seg)) - 2.0 * eps)
+            fast = True
+            if b - a0 > 2 * step:
+                w = uu[a0:b + 1]
+                v = (w[step:] - w[:-step]) / step          # px per frame, over `step` frames
+                # Its last few steps in (the contact itself can fall between
+                # two frames, leaving the very last step short).
+                fast = float(np.max(v[-3:])) >= 0.3 * float(np.max(v))
+            if low and fast:
                 keep.append(b)
         bounces = keep
         cuts = [0] + bounces + [len(idx) - 1]

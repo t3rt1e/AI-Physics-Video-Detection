@@ -75,6 +75,11 @@ Z_TOL = 2.5
 # If Z_TOL * relative error exceeds this, a "matches gravity" call would be
 # meaningless, so the verdict is "too uncertain" unless g is far off anyway.
 MAX_SPREAD = 0.35
+# Take every clip as playing at the speed it was filmed (no slow motion, no
+# speed-up). Then g inside Earth's interval is real, and outside it, too slow
+# or too fast, is AI. False (or --slowmo) reads the file's clocks instead and
+# allows real slow motion (SLOWMO) and sped-up footage (can't tell).
+ASSUME_REAL_TIME = True
 
 # Minimum data for any verdict.
 MIN_FLIGHT_POINTS = 6
@@ -98,6 +103,10 @@ CLOCK_MIN_CONFIDENCE = 0.6
 WORK_MAX_SIDE = 1280
 FRAME_BUDGET_BYTES = 600_000_000
 MAX_FRAMES = 900
+# A longer clip is read one frame in N, as long as that leaves this many
+# frames a second (plenty for a fall); only past that is it cut to the
+# stretch with the most motion.
+MIN_FPS_LONG = 60.0
 
 # Zoom pass: if the ball is smaller than ZOOM_MIN_PX in the first pass, the fall
 # is decoded again, cropped around the ball's path, at a scale that makes the

@@ -13,6 +13,10 @@ Order of evidence:
   7. g (after clocks) matches Earth                 -> REAL, or SLOWMO if k > 1
   8. g too low and no clock explains it             -> AI
   9. g too high                                     -> UNSURE (sped up, or object smaller than assumed)
+
+By default (config.ASSUME_REAL_TIME) every clip is taken as playing at the
+speed it was filmed, with no clocks: g inside Earth's interval is REAL, and
+outside it, too slow or too fast, is AI.
 """
 from __future__ import annotations
 
@@ -33,14 +37,18 @@ def _fmt_g(g, sig):
 
 def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_EARTH,
            tracking_ok=True, rs_rel=0.0, drag=None, falls=True, light=None,
-           geom_rel=0.0) -> dict:
+           geom_rel=0.0, real_time=C.ASSUME_REAL_TIME) -> dict:
     """falls: the tracked object moves down a good distance and is still moving
     down at the end of its flight (False for a hand pulling away).
     light: the object's name when air drag rules its fall (a feather, a
     balloon, a sheet of paper): then falling slowly or at a steady speed is
     what a real one does, not a sign of AI.
     geom_rel: relative error from the camera model (its focal length and
-    angle), which matters when the camera looks down or up at the fall."""
+    angle), which matters when the camera looks down or up at the fall.
+    real_time: the clip plays at the speed it was filmed (k = 1), so a g
+    outside Earth's interval is AI whichever side it falls on. Otherwise
+    clocks may explain a low g (slow motion), and a high g can't be called
+    (the footage may be sped up)."""
     reasons: list[str] = []
     out = {"verdict": "UNSURE", "confidence": 0.0, "headline": "", "reasons": reasons,
            "g": None, "sigma": None, "g_naive": None, "g_ref": g_ref, "ratio": None,
@@ -65,6 +73,8 @@ def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_
     weak_k = clock.get("weak_k") if clock else None
     if clock and clock.get("conflict"):
         weak_k = weak_k or clock.get("k")
+    if real_time:
+        k, weak_k = 1.0, None
     out["k"] = k
 
     if fails and scale is None:
@@ -161,6 +171,12 @@ def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_
                            "in the frame, or only a few frames of the fall were tracked.")
             return out
 
+    # Earth's interval for this measurement: real inside it.
+    lo, hi = g_ref * (1 - tol), g_ref * (1 + tol)
+    out["real_range"] = [float(lo), float(hi)]
+    range_line = (f"Counts as real between {lo:.1f} and {hi:.1f} m/s² (Earth's {g_ref:.2f} "
+                  f"± {100 * tol:.0f}% for this measurement).")
+
     if abs(ratio - 1) <= tol and not far:
         out["stage"] = "ok"
         if k >= 1.5:
@@ -176,6 +192,7 @@ def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_
             out["headline"] = f"Falls at {gtxt}: Earth's gravity."
             reasons.append(f"Measured g = {gtxt}, within {abs(ratio - 1) * 100:.0f}% of "
                            f"{g_ref:.2f}.")
+            reasons.append(range_line)
             if clock and clock.get("slowmo_playback"):
                 sp = clock["slowmo_playback"]
                 reasons.append(f"Played back at 30 fps this clip would look {sp:.0f}x slow "
@@ -194,7 +211,7 @@ def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_
         return out
 
     if ratio < 1 - tol:
-        k_needed = float(np.sqrt(1 / ratio))
+        k_needed = float(np.sqrt(1 / ratio)) if ratio > 0 else float("inf")
         if weak_k and abs(g * weak_k**2 / g_ref - 1) <= tol:
             out.update(verdict="SLOWMO", confidence=0.55, k=weak_k, stage="ok",
                        g=g * weak_k**2, sigma=sigma * weak_k**2)
@@ -209,7 +226,11 @@ def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_
         out.update(verdict="AI", confidence=conf, stage="physics: g too low")
         out["headline"] = f"Falls at {pct:.0f}% of Earth's gravity ({gtxt}): too slow to be real."
         reasons.append(f"Measured g = {gtxt}; Earth's is {g_ref:.2f}.")
-        if k > 1:
+        reasons.append(range_line)
+        if real_time:
+            reasons.append("The clip is taken as playing at the speed it was filmed (no slow "
+                           "motion).")
+        elif k > 1:
             reasons.append(f"Even after undoing the {k:.0f}x slow motion found by "
                            f"{clock['source']}, it's too slow.")
         else:
@@ -224,6 +245,21 @@ def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_
         return out
 
     # Too fast.
+    if real_time:
+        # Judged at the bottom of the error bar when the bar is wide.
+        r_lo = ratio * (1 - spread) if far else ratio
+        conf = float(np.clip(0.6 + (r_lo - 1 - tol) * 1.5, 0.6, 0.98))
+        out.update(verdict="AI", confidence=conf, stage="physics: g too high")
+        out["headline"] = f"Falls at {pct:.0f}% of Earth's gravity ({gtxt}): too fast to be real."
+        reasons.append(f"Measured g = {gtxt}; Earth's is {g_ref:.2f}.")
+        reasons.append(range_line)
+        reasons.append("The clip is taken as playing at the speed it was filmed (not sped up). "
+                       f"A real one would have to be {1 / ratio:.2f}x the size assumed for it.")
+        if drag_line:
+            reasons.append(drag_line)
+        reasons.extend(t["summary"] for t in tests if t["status"] == "pass")
+        reasons.extend(t["summary"] for t in warns)
+        return out
     out.update(verdict="UNSURE", confidence=0.5, stage="physics: g too high")
     out["headline"] = f"Falls faster than gravity allows ({gtxt})."
     reasons.append("Either the footage is sped up, or the object is smaller than assumed "

@@ -206,6 +206,13 @@ def test_verdict_guards():
     assert v["verdict"] == "UNSURE" and v["stage"] == "measurement: too uncertain"
     v = decide(a_px=3500.0, a_sigma=30.0, drag={"factor": 1.12, "vt": 8.4}, **base)
     assert v["verdict"] == "REAL" and v["g"] == pytest.approx(3500 / 400 * 1.12)
+    assert v["real_range"] == pytest.approx([9.80 * 0.85, 9.80 * 1.15])
+    # Outside Earth's interval is AI on either side (clips play in real time)...
+    v = decide(a_px=4800.0, a_sigma=30.0, **base)               # 12 m/s^2
+    assert v["verdict"] == "AI" and v["stage"] == "physics: g too high"
+    assert decide(a_px=2400.0, a_sigma=30.0, **base)["verdict"] == "AI"
+    # ...unless sped-up footage is allowed (--slowmo): then too fast can't be called.
+    assert decide(a_px=4800.0, a_sigma=30.0, real_time=False, **base)["verdict"] == "UNSURE"
 
 
 def test_pick_seeded_follows_the_click():
@@ -341,10 +348,19 @@ def test_ai_clip_is_flagged(clips):
 
 
 def test_slow_motion_is_not_called_fake(clips):
-    r = analyze(clips["slow"], preset="steel-38mm")
+    # Only with the clocks on (--slowmo); by default clips are taken as real time.
+    r = analyze(clips["slow"], preset="steel-38mm", real_time=False)
     v = r["verdict"]
     assert v["verdict"] == "SLOWMO" and v["k"] == pytest.approx(4)
     assert v["g"] == pytest.approx(9.81, rel=0.1)
+
+
+def test_clips_are_taken_as_real_time_by_default(clips):
+    r = analyze(clips["slow"], preset="steel-38mm")
+    v = r["verdict"]
+    assert v["verdict"] == "AI" and v["k"] == 1.0
+    assert v["g"] == pytest.approx(9.81 / 16, rel=0.15)
+    assert any("slow motion" in n for n in r["notes"])        # what the clocks found is noted
 
 
 def test_web_api(clips, tmp_path):

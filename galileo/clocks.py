@@ -227,3 +227,18 @@ def combine(evidence: list[dict], fps_file: float) -> dict:
         w = max(weak, key=lambda e: e["confidence"])
         out["weak_k"], out["weak_source"] = w["k"], w["name"]
     return out
+
+
+def real_time(clock: dict) -> dict:
+    """Take the clip as playing at the speed it was filmed: k = 1, no slow
+    motion and no speed-up. Frames the clocks found to be repeats or blends
+    are still left out of the fit; a slow-down they found is only reported
+    ("ignored_k")."""
+    out = {**clock, "k": 1.0, "weak_k": None, "weak_source": None, "conflict": False,
+           "real_time": True, "ignored_k": None}
+    if clock.get("confidence", 0) >= C.CLOCK_MIN_CONFIDENCE and abs(clock.get("k", 1.0) - 1) > 0.05:
+        out["ignored_k"] = (float(clock["k"]), clock["source"])
+        out["source"] = "taken as real time"
+    elif clock.get("weak_k"):
+        out["ignored_k"] = (float(clock["weak_k"]), clock["weak_source"])
+    return out

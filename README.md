@@ -227,7 +227,7 @@ in the CSV):
 | --- | --- | --- |
 | Live drop | `serve --tower COM5 --camera 0` (or `--fake-tower` to rehearse) | Button, then TOWER g and VIDEO g side by side within seconds |
 | AI twin | `twin --image tower.jpg`, then pick it on the right | Same tower, wrong gravity, strobe view with the ball lagging Earth's rings |
-| Slow-motion trap | Pick the 240 fps phone clip | "As played: 0.15 m/s²", Galileo reads the 240 fps clock and reports 9.8 |
+| Slow-motion trap | Pick the 240 fps phone clip (`--slowmo` on the command line) | "As played: 0.15 m/s²", Galileo reads the 240 fps clock and reports 9.8 |
 | In the wild | Upload any clip of something falling, pick the object as the ruler | Verdict with reasons and error bars |
 
 The left panel follows live drops automatically. Each result shows:
@@ -242,7 +242,12 @@ The left panel follows live drops automatically. Each result shows:
 
 ### The slow-motion clip
 
-Use the original file from the phone so its clock survives:
+By default every clip is taken as playing at the speed it was filmed: no slow motion,
+no speed-up. Then g inside Earth's interval (shown with every result, e.g. "counts as real
+between 8.3 and 11.3 m/s²") is real, and outside it, too slow or too fast, is AI. To let
+Galileo read the file's clocks and allow real slow motion (and sped-up footage), pass
+`--slowmo` (or set `ASSUME_REAL_TIME = False` in `config.py`). Then use the original
+file from the phone so its clock survives:
 
 - **iPhone:** AirDrop with Options, All Photos Data on, or export the unmodified original.
   The 240 fps timestamps let Galileo read real time directly.
@@ -317,7 +322,9 @@ Veo clips are 24 fps and 4, 6 or 8 s long, and stay downloadable for 2 days.
 ## How it works
 
 1. **Frames** (`video.py`): PyAV decode with exact timestamps, display rotation, and
-   capture-rate tags. Long clips are cut to the stretch with the most motion.
+   capture-rate tags. A clip over 900 frames is read one frame in N (a 240 fps clip at
+   120 a second), so a moving camera can't hide the first bounce; only when that would
+   leave under 60 frames a second is it cut to the stretch with the most motion.
 2. **Camera motion** (`stabilize.py`): pans, drift, zooms and handheld shake are tracked
    on the background against keyframes and removed. Matching against a keyframe (not the
    previous frame) keeps a slowly moving hand from leaking in as fake camera motion at
@@ -361,7 +368,9 @@ Veo clips are 24 fps and 4, 6 or 8 s long, and stay downloadable for 2 days.
    mapped into the level view (`Leveler`), and how far the focal length and the tilt could
    move g is added to the error bar.
 6. **Fitting** (`physics.py`): the track is cut into flights at bounces (direction changes
-   are judged over 1/60 s, so noise at 240 fps isn't a bounce) and each gets a robust
+   are judged over 1/60 s, so noise at 240 fps isn't a bounce; a bounce is low in its hop
+   and arrives fast, and need not land where the last one did: a ball bouncing away
+   from the camera lands higher in the picture each time) and each gets a robust
    parabola in x and y, so sideways motion is fine: g is the part along gravity. One
    rolling-shutter term (bounded by a frame's readout time) is fitted when it clearly
    helps; uncorrected, a 60 fps webcam can read 5 to 10% high. This runs in the level
@@ -374,8 +383,12 @@ Veo clips are 24 fps and 4, 6 or 8 s long, and stay downloadable for 2 days.
    needs the most.
 8. **Checks** (`checks.py`): tests that need neither ruler nor clock. Only a clear,
    significant change fails the constant-acceleration check, and hops are compared for
-   "same g" only when both were measured well (at least 0.15 s each). With the room's
-   uprights in view, the fall must also speed up along them ("Falls straight down").
+   "same g" only when both were measured well (at least 0.15 s each). A bounce's
+   restitution comes from the hops' times when both hops are whole (a hop lasts 2v/g, so
+   the ratio of two hops' times is the bounce's restitution, with no scale or camera
+   motion in it), otherwise from the speeds, and only a gain beyond the measurement's
+   error fails. With the room's uprights in view, the fall must also speed up along them
+   ("Falls straight down").
 9. **Clocks** (`clocks.py`): capture-rate tags, high-frame-rate timestamps, repeated
    frames, interpolation patterns, and lighting flicker (a hint only). Read once, on the
    main object, and shared: a clip has one speed.
@@ -383,10 +396,11 @@ Veo clips are 24 fps and 4, 6 or 8 s long, and stay downloadable for 2 days.
    error bars that widen when rulers disagree.
 11. **Verdict** (`verdict.py`): a scale-free failure means AI. A tracked thing that never
    falls, or slows as it falls, gets "Can't tell" (it is probably a hand); one that falls
-   at a steady speed is AI. Otherwise g decides, with a ±15% band; if the error bar is
-   wider than ±35% the answer is "too uncertain" unless g is far off anyway. Too slow with
-   no clock explaining it is AI; matching Earth after a found slow-down is real slow
-   motion. With several objects, the main one decides; another stands in when the main
+   at a steady speed is AI. Otherwise g decides, with a ±15% band (wider when the error
+   bar is): inside it is real, outside it, too slow or too fast, is AI. If the error bar
+   is wider than ±35% the answer is "too uncertain" unless g is far off anyway. With
+   `--slowmo`, a clock that explains a low g makes it real slow motion, and too fast
+   can't be called (the footage may be sped up). With several objects, the main one decides; another stands in when the main
    one can't be measured and Galileo knows what the other one is, and the rest add their
    numbers to the reasons (lowering the confidence when they disagree).
 

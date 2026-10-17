@@ -699,26 +699,44 @@ def _run(path: str, *, dbg: dict | None = None, preset=None,
          seed=None, zoom: bool = True, drag_vt: float | None = None, identify_mode: str = "auto",
          max_objects: int = C.MAX_OBJECTS, hfov: float | None = None, camera_mode: str = "auto",
          camera_pitch: float | None = None, camera_roll: float | None = None,
+         real_time: bool | None = None,
          progress: Callable[[str], None] | None = None) -> dict:
     t_wall = time.time()
+    real_time = C.ASSUME_REAL_TIME if real_time is None else bool(real_time)
     say = progress or (lambda s: None)
     info = probe(path)
     result: dict = {"file": info.to_dict(), "notes": [], "version": 3}
     presets = _preset_list(preset)
 
     # ---- first pass: the whole picture ------------------------------------------
-    n_est = info.n_frames or int(info.fps * info.duration) or C.MAX_FRAMES
-    if t_start is None and t_end is None and n_est > C.MAX_FRAMES:
-        say("finding the motion")
-        t_start, t_end = motion_window(path, info, C.MAX_FRAMES)
-        if t_start is not None:
-            result["notes"].append(f"Long clip: analysed {t_start:.2f}-{t_end:.2f} s, where "
-                                   "the motion is.")
-    n_use = min(n_est, C.MAX_FRAMES)
+    fps0 = float(info.fps or 30.0)
+    n_est = info.n_frames or int(fps0 * info.duration) or C.MAX_FRAMES
+    span_n = n_est
+    if t_start is not None or t_end is not None:
+        t_a = t_start or 0.0
+        t_b = t_end if t_end is not None else (info.duration or n_est / fps0)
+        span_n = max(1, int(round((t_b - t_a) * fps0)) + 1)
+    step = 1
+    if span_n > C.MAX_FRAMES:
+        # A long clip: one frame in `step` of all of it (a moving camera makes
+        # "where the motion is" a poor guess, and the first bounce stays in),
+        # while that leaves MIN_FPS_LONG frames a second. Past that, the
+        # stretch with the most motion.
+        step = max(1, min(int(np.ceil(span_n / C.MAX_FRAMES)), int(fps0 // C.MIN_FPS_LONG)))
+        if t_start is None and t_end is None and span_n > C.MAX_FRAMES * step:
+            say("finding the motion")
+            t_start, t_end = motion_window(path, info, C.MAX_FRAMES * step)
+            if t_start is not None:
+                result["notes"].append(f"Long clip: analysed {t_start:.2f}-{t_end:.2f} s, where "
+                                       "the motion is.")
+        if step > 1:
+            result["notes"].append(f"Long clip: used one frame in {step} "
+                                   f"({fps0 / step:.0f} a second).")
+    n_use = min(int(np.ceil(span_n / step)), C.MAX_FRAMES)
     sc = work_scale(info, n_use, C.WORK_MAX_SIDE, C.FRAME_BUDGET_BYTES)
     say("decoding")
     frames, times, nums = read_frames(path, info, scale=sc, t_start=t_start, t_end=t_end,
-                                      max_frames=C.MAX_FRAMES)
+                                      max_frames=C.MAX_FRAMES, step=step)
     if len(frames) < 6:
         return _unsure(result, "The clip is too short to measure.", t_wall,
                        stage="decode: too short")
@@ -726,7 +744,7 @@ def _run(path: str, *, dbg: dict | None = None, preset=None,
     dt_med = float(np.median(np.diff(times))) if len(times) > 1 else 1.0 / (info.fps or 30)
     fps_file = 1.0 / dt_med if dt_med > 0 else (info.fps or 30.0)
     result["work"] = {"scale": sc, "width": Ww, "height": Hw,
-                      "frames": len(frames), "fps_measured": fps_file}
+                      "frames": len(frames), "fps_measured": fps_file, "step": step}
 
     say("stabilizing")
     frames_s, T, stab = stabilize(frames, stabilize_mode)
@@ -809,6 +827,7 @@ def _run(path: str, *, dbg: dict | None = None, preset=None,
                               p1["d_ref"], extent=p1["size"])
             if not plan:
                 continue
+            plan["step"] = step                  # the same frames as the first pass
             say("zooming in on the ball" if len(objs) == 1 else f"zooming in on object {o.n}")
             z = _zoom_pass(path, info, plan, geo, times, o.tr, tracker, want_gray=o.n == 1,
                            down=p1["g2"])
@@ -897,7 +916,8 @@ def _run(path: str, *, dbg: dict | None = None, preset=None,
     # ---- measure each one -----------------------------------------------------------
     shared = {"info": info, "fps_file": fps_file, "dt_med": dt_med, "rs_axis": rs_axis,
               "g_ref": g_ref, "rs_mode": rs_mode, "scale_correction": scale_correction,
-              "bright": bright, "camera": camera}
+              "bright": bright, "camera": camera, "real_time": real_time,
+              "fps_native": fps_file * step}
     clock = None
     keep_nums = None
     for o in objs:
@@ -1262,7 +1282,9 @@ def _measure(o: _Obj, sh: dict, *, clock=None, keep_nums=None, say=None, manual_
     # ---- clocks -------------------------------------------------------------------
     if clock is None:
         say("reading clocks")
-        ev = clocks.metadata_clock({"fps": fps_file, "capture_fps": info.capture_fps})
+        # The file's own frame rate (a long clip may be read one frame in N).
+        ev = clocks.metadata_clock({"fps": sh.get("fps_native", fps_file),
+                                    "capture_fps": info.capture_fps})
         mf = jf.flights[jf.main]
         mi = mf.idx
         vx, vy = mf.fit.vel(t[mi] - mf.fit.t0)
@@ -1277,6 +1299,12 @@ def _measure(o: _Obj, sh: dict, *, clock=None, keep_nums=None, say=None, manual_
         ev.append(clocks.interpolation_clock(f[mi], u_all[mi]))
         ev.append(clocks.flicker_clock(sh["bright"], fps_file))
         clock = clocks.combine([e for e in ev if e], fps_file)
+        if sh.get("real_time"):
+            clock = clocks.real_time(clock)
+            if clock.get("ignored_k"):
+                kk, src = clock["ignored_k"]
+                notes.append(f"A slow-motion clue ({src}) points to {kk:.1f}x slow motion, but "
+                             "clips are taken as playing in real time.")
         keep = clock.get("keep_frames")
         sel = np.isin(f, np.asarray(keep)) if keep else None
     else:
@@ -1478,13 +1506,17 @@ def _measure(o: _Obj, sh: dict, *, clock=None, keep_nums=None, say=None, manual_
     # down, having come down a few of its own widths. A hand pulling away doesn't.
     # A big ball close to the camera has no room to come down two of its own
     # widths inside the picture, so for it a fifth of the picture is enough.
-    pu_m = mf.fit.cx * gdir[0] + mf.fit.cy * gdir[1]
-    tau_m = t[mf.idx] - mf.fit.t0
-    u_m = pu_m[0] + pu_m[1] * tau_m + pu_m[2] * tau_m**2
-    v_end = float(pu_m[1] + 2 * pu_m[2] * tau_m[-1])
-    travel = float(u_m[-1] - np.min(u_m))
+    # Any of its flights will do: a bouncing ball's later hops are lower than
+    # its first drop.
     need = min(2.0 * d_ref, 0.2 * (abs(gdir[0]) * geo.W + abs(gdir[1]) * geo.H))
-    falls = travel >= need and v_end > 0
+
+    def _drop(fr_):
+        pu_m = fr_.fit.cx * gdir[0] + fr_.fit.cy * gdir[1]
+        tau_m = t[fr_.idx] - fr_.fit.t0
+        u_m = pu_m[0] + pu_m[1] * tau_m + pu_m[2] * tau_m**2
+        return float(u_m[-1] - np.min(u_m)), float(pu_m[1] + 2 * pu_m[2] * tau_m[-1])
+    travel = _drop(mf)[0]
+    falls = any(dr_ >= need and ve_ > 0 for dr_, ve_ in map(_drop, jf.flights))
     if not falls and _sure_of(idn):
         # A ball tossed up is in free flight too; "never falls" is there to
         # catch a hand pulling away, and this is known not to be a hand.
@@ -1505,7 +1537,8 @@ def _measure(o: _Obj, sh: dict, *, clock=None, keep_nums=None, say=None, manual_
     v = decide(a_px=a_raw, a_sigma=jf.a_sigma / drag["factor"] if drag else s_raw, scale=scale,
                clock=clock, tests=tests, n_points=len(mf.idx), duration=mf.duration,
                g_ref=g_ref, tracking_ok=tracking_ok, rs_rel=rs_rel, drag=drag, falls=falls,
-               light=obj_label if light else None, geom_rel=geom_rel)
+               light=obj_label if light else None, geom_rel=geom_rel,
+               real_time=sh.get("real_time", C.ASSUME_REAL_TIME))
     if v["stage"] == "ruler: missing" and o.n > 1:
         v["headline"] = "Can't tell: no ruler (its size isn't known)."
 
@@ -1815,7 +1848,8 @@ def _zoom_pass(path, info, plan, geo, times, tr, tracker, want_gray=True, down=D
     z = plan["z"]
     x0, y0, x1, y1 = plan["crop"]
     frames, tz, nz = read_frames(path, info, scale=z, t_start=plan["t0"], t_end=plan["t1"],
-                                 max_frames=C.MAX_FRAMES, crop=plan["crop"])
+                                 max_frames=C.MAX_FRAMES, crop=plan["crop"],
+                                 step=plan.get("step", 1))
     if len(frames) < 8:
         return None
     ratio = plan["W"] / geo.W

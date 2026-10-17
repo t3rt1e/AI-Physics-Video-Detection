@@ -86,7 +86,8 @@ def _analyze_kwargs(a):
                 scale_correction=a.scale_correction, zoom=not a.no_zoom, drag_vt=a.drag_vt,
                 identify_mode=a.identify, max_objects=a.max_objects, hfov=a.hfov,
                 camera_pitch=a.pitch, camera_roll=a.roll,
-                camera_mode="upright" if a.upright else "auto")
+                camera_mode="upright" if a.upright else "auto",
+                real_time=False if a.slowmo else None)
 
 
 def _camera_line(r) -> str | None:
@@ -404,6 +405,10 @@ def main(argv=None):
                        help="how far the camera was turned about its own axis, if known")
         s.add_argument("--upright", action="store_true",
                        help="assume a level, upright camera (skip working out its angle)")
+        s.add_argument("--slowmo", action="store_true",
+                       help="allow slow-motion and sped-up footage: read the file's clocks "
+                            "(capture-rate tags, repeated or blended frames) instead of taking "
+                            "the clip as real time")
 
     s = sub.add_parser("analyze", help="measure one clip")
     s.add_argument("clip")

@@ -312,8 +312,9 @@ def render_debug_video(path, dbg, result, out_path, *, speed=1.0, max_side=1280)
 
     # ---- decode and draw ---------------------------------------------------------
     out_scale = min(1.0, max_side / max(info.width, info.height, 1))
+    step = int(np.median(np.diff(nums1))) if len(nums1) > 1 else 1   # a long clip: 1 in N
     frames = iter_frames(path, info, scale=out_scale, first_num=int(nums1[0]),
-                         last_num=int(nums1[-1]))
+                         last_num=int(nums1[-1]), step=max(1, step))
     writer = None
     chart_bg = None
     n_done = 0

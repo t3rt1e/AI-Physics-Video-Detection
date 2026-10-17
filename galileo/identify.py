@@ -254,8 +254,19 @@ def _load_clip():
         return _clip
     from transformers import CLIPModel, CLIPProcessor
     name = os.environ.get("GALILEO_CLIP_MODEL", C.CLIP_MODEL)
-    _clip.update(model=CLIPModel.from_pretrained(name).eval(),
-                 proc=CLIPProcessor.from_pretrained(name), name=name)
+    # Otherwise transformers asks the Hugging Face Hub in the background, on
+    # every run, whether a safetensors copy of the weights exists, and the Hub
+    # answers an anonymous request with a "set HF_TOKEN" warning.
+    os.environ.setdefault("DISABLE_SAFETENSORS_CONVERSION", "1")
+    try:
+        # Once downloaded, load it from disk without asking the Hub at all
+        # (it also works offline).
+        model = CLIPModel.from_pretrained(name, local_files_only=True)
+        proc = CLIPProcessor.from_pretrained(name, local_files_only=True)
+    except Exception:
+        model = CLIPModel.from_pretrained(name)          # first run: download (~600 MB)
+        proc = CLIPProcessor.from_pretrained(name)
+    _clip.update(model=model.eval(), proc=proc, name=name)
     keys, kinds, groups = _vocabulary()
     # The vocabulary's embeddings take a while on a CPU; keep them on disk.
     from .gemini import CACHE_DIR

@@ -79,6 +79,13 @@ def _u_poly(fit, g):
     return fit.cx * g[0] + fit.cy * g[1]
 
 
+def _v_sigma(fit, g, tau) -> float:
+    """Standard error of the speed along gravity at tau, from the fit."""
+    J = np.array([0.0, 1.0, 2.0 * tau])
+    var = g[0] ** 2 * float(J @ fit.cov_x @ J) + g[1] ** 2 * float(J @ fit.cov_y @ J)
+    return float(np.sqrt(max(var, 0.0)))
+
+
 def bounce_check(t, jf: JointFit, frame_dt: float) -> dict:
     """Bounce law: same gravity every hop, and hops never gain energy.
 
@@ -117,14 +124,18 @@ def bounce_check(t, jf: JointFit, frame_dt: float) -> dict:
         if va < 0.25 * v_max:
             continue
         e = -vb / va
+        # How well the two fits pin the speeds down at the contact: a short
+        # low hop, or a camera that moves, measures them loosely.
+        e_sigma = abs(e) * float(np.hypot(_v_sigma(a.fit, g, tb - ta0) / va,
+                                          _v_sigma(b.fit, g, tb - tb0) / vb))
         # Same g on both hops: only between hops measured well enough to say
         # (a stub of a hop, cut off by the end of the clip, can't).
         a_big = max(abs(a.a_along), abs(b.a_along))
         precise = all(np.isfinite(h.a_sigma) and h.a_sigma < 0.1 * a_big
                       and t[h.idx[-1]] - t[h.idx[0]] >= 0.15 for h in (a, b))
         compare = j not in excluded and (j + 1) not in excluded and a.a_along != 0 and precise
-        pairs.append({"t_bounce": float(tb), "v_in": float(va), "v_out": float(vb),
-                      "restitution": float(e),
+        pairs.append({"j": j, "t_bounce": float(tb), "v_in": float(va), "v_out": float(vb),
+                      "restitution": float(e), "restitution_sigma": e_sigma,
                       "a_ratio": float(b.a_along / a.a_along) if compare else float("nan"),
                       "a_ratio_z": float((b.a_along - a.a_along) /
                                          max(np.hypot(a.a_sigma, b.a_sigma), 1e-9))
@@ -132,9 +143,31 @@ def bounce_check(t, jf: JointFit, frame_dt: float) -> dict:
                       "n_after": int(len(b.idx))})
     if not pairs:
         return _result(name, "skip", "Bounces found but the hops around them weren't tracked.")
-    es = [p["restitution"] for p in pairs if np.isfinite(p["restitution"])]
+    # Between two bounces a hop lasts 2v/g, so the time of the hop after a
+    # bounce over the time of the hop before it is that bounce's restitution,
+    # with no scale, distance or camera motion in it: preferred whenever both
+    # hops are whole. Each bounce time is good to about half a frame.
+    by_j = {p["j"]: p for p in pairs}
+    s_t = 0.5 * frame_dt * np.sqrt(2.0)
+    for p in pairs:
+        prev, nxt = by_j.get(p["j"] - 1), by_j.get(p["j"] + 1)
+        if prev is None or nxt is None:
+            continue
+        t_in, t_out = p["t_bounce"] - prev["t_bounce"], nxt["t_bounce"] - p["t_bounce"]
+        if t_in > 0 and t_out > 0:
+            e_t = t_out / t_in
+            p["restitution_t"] = float(e_t)
+            p["restitution_t_sigma"] = float(e_t * np.hypot(s_t / t_in, s_t / t_out))
+
+    def _e(p):
+        if "restitution_t" in p:
+            return p["restitution_t"], p["restitution_t_sigma"]
+        return p["restitution"], p["restitution_sigma"]
+    es = [_e(p)[0] for p in pairs if np.isfinite(_e(p)[0])]
     detail = {"bounces": pairs}
-    gain = [e for e in es if e > C.RESTITUTION_FAIL]
+    # Gaining energy, by more than the measurement allows.
+    gain = [e for e, s_e in map(_e, pairs) if np.isfinite(e)
+            and e > C.RESTITUTION_FAIL and e - 1.0 > 3.0 * s_e]
     if gain:
         return _result(name, "fail",
                        f"The ball leaves the floor faster than it arrived (restitution "
@@ -149,9 +182,12 @@ def bounce_check(t, jf: JointFit, frame_dt: float) -> dict:
                        f"Gravity changes between hops (next hop accelerates {r:.2f}x as hard). "
                        "Every hop should share one g.", **detail)
     if es:
+        # Quote the bounces measured well; a loose one (a stub of a hop) can
+        # read over 1 within its error.
+        shown = [e for e, s_e in map(_e, pairs) if np.isfinite(e) and s_e <= 0.05] or es
         return _result(name, "pass",
                        f"{len(pairs)} bounce(s) lose energy normally (restitution "
-                       f"{min(es):.2f}-{max(es):.2f}) and hops share one g.", **detail)
+                       f"{min(shown):.2f}-{max(shown):.2f}) and hops share one g.", **detail)
     return _result(name, "skip", "Couldn't measure the bounce speeds.", **detail)
 
 

@@ -133,17 +133,20 @@ def work_scale(info: ClipInfo, n_frames: int, max_side: int, budget: int) -> flo
 def iter_frames(path: str, info: ClipInfo | None = None, *, scale: float = 1.0,
                 t_start: float | None = None, t_end: float | None = None,
                 gray: bool = False, crop=None, first_num: int | None = None,
-                last_num: int | None = None):
+                last_num: int | None = None, step: int = 1):
     """Yield (frame, time, number) one frame at a time, upright, at `scale`.
 
     time is seconds from the file's first frame (presentation timestamps);
     number is the frame's index in the file. Frames outside the time window
-    or the [first_num, last_num] range are skipped without converting them.
+    or the [first_num, last_num] range are skipped without converting them,
+    and so is every frame but each step-th one (by its number).
     crop is (x0, y0, x1, y1) in pixels of the scaled, upright frame.
     """
     info = info or probe(path)
+    step = max(1, int(step))
     if av is None:
-        yield from _iter_cv(path, info, scale, t_start, t_end, gray, crop, first_num, last_num)
+        yield from _iter_cv(path, info, scale, t_start, t_end, gray, crop, first_num, last_num,
+                            step)
         return
     with av.open(path) as c:
         vs = c.streams.video[0]
@@ -165,6 +168,8 @@ def iter_frames(path: str, info: ClipInfo | None = None, *, scale: float = 1.0,
                 continue
             if t_end is not None and t > t_end + 1e-9:
                 break
+            if i % step:
+                continue
             sw, sh = fr.width, fr.height
             tw, th = max(2, int(round(sw * scale))), max(2, int(round(sh * scale)))
             fmt = "gray" if gray else "bgr24"
@@ -184,18 +189,20 @@ def iter_frames(path: str, info: ClipInfo | None = None, *, scale: float = 1.0,
 
 def read_frames(path: str, info: ClipInfo | None = None, *, scale: float = 1.0,
                 t_start: float | None = None, t_end: float | None = None,
-                max_frames: int | None = None, gray: bool = False, crop=None):
+                max_frames: int | None = None, gray: bool = False, crop=None,
+                step: int = 1):
     """Decode frames (display orientation) at `scale`. Returns (frames, times, numbers).
 
     times are seconds from the first frame of the file, from presentation
     timestamps. numbers are frame indices within the file. crop is
     (x0, y0, x1, y1) in pixels of the scaled, upright frame: only that window
-    is kept, so a small region can be decoded at full resolution.
+    is kept, so a small region can be decoded at full resolution. step: keep
+    every step-th frame only (a long high-speed clip, whole).
     """
     info = info or probe(path)
     frames, times, nums = [], [], []
     for img, t, i in iter_frames(path, info, scale=scale, t_start=t_start, t_end=t_end,
-                                 gray=gray, crop=crop):
+                                 gray=gray, crop=crop, step=step):
         frames.append(img)
         times.append(t)
         nums.append(i)
@@ -238,7 +245,7 @@ def regularize_timestamps(ts) -> np.ndarray:
 
 
 def _iter_cv(path, info, scale, t_start, t_end, gray, crop=None, first_num=None,
-             last_num=None):
+             last_num=None, step=1):
     cap = cv2.VideoCapture(path)
     i = 0
     fps = info.fps or 30.0
@@ -257,6 +264,8 @@ def _iter_cv(path, info, scale, t_start, t_end, gray, crop=None, first_num=None,
                 continue
             if t_end is not None and t > t_end:
                 break
+            if (i - 1) % step:
+                continue
             if scale != 1.0:
                 img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
             if gray:
