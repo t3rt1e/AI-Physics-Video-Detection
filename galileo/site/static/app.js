@@ -83,34 +83,42 @@ async function route() {
 function homePage() {
   const controller = new AbortController();
   view.innerHTML = `
-    <div class="home">
-      <section class="lede">
-        <span class="eyebrow"><i></i> VIDEO ANALYSIS, GROUNDED IN PHYSICS</span>
-        <h1>Reality has<br>a <span>gravity</span> to it.</h1>
-        <p>Does that video move like the real world? Follow the fall, check the physics, and see the evidence for yourself.</p>
-        <div class="orbit-illustration" aria-hidden="true">
-          <svg viewBox="0 0 500 150"><defs><pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1" fill="currentColor" opacity=".15"/></pattern></defs>
-          <rect width="500" height="150" fill="url(#dots)"/><path d="M20 28Q170 28 420 120" stroke="var(--blue)" stroke-width="2" stroke-dasharray="4 7" fill="none"/>
-          <path d="M20 28Q170 28 420 70" stroke="var(--orange)" stroke-width="2" stroke-dasharray="4 7" fill="none"/>
-          <circle cx="20" cy="28" r="5" fill="var(--ink)"/><circle cx="145" cy="40" r="7" fill="var(--blue)" opacity=".35"/><circle cx="275" cy="74" r="9" fill="var(--blue)" opacity=".65"/><circle cx="420" cy="120" r="12" fill="var(--blue)"/>
-          <circle cx="420" cy="70" r="12" fill="var(--orange)"/><path d="M456 75v39m-4-4 4 4 4-4" fill="none" stroke="var(--ink2)" stroke-width="1.5"/></svg>
-          <span>Different motion. A different story.</span>
-        </div>
-        <div class="hero-note">${icon('orbit')}<span>Best with a clearly visible object falling or bouncing.</span></div>
-      </section>
-      <form class="drop" id="form" novalidate>
-        <div class="form-title"><span class="step-number">01</span><div><h2>Start with a clip</h2><p>A few seconds is all you need.</p></div></div>
-        ${uploadMarkup('single')}
-        <p class="err" id="err" role="alert" hidden></p>
-        <button class="btn primary" id="go" type="submit" disabled>Analyze video ${icon('arrow')}</button>
-        <span class="upload-note">Your file is processed by this Galileo server.</span>
-      </form>
-    </div>
-    <section class="sample-section" aria-labelledby="sample-heading">
-      <div class="section-heading"><div><span class="eyebrow">TAKE IT FOR A SPIN</span><h2 id="sample-heading">A little proof of concept.</h2></div><span class="hint">Synthetic examples · known motion</span></div>
-      <div class="sample-grid" id="samples">${(STATUS.samples || []).map((sample, i) => `<button class="sample-card" type="button" data-name="${esc(sample.name)}"><span class="sample-glyph ${sample.ai_generated ? 'orange' : ''}">${icon(sample.ai_generated ? 'orbit' : 'play')}</span><span><b>${esc(sampleLabel(sample))}</b><small>${sample.ai_generated ? 'Simulated physics anomaly' : 'Simulated natural motion'}</small></span><span class="sample-arrow">↗</span></button>`).join('') || '<p class="hint">No sample clips installed.</p>'}</div>
+    <section class="home" aria-labelledby="home-title">
+      <div class="lede">
+        <span class="eyebrow"><i></i> A CLOSER LOOK AT REALITY</span>
+        <h1 id="home-title">FOLLOW<br>THE <span class="decode-word" aria-label="fall"><span aria-hidden="true" data-decode="FALL">FALL</span></span><span class="hero-period">.</span></h1>
+        <p>A video can look convincing.<br>See what its motion has to say.</p>
+        <button class="hero-anchor" type="button" id="start-analysis">Start an analysis <span>↘</span></button>
+      </div>
+      <div class="motion-study" data-light aria-label="Illustration of a falling object's path, not an analysis result">
+        <div class="study-label"><span><i></i> MOTION STUDY</span><span>001 / GRAVITY</span></div>
+        <div class="study-grid" aria-hidden="true"></div>
+        <svg class="study-art" viewBox="0 0 480 300" aria-hidden="true">
+          <defs><radialGradient id="sphere" cx="30%" cy="22%" r="80%"><stop stop-color="#ffcf9c"/><stop offset=".38" stop-color="#f59b5b"/><stop offset="1" stop-color="#6e341b"/></radialGradient></defs>
+          <path class="study-guide" d="M60 48H420M60 140H420M60 232H420M60 35V250M240 35V250M420 35V250"/>
+          <path class="study-trajectory" d="M80 52Q250 52 357 221"/>
+          <path class="study-projection" d="M357 221H420M357 221V252"/>
+          <g class="study-points"><circle cx="80" cy="52" r="4"/><circle cx="140" cy="59" r="5"/><circle cx="203" cy="84" r="6"/><circle cx="260" cy="123" r="7"/><circle cx="311" cy="171" r="8"/></g>
+          <circle class="study-halo" cx="357" cy="221" r="35"/>
+          <circle cx="357" cy="221" r="23" fill="url(#sphere)"/>
+          <path class="study-brackets" d="M312 209v-28h28m34 0h28v28m0 25v28h-28m-34 0h-28v-28"/>
+          <text x="77" y="34" class="study-coordinate">RELEASE</text><text x="102" y="240" class="study-coordinate">THE PATH TELLS A STORY.</text>
+        </svg>
+        <div class="study-bottom"><span>Small motion.<br><b>Extraordinary evidence.</b></span><span class="study-axis" aria-hidden="true">↓<small>g</small></span></div>
+      </div>
     </section>
-    <a class="compare-callout" href="#/compare"><span class="compare-callout-icon">${icon('compare')}</span><span><b>Two clips. One closer look.</b><small>Compare their motion and results side by side.</small></span>${icon('arrow')}</a>`;
+    <form class="drop home-upload" id="form" novalidate data-light>
+      <div class="form-title" id="analysis-start"><span class="step-number">01 /</span><div><h2>Bring a clip. Follow the evidence.</h2><p>Best with a clearly visible object falling or bouncing.</p></div><span class="form-label">NEW ANALYSIS ${icon('upload')}</span></div>
+      ${uploadMarkup('single')}
+      <div class="upload-action"><span class="upload-note">Your file is processed by this Galileo server.</span><button class="btn primary" id="go" type="submit" disabled>Analyze video ${icon('arrow')}</button></div>
+      <p class="err" id="err" role="alert" hidden></p>
+    </form>
+    <section class="sample-section" aria-labelledby="sample-heading">
+      <div class="section-heading"><div><span class="eyebrow">02 / THE EXAMPLE COLLECTION</span><h2 id="sample-heading">Know the motion. See the result.</h2></div><span class="hint">Synthetic clips. Real physics checks.</span></div>
+      <div class="sample-grid" id="samples">${(STATUS.samples || []).map((sample, i) => `<button class="sample-card ${sample.ai_generated ? 'sample-orange' : ''}" type="button" data-light data-name="${esc(sample.name)}"><span class="sample-top"><span>STUDY / 0${i+1}</span><span class="sample-arrow">↗</span></span><svg class="sample-art" viewBox="0 0 240 80" aria-hidden="true"><path class="sample-baseline" d="M10 66H230"/><path d="M20 14Q120 ${sample.ai_generated ? '8 212 35' : '14 212 61'}"/><circle cx="212" cy="${sample.ai_generated ? '35' : '61'}" r="7"/></svg><span class="sample-copy"><b>${esc(sampleLabel(sample))}</b><small>${sample.ai_generated ? 'Simulated physics anomaly' : 'Simulated natural motion'}</small></span></button>`).join('') || '<p class="hint">No sample clips installed.</p>'}</div>
+    </section>
+    <a class="compare-callout" href="#/compare" data-light><span class="compare-callout-icon">${icon('compare')}</span><span><span class="eyebrow">A SECOND PERSPECTIVE</span><b>Two clips. A clearer picture.</b><small>Compare motion and results side by side.</small></span><span class="callout-arrow">↗</span></a>`;
+  $('#start-analysis').onclick = () => { $('#analysis-start').scrollIntoView({behavior:matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'}); $('#single-file').focus({preventScroll:true}); };
   const upload = new UploadInput('single', () => { $("#go").disabled = !upload.file; });
   const go = $("#go"), err = $("#err");
   const fail = (e) => { if (controller.signal.aborted) return; err.textContent = e.message; err.hidden = false; go.disabled = !upload.file; go.innerHTML = `Analyze video ${icon('arrow')}`; };
@@ -162,7 +170,8 @@ class JobPage {
   constructor(id) {
     this.id = id; this.dead = false; this.data = null; this.frames = null; this.idx = 0;
     this.mode = "original"; this.playing = false; this.rate = 1; this.loop = true;
-    this.show = { ball: false, earth: false, trail: false };
+    this.show = { ball: true, earth: false, trail: true };
+    this.interacted = false;
     this.controller = new AbortController(); this.debugOpen = false;
     this.redraw = () => { if (this.done && !this.dead) { this.drawStrip(); this.drawOverlay(); if (this.debugOpen) this.drawChart(); } };
     window.addEventListener("resize", this.redraw); window.addEventListener("themechange", this.redraw);
@@ -214,7 +223,7 @@ class JobPage {
       <div id="verdict"></div>
       <div class="bench">
         <section class="player" aria-label="Video player">
-          <div class="player-heading"><b>Video playback</b><span class="hint">One frame at a time.</span></div>
+          <div class="player-heading"><span class="eyebrow"><i></i> THE MOTION</span><button type="button" class="tracking-toggle" id="tracking-toggle" aria-pressed="true" disabled>Tracking on ${icon("orbit")}</button></div>
           <div class="ptabs" id="analysis-tools" hidden>
             <div class="seg" role="group" aria-label="What to show">
               <button data-mode="original" aria-pressed="true">Video</button>
@@ -222,16 +231,17 @@ class JobPage {
               <button data-mode="both" aria-pressed="false">Video + debug</button>
             </div>
             <div class="opts" id="ovopts">
-              <label><input type="checkbox" data-ov="ball"><span class="sw" style="border-color:#3ea6ff"></span>Tracked object</label>
-              <label><input type="checkbox" data-ov="trail"><span class="sw" style="border-color:#8fd0ff;border-style:dotted"></span>Path</label>
-              <label><input type="checkbox" data-ov="earth"><span class="sw" style="border-color:#ffc400"></span>Where real gravity puts it</label>
+              <label><input type="checkbox" data-ov="ball" checked><span class="sw" style="border-color:#3ea6ff"></span>Tracked object</label>
+              <label><input type="checkbox" data-ov="trail" checked><span class="sw" style="border-color:#8fd0ff;border-style:dotted"></span>Path</label>
+              <label><input type="checkbox" data-ov="earth"><span class="sw" style="border-color:#ffb86b"></span>Where real gravity puts it</label>
             </div>
           </div>
           <div class="stage" id="stage">
-            <div class="pane" id="pane-o"><div class="box" id="box-o"><video id="vo" muted playsinline preload="auto"></video><canvas id="ov"></canvas></div><span class="cap">Video</span></div>
+            <div class="pane" id="pane-o"><div class="box" id="box-o"><video id="vo" muted playsinline preload="auto"></video><canvas id="ov" aria-label="Detected object and measured path"></canvas></div><span class="cap">ORIGINAL + TRACKING</span></div>
             <div class="pane vis0" id="pane-d"><div class="box"><video id="vd" muted playsinline preload="auto"></video></div><span class="cap">What Galileo saw</span><div class="away" id="away" hidden>This frame is outside the part of the clip Galileo analysed.</div></div>
             <div class="working" id="working" hidden><div><div class="spin"></div><span id="working-t">Working…</span></div></div>
           </div>
+          <div class="tracking-legend" id="tracking-legend"><span><i class="tracking-ring"></i>Object</span><span><i class="tracking-line"></i>Full measured path</span><small id="track-status">Waiting for tracking…</small></div>
           <div class="ctl">
             <div class="scrub" id="scrub"><canvas id="strip" height="22"></canvas><input type="range" id="range" min="0" max="0" value="0" aria-label="Frame"><div class="head" id="head"></div></div>
             <div class="btns">
@@ -250,6 +260,7 @@ class JobPage {
           </div>
         </section>
         <aside class="side">
+          <div class="card gravity-card" id="gravity-card" hidden></div>
           <div class="card why" id="why"></div>
           <div class="card chartwrap" id="chartcard"><h2>Distance fallen</h2>
             <p class="legend"><span><i style="border-color:var(--blue)"></i>measured</span><span><i style="border-color:var(--ink)"></i>fit</span><span><i style="border-color:var(--gold);border-top-style:dashed"></i>real gravity</span></p>
@@ -280,7 +291,12 @@ class JobPage {
       const sync = !!this.frames.debug_times;
       $("[data-mode=debug]").disabled = $("[data-mode=both]").disabled = !sync;
       if (j.debug && sync) this.vd.src = `/media/${this.id}/debug.mp4`;
-      this.drawStrip(); this.go(this.idx, true);
+      this.drawStrip();
+      const first = this.trackAt.findIndex(index => index !== null);
+      // Start at the first actual detection so the highlight is useful on arrival.
+      // Never interrupt someone already inspecting or playing the preview.
+      this.go(!this.interacted && !this.playing && first >= 0 ? first : this.idx, true);
+      $("#tracking-toggle").disabled = !this.track.length;
     } else if (!this.done) {
       $("#verdict").innerHTML = "";
       $("#why").innerHTML = `<h2>Measuring…</h2><p class="hint">You can already step through the video while Galileo works.</p>`;
@@ -350,52 +366,25 @@ class JobPage {
   drawVerdict() {
     const v = this.result.verdict || {}, st = v.verdict || "UNSURE";
     const obj = this.result.objects?.[0]?.identity?.label || this.result.objects?.[0]?.label;
-    $("#verdict").innerHTML = `<section class="verdict ${esc(st)}"><div><span class="eyebrow">ANALYSIS COMPLETE</span><h1 class="vword">${esc(VERDICT[st] || st)}</h1><p class="vhead">${esc(summaryText(v))}</p>${obj ? `<p class="vmeta">Object measured <b>${esc(obj)}</b></p>` : ''}</div><div class="gravity-summary"><span>Measured gravity</span><strong>${v.g != null ? num(v.g, 2) : '—'} <small>${v.g != null ? 'm/s²' : ''}</small></strong><span>${v.g != null ? `Earth reference: ${num(v.g_ref ?? STATUS.g_ref ?? 9.8, 2)} m/s²` : 'No reliable measurement available'}</span></div></section>`;
+    $("#verdict").innerHTML = `<section class="verdict ${esc(st)}"><div><span class="eyebrow"><i></i> ANALYSIS COMPLETE</span><h1 class="vword">${esc(VERDICT[st] || st)}</h1><p class="vhead">${esc(summaryText(v))}</p></div><div class="result-seal" aria-hidden="true">${icon(st === 'REAL' || st === 'SLOWMO' ? 'check' : 'orbit')}</div>${obj ? `<p class="vmeta">OBJECT MEASURED <b>${esc(obj)}</b></p>` : ''}</section>`;
+    const ref = v.g_ref ?? STATUS.g_ref ?? 9.8;
+    $("#gravity-card").hidden = false;
+    $("#gravity-card").innerHTML = `<span class="eyebrow">GRAVITY, IN CONTEXT</span><h2>How does it compare?</h2><div class="gravity-value"><strong>${Number.isFinite(v.g) ? num(v.g, 2) : '—'}</strong><span>m/s²<small>measured gravity</small></span></div><div class="gauge" id="gravity-gauge">${SiteVisuals.gauge(v, ref)}</div><p class="earth-reference">Earth reference <b>${num(ref,2)} m/s²</b></p>`;
     this.drawWhy();
-  }
-  countUp() {
-    const el = document.querySelector(".gauge .cu"); if (!el) return;
-    const to = +el.dataset.v;
-    if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-    const t0 = performance.now(), D = 900;
-    const f = (t) => { const p = Math.min(1, (t - t0) / D), e = 1 - Math.pow(1 - p, 3); el.textContent = (to * e).toFixed(1); if (p < 1 && !this.dead) this.countRaf = requestAnimationFrame(f); };
-    this.countRaf = requestAnimationFrame(f);
   }
   drawWhy() {
     const v = this.result.verdict || {};
     const explanation = v.verdict === 'UNSURE' ? "The clip may need a clearer view, a longer fall, or a more accurate object size." : v.verdict === 'AI' ? "An unusual fall is a reason to look closer. It doesn't establish how the video was made." : "The measured fall passes the detector's checks. That alone can't establish the video's origin.";
-    $("#why").innerHTML = `<span class="eyebrow">MAKING SENSE OF IT</span><h2>What this means</h2><p>${explanation}</p><div class="why-divider"></div><h3>Curious about the evidence?</h3><p class="hint">Explore the tracking, physics checks, and every measurement behind this result.</p><button class="btn ghost small" type="button" data-open="overview">Technical details ${icon('arrow')}</button>`;
+    $("#why").innerHTML = `<span class="eyebrow">READING THE RESULT</span><h2>What this tells us.</h2><p>${explanation}</p><div class="why-divider"></div><p class="hint">The complete evidence is one click away.</p><button class="btn ghost small" type="button" data-open="overview">Technical details ${icon('arrow')}</button>`;
     $("#why [data-open]").onclick = () => this.openDebug('overview');
   }
-  gauge(v) {
-    if (v.g == null) return `<p class="nog"><b>No acceleration measured.</b> ${esc(v.stage ? "Stopped at: " + v.stage + "." : "")} Review the checks for the reasons, or confirm the object and its size.</p>`;
-    const MAXG = Math.max(14, Math.ceil((v.g + (v.sigma || 0)) / 2) * 2 + 2), W = 640, L = 12, R = 628;
-    const X = (g) => L + (R - L) * Math.min(g, MAXG) / MAXG;
-    const ref = v.g_ref ?? STATUS.g_ref ?? 9.8, tol = v.tol ?? 0.15;
-    const col = { REAL: "var(--real)", AI: "var(--ai)", SLOWMO: "var(--slow)", UNSURE: "var(--unsure)" }[v.verdict] || "var(--ink)";
-    let ticks = "";
-    for (let g = 0; g <= MAXG; g += 2) ticks += `<line x1="${X(g)}" x2="${X(g)}" y1="62" y2="68" stroke="var(--line2)"/><text x="${X(g)}" y="82" text-anchor="middle">${g}</text>`;
-    const lo = Math.max(0, v.g - (v.sigma || 0)), hi = v.g + (v.sigma || 0);
-    const note = v.k && Math.abs(v.k - 1) > 0.02 ? `Corrected for ${num(v.k, 1)}× slow motion` : "";
-    return `<svg viewBox="0 0 ${W} 112" role="img" aria-label="Measured ${num(v.g, 1)} metres per second squared against Earth's ${ref}">
-      <text class="gnum" x="${L}" y="26"><tspan class="cu" data-v="${v.g}">${num(v.g, 1)}</tspan> <tspan font-size="14" font-weight="600" fill="var(--ink2)">m/s²${v.sigma ? ` ± ${num(v.sigma, 1)}` : ""}</tspan></text>
-      ${note ? `<text class="gnote" x="${R}" y="24" text-anchor="end">${esc(note)}</text>` : ""}
-      <rect x="${L}" y="44" width="${R - L}" height="18" rx="9" fill="var(--paper)"/>
-      <rect x="${X(ref * (1 - tol))}" y="44" width="${X(ref * (1 + tol)) - X(ref * (1 - tol))}" height="18" fill="var(--realSoft)" stroke="var(--real)" stroke-opacity=".5"/>
-      <line x1="${X(ref)}" x2="${X(ref)}" y1="38" y2="68" stroke="var(--real)" stroke-width="2"/>
-      <text x="${X(ref)}" y="100" text-anchor="middle" style="fill:var(--real);font-weight:700">Earth ${ref}</text>
-      <g class="mk" style="--dx:${X(0) - X(v.g)}px"><rect x="${X(lo)}" y="49" width="${Math.max(3, X(hi) - X(lo))}" height="8" rx="4" fill="${col}" opacity=".3"/>
-      <circle cx="${X(v.g)}" cy="53" r="9" fill="${col}" stroke="#fff" stroke-width="3"/></g>
-      ${ticks}</svg>`;
-  }
-
   /* ---- sections ---- */
   drawSections() {
     const r = this.result, notes = r.notes || [];
     const raw = `<section class="card"><h2>Everything it recorded</h2><p class="hint">The full result, exactly as saved.</p><div class="tree" id="tree"></div>
       <div class="dl"><a class="btn ghost small" href="/download/${this.id}/result.json">Download result.json</a><a class="btn ghost small" href="/download/${this.id}/track.csv">Download tracked points (CSV)</a>${this.data.job.debug ? `<a class="btn ghost small" href="/media/${this.id}/debug.mp4" download>Download debug video</a>` : ""}</div></section>`;
     const tabs = [
-      ["overview", "Overview", `<div class="grid2"><section class="card"><h3>Gravity measurement</h3><div class="gauge">${this.gauge(r.verdict || {})}</div><h3>From the detector</h3><p>${esc(r.verdict?.headline || 'No headline provided.')}</p><ul class="reasons">${(r.verdict?.reasons || []).map(x => `<li>${esc(x)}</li>`).join('')}</ul><p class="hint">${r.verdict?.confidence != null ? `Detector confidence: ${num(r.verdict.confidence * 100, 0)}% · not a calibrated probability of origin` : ''}</p>${this.frames.truncated ? '<p class="note">The playback preview contains the first 6,000 frames. The detector analyzes the original file using its own limits.</p>' : ''}</section><div id="chart-slot"></div></div>`],
+      ["overview", "Overview", `<div class="grid2"><section class="card"><h3>From the detector</h3><p>${esc(r.verdict?.headline || 'No headline provided.')}</p><ul class="reasons">${(r.verdict?.reasons || []).map(x => `<li>${esc(x)}</li>`).join('')}</ul><p class="hint">${r.verdict?.confidence != null ? `Detector confidence: ${num(r.verdict.confidence * 100, 0)}% · not a calibrated probability of origin` : ''}</p>${this.frames.truncated ? '<p class="note">The playback preview contains the first 6,000 frames. The detector analyzes the original file using its own limits.</p>' : ''}</section><div id="chart-slot"></div></div>`],
       ["debugvideo", "Debug video", this.data.job.debug && !this.frames.debug_times ? `<p class="hint">This debug render has its own timeline. Use these controls to inspect it without guessing how it aligns with the original.</p><video id="independent-debug" class="independent-debug" controls playsinline muted preload="metadata"></video><div class="btns"><button class="ib" id="debug-back" aria-label="Previous debug frame">←</button><button class="ib" id="debug-next" aria-label="Next debug frame">→</button><span id="debug-frame-count" class="hint"></span></div>` : ''],
       ["frame", "This frame", `<div class="card live" id="live"></div>`],
       ["checks", "Checks", `<section class="card"><h2>Checks gravity can't fake</h2>${this.testsTable(r.tests || [])}</section>`],
@@ -626,7 +615,14 @@ class JobPage {
   /* ---- player ---- */
   bind() {
     document.querySelectorAll("[data-mode]").forEach((b) => b.onclick = () => this.setMode(b.dataset.mode));
-    document.querySelectorAll("[data-ov]").forEach((c) => c.onchange = () => { this.show[c.dataset.ov] = c.checked; this.drawOverlay(); });
+    document.querySelectorAll("[data-ov]").forEach((c) => c.onchange = () => { this.show[c.dataset.ov] = c.checked; this.syncTracking(); });
+    $("#tracking-toggle").onclick = () => {
+      const on = !(this.show.ball || this.show.trail);this.show.ball=on;this.show.trail=on;
+      document.querySelectorAll('[data-ov=ball],[data-ov=trail]').forEach(input => input.checked=on);
+      this.syncTracking();
+    };
+    $(".player").addEventListener('pointerdown', () => {this.interacted=true;}, {signal:this.controller.signal});
+    $(".player").addEventListener('keydown', () => {this.interacted=true;}, {signal:this.controller.signal});
     $("#b-start").onclick = () => { this.pause(); this.go(0); };
     $("#b-end").onclick = () => { this.pause(); this.go(this.n - 1); };
     $("#b-prev").onclick = () => this.step(-1);
@@ -644,6 +640,7 @@ class JobPage {
     if (e.defaultPrevented || /INPUT|SELECT|TEXTAREA|BUTTON|A|SUMMARY/.test(document.activeElement.tagName) || document.activeElement.isContentEditable) return;
     if (!this.videosReady) return;
     const k = e.key;
+    if (["ArrowRight","ArrowLeft",".",","," ","Home","End"].includes(k)) this.interacted=true;
     if (k === "ArrowRight" || k === ".") { e.preventDefault(); this.step(e.shiftKey ? 10 : 1); }
     else if (k === "ArrowLeft" || k === ",") { e.preventDefault(); this.step(e.shiftKey ? -10 : -1); }
     else if (k === " ") { e.preventDefault(); this.playing ? this.pause() : this.play(); }
@@ -733,29 +730,20 @@ class JobPage {
     document.querySelectorAll("#pts tr.cur").forEach((r) => r.classList.remove("cur"));
     if (row) { row.classList.add("cur"); if (this.playing === false) { const sc = $("#pts"); if (sc && sc.contains(row)) sc.scrollTop = row.offsetTop - sc.clientHeight / 2; } }
   }
+  syncTracking() {
+    const on=this.show.ball || this.show.trail;
+    $("#tracking-toggle").setAttribute('aria-pressed',on);
+    $("#tracking-toggle").innerHTML=`Tracking ${on ? 'on' : 'off'} ${icon('orbit')}`;
+    $("#pane-o .cap").textContent=on ? 'ORIGINAL + TRACKING' : 'ORIGINAL';
+    this.drawOverlay();
+  }
   drawOverlay() {
     const cv = $("#ov"); if (!cv || !this.done) return;
-    const b = cv.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
-    cv.width = Math.round(b.width * dpr); cv.height = Math.round(b.height * dpr);
-    const c = cv.getContext("2d"); c.setTransform(dpr, 0, 0, dpr, 0, 0); c.clearRect(0, 0, b.width, b.height);
-    if (!this.debugOpen) return;
-    const W = b.width, H = b.height, i = this.idx;
-    const ti = this.trackAt[i], gi = this.ghostAt[i];
-    c.lineWidth = 2;
-    if (this.show.trail) {
-      c.strokeStyle = "rgba(143,208,255,.75)"; c.setLineDash([3, 4]); c.beginPath();
-      let started = false;
-      for (let k = 0; k < this.track.length; k++) { const p = this.track[k]; if (p.t > this.frames.times[i] + 1e-6) break; const x = p.x * W, y = p.y * H; if (!started) { c.moveTo(x, y); started = true; } else c.lineTo(x, y); }
-      c.stroke(); c.setLineDash([]);
-    }
-    if (this.show.earth && gi !== null) {
-      const g = this.ghost[gi]; const rad = ti !== null ? this.track[ti].r * W : 10;
-      c.strokeStyle = "#ffc400"; c.lineWidth = 2.5; c.beginPath(); c.arc(g.x * W, g.y * H, Math.max(rad, 4), 0, 7); c.stroke();
-    }
-    if (this.show.ball && ti !== null) {
-      const p = this.track[ti];
-      c.strokeStyle = "#3ea6ff"; c.lineWidth = 2.5; c.beginPath(); c.arc(p.x * W, p.y * H, Math.max(p.r * W, 4), 0, 7); c.stroke();
-    }
+    const gi=this.ghostAt[this.idx];
+    const state=SiteVisuals.drawTracking(cv,{points:this.track,time:this.frames.times[this.idx],tolerance:this.dt*.55,width:this.W,height:this.H,
+      ball:this.show.ball,trail:this.show.trail,ghost:this.show.earth && gi!==null ? this.ghost[gi] : null});
+    $("#tracking-legend").hidden=!(this.show.ball || this.show.trail);
+    $("#track-status").textContent=!state?.count ? 'No object track available' : state.tracked ? '' : 'No detection on this frame';
   }
   drawLive() {
     if (!$("#live")) return;

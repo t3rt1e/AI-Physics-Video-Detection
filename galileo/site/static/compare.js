@@ -61,7 +61,7 @@ class CompareUpload {
   constructor() {
     this.controller = new AbortController(); this.ids = [null, null]; this.busy = false;
     view.innerHTML = `<div class="page-heading compare-heading"><div><span class="eyebrow">A SECOND PERSPECTIVE</span><h1>Side by side.<br><span>See the difference.</span></h1><p>Two clips, measured independently. Play them together and compare what the physics says.</p></div><span class="compare-emblem" aria-hidden="true">${icon('compare')}</span></div>
-      <form id="compare-form" novalidate><div class="compare-upload-grid">${['A','B'].map((label,i) => `<section class="drop compare-upload ${i ? 'clip-orange' : 'clip-blue'}"><div class="clip-title"><span class="clip-letter">${label}</span><div><h2>Clip ${label}</h2><p>${i ? 'A different clip. A fresh perspective.' : 'Choose your first point of reference.'}</p></div></div>${uploadMarkup('upload-' + i, 'Clip ' + label)}<p class="hint" id="upload-status-${i}" role="status"></p></section>`).join('')}</div>
+      <form id="compare-form" novalidate><div class="compare-upload-grid">${['A','B'].map((label,i) => `<section class="drop compare-upload ${i ? 'clip-orange' : 'clip-blue'}" data-light><div class="clip-title"><span class="clip-letter">${label}</span><div><h2>Clip ${label}</h2><p>${i ? 'A different clip. A fresh perspective.' : 'Choose your first point of reference.'}</p></div></div>${uploadMarkup('upload-' + i, 'Clip ' + label)}<p class="hint" id="upload-status-${i}" role="status"></p></section>`).join('')}</div>
       <div class="compare-submit"><p class="hint">Each clip can contain a different object.<br>For a useful comparison, try similar scenes.</p><button type="submit" class="btn primary" id="compare-go" disabled>Analyze both clips ${icon('arrow')}</button></div><p class="err" id="compare-error" role="alert" hidden></p></form>
       <div class="compare-bottom"><span>Just exploring?</span><button class="linkbtn" id="compare-demo" type="button">Try an example comparison ↗</button><a href="#/history">Use past results ↗</a></div>`;
     this.uploads = [0,1].map(i => new UploadInput('upload-' + i, () => { this.ids[i] = null; document.getElementById('upload-status-' + i).textContent = ''; this.sync(); }));
@@ -103,7 +103,7 @@ class ComparePage {
     this.clips = ids.map(id => ({id, data:null, frames:null, loaded:false, failed:false}));
     view.innerHTML = `<div class="page-heading"><div><span class="eyebrow">THE BIGGER PICTURE</span><h1>Compare clips</h1><p>One view. Two independent analyses.</p></div><a class="btn ghost" href="#/compare">${icon('upload')} New comparison</a></div>
       <div class="comparison-grid">${this.clips.map((clip,i) => `<section class="comparison-card ${i ? 'clip-orange' : 'clip-blue'}" id="clip-${i}" aria-label="Clip ${i ? 'B' : 'A'}"><div class="comparison-card-head"><span class="clip-letter">${i ? 'B' : 'A'}</span><span class="clip-name" id="clip-name-${i}">Loading clip…</span></div>
-        <div class="comparison-stage"><video id="clip-video-${i}" muted playsinline preload="auto"></video><div class="comparison-placeholder" id="clip-placeholder-${i}"><div class="spin"></div><span>Preparing video…</span></div></div>
+        <div class="comparison-stage"><video id="clip-video-${i}" muted playsinline preload="auto"></video><canvas id="clip-overlay-${i}" aria-label="Detected object and measured path"></canvas><div class="comparison-placeholder" id="clip-placeholder-${i}"><div class="spin"></div><span>Preparing video…</span></div></div>
         <div class="clip-controls"><button class="ib clip-prev" type="button" aria-label="Previous frame, clip ${i ? 'B' : 'A'}" disabled>←</button><button class="ib clip-play" type="button" aria-label="Play clip ${i ? 'B' : 'A'}" disabled>▶</button><button class="ib clip-next" type="button" aria-label="Next frame, clip ${i ? 'B' : 'A'}" disabled>→</button><input class="clip-range" type="range" min="0" max="0" value="0" aria-label="Frame, clip ${i ? 'B' : 'A'}" disabled><span class="clip-time" id="clip-time-${i}">—</span></div>
         <div class="comparison-result" id="clip-result-${i}" aria-live="polite"><div class="skeleton"></div><p class="hint">Waiting for the analysis…</p></div></section>`).join('')}</div>
       <section class="comparison-transport card" aria-label="Comparison playback"><div class="transport-heading"><label class="link-switch"><input type="checkbox" id="link-playback" checked><span class="switch-track"></span>Linked playback</label><label class="speed">Speed <select id="compare-rate"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option></select></label><span id="pair-time">0.00 s</span></div>
@@ -117,7 +117,10 @@ class ComparePage {
         if (!clip.video.dataset.fallback) { clip.video.dataset.fallback = '1'; clip.video.src = `/media/${clip.id}/preview.webm`; }
         else { clip.failed = true; clip.loaded = false; document.getElementById('clip-placeholder-' + i).innerHTML = '<span>This browser could not play the video. You can still open the analysis below.</span>'; document.getElementById('clip-placeholder-' + i).hidden = false; this.pause(); this.ready(); }
       });
-      clip.video.addEventListener('timeupdate', () => this.updateClipTime(i));
+      clip.video.addEventListener('timeupdate', () => {this.updateClipTime(i);if(clip.video.paused) this.drawClip(i);});
+      clip.video.addEventListener('seeked', () => this.drawClip(i));
+      clip.video.addEventListener('loadeddata', () => this.drawClip(i));
+      clip.video.addEventListener('play', () => this.watchClip(i));
       clip.video.addEventListener('play', () => { $('.clip-play', clip.box).textContent = 'Ⅱ'; $('.clip-play', clip.box).setAttribute('aria-label', `Pause clip ${i ? 'B' : 'A'}`); });
       clip.video.addEventListener('pause', () => { $('.clip-play', clip.box).textContent = '▶'; $('.clip-play', clip.box).setAttribute('aria-label', `Play clip ${i ? 'B' : 'A'}`); });
       $('.clip-prev', clip.box).onclick = () => this.stepClip(i, -1);
@@ -134,8 +137,10 @@ class ComparePage {
     $('#pair-range').oninput = e => { this.pause(); this.seek(+e.target.value); };
     this.key = e => { if (e.defaultPrevented || /INPUT|SELECT|TEXTAREA|BUTTON|A|SUMMARY/.test(document.activeElement.tagName) || !this.linked || !this.allReady()) return; if (e.key === ' ') {e.preventDefault(); this.playing ? this.pause() : this.play();} if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {e.preventDefault(); this.stepPair((e.key === 'ArrowLeft' ? -1 : 1) * (e.shiftKey ? 10 : 1));} };
     document.addEventListener('keydown', this.key);
+    this.redraw = () => this.clips.forEach((_,i) => this.drawClip(i));
+    window.addEventListener('resize', this.redraw);window.addEventListener('themechange', this.redraw);
   }
-  destroy() { this.dead = true; this.controller.abort(); this.timers.forEach(clearTimeout); cancelAnimationFrame(this.raf); document.removeEventListener('keydown',this.key); this.clips.forEach(c => {c.video.pause(); c.video.removeAttribute('src'); c.video.load();}); }
+  destroy() { this.dead = true; this.controller.abort(); this.timers.forEach(clearTimeout); cancelAnimationFrame(this.raf); document.removeEventListener('keydown',this.key);window.removeEventListener('resize',this.redraw);window.removeEventListener('themechange',this.redraw); this.clips.forEach(c => {cancelAnimationFrame(c.overlayRaf);if(c.video.cancelVideoFrameCallback && c.overlayFrame!=null)c.video.cancelVideoFrameCallback(c.overlayFrame);c.video.pause(); c.video.removeAttribute('src'); c.video.load();}); }
   async poll(i) {
     const clip = this.clips[i];
     try {
@@ -149,7 +154,7 @@ class ComparePage {
         $('.clip-range', clip.box).max = ts.length-1;
         clip.video.src = `/media/${clip.id}/preview.mp4`;
       }
-      this.renderResult(i);
+      this.renderResult(i);this.drawClip(i);
       if (data.job.status !== 'done' && data.job.status !== 'error') this.timers[i] = setTimeout(() => this.poll(i), 1200);
       if (data.job.status === 'error' && !clip.frames) { document.getElementById('clip-placeholder-' + i).innerHTML = `<span>Video preview unavailable</span>`; }
     } catch(e) {
@@ -165,8 +170,28 @@ class ComparePage {
     box.innerHTML = `<span class="pill ${esc(st)}">${esc(stateLabel({...j, verdict:v.verdict || j.verdict}))}</span>
       <h2>${j.status === 'done' ? esc(VERDICT[v.verdict] || v.verdict || 'Inconclusive') : j.status === 'error' ? 'A closer look is needed.' : 'Following the physics…'}</h2>
       <p>${j.status === 'done' ? esc(summaryText(v)) : j.status === 'error' ? 'This clip could not be analyzed. Open its details or try another clip.' : 'You can explore the video while the measurement finishes.'}</p>
-      ${j.status === 'done' ? `<div class="compare-measure"><span>Measured gravity</span><b>${v.g != null ? `${num(v.g, 2)} <small>m/s²</small>` : 'Not available'}</b></div>` : ''}
+      ${j.status === 'done' ? `<div class="compare-measure"><span>Measured gravity</span><b>${Number.isFinite(v.g) ? `${num(v.g, 2)} <small>m/s²</small>` : 'Not available'}</b></div><div class="gauge">${SiteVisuals.gauge(v,STATUS.g_ref ?? 9.8)}</div>` : ''}
       <a class="result-link" href="#/job/${clip.id}">${j.status === 'done' ? 'Open full analysis' : 'View analysis'} ${icon('arrow')}</a>`;
+  }
+  drawClip(i, mediaTime) {
+    if(this.dead) return;
+    const clip=this.clips[i];if(!clip.frames || !clip.loaded) return;
+    const index=this.frameAt(clip,mediaTime ?? clip.video.currentTime),ts=clip.frames.times;
+    const dt=index+1<ts.length ? ts[index+1]-ts[index] : clip.dt;
+    SiteVisuals.drawTracking(document.getElementById('clip-overlay-'+i),{points:clip.data?.result?.track?.points || [],
+      time:ts[index],tolerance:dt*.55,width:clip.frames.width,height:clip.frames.height});
+  }
+  watchClip(i) {
+    const clip=this.clips[i];
+    cancelAnimationFrame(clip.overlayRaf);
+    if(clip.video.cancelVideoFrameCallback && clip.overlayFrame!=null) clip.video.cancelVideoFrameCallback(clip.overlayFrame);
+    const draw=(_time,metadata) => {
+      if(this.dead) return;
+      this.drawClip(i,metadata?.mediaTime);
+      if(!clip.video.paused && !clip.video.ended) schedule();
+    };
+    const schedule=() => {if(clip.video.requestVideoFrameCallback) clip.overlayFrame=clip.video.requestVideoFrameCallback(draw);else clip.overlayRaf=requestAnimationFrame(draw);};
+    schedule();
   }
   allReady() { return this.clips.every(c => c.loaded && c.frames?.times?.length && !c.failed); }
   master() { return (this.clips[1].end || 0) > (this.clips[0].end || 0) ? 1 : 0; }
