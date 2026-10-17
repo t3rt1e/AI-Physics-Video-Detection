@@ -713,3 +713,51 @@ def test_camera_that_tilts_to_follow_the_ball(camera_clips):
     assert r["stabilization"]["applied"] and r["stabilization"]["model"] == "homography"
     assert r["verdict"]["verdict"] == "REAL"
     assert r["verdict"]["g"] == pytest.approx(9.81, rel=0.08)
+
+
+# ---- a ball close to the camera, on a plain backdrop (generated clips) ----------
+# Video generators like a big pale ball against a seamless white backdrop. The
+# ball then fills a third of the picture (it can't fall two of its own widths
+# inside it), looks like a shadow by colour (the backdrop, only darker), and is
+# the only detail in the picture (so its motion can pass for the camera's).
+@pytest.fixture(scope="module")
+def plain_clips(tmp_path_factory):
+    d = tmp_path_factory.mktemp("plain")
+    out = {}
+    for name, g in (("real", 9.81), ("ai", 2.0)):
+        sc = Scene(width=640, height=360, px_per_m=700.0, ball_d_m=0.22, ball_bgr=(225, 225, 225),
+                   bg_level=245, texture=False, shading=0.3, x0=100.0, y0=95.0, floor_y=280.0,
+                   seed=5)
+        m = Motion(g=g, restitution=0.85, t_release=0.15, vx=0.4 if g > 5 else 0.2)
+        out[name] = make_clip(str(d / f"{name}.mp4"), scene=sc, motion=m, capture_fps=60,
+                              duration=1.3 if g > 5 else 2.6)["path"]
+    sc = Scene(width=640, height=360, px_per_m=600.0, ball_d_m=0.21, bg_level=240, texture=False,
+               noise=1.0, panels=((180, 90, 30), (40, 210, 235), (235, 235, 235), (180, 90, 30),
+                                  (40, 210, 235), (235, 235, 235)),
+               shading=0.25, x0=120.0, y0=90.0, floor_y=290.0, seed=3)
+    out["panels"] = make_clip(str(d / "panels.mp4"), scene=sc,
+                              motion=Motion(g=9.81, restitution=0.8, t_release=0.15, vx=0.35),
+                              capture_fps=60, duration=1.4)["path"]
+    return out
+
+
+def test_ball_on_a_plain_backdrop_is_not_taken_for_camera_motion(plain_clips):
+    from galileo.stabilize import stabilize
+    from galileo.video import read_frames
+    for name in ("panels", "real"):          # detail only on the ball; no detail at all
+        frames, _, _ = read_frames(plain_clips[name])
+        _, T, info = stabilize(frames)
+        assert T is None and info["unreliable"] and info["ignored"], name
+    r = analyze(plain_clips["panels"], preset="volleyball")
+    assert r["verdict"]["verdict"] == "REAL"
+    assert r["verdict"]["g"] == pytest.approx(9.81, rel=0.06)
+
+
+def test_big_pale_ball_close_to_the_camera(plain_clips):
+    r = analyze(plain_clips["real"], preset="soccer")
+    assert r["fit"]["diam_px"] == pytest.approx(0.22 * 700.0, rel=0.05)
+    assert r["verdict"]["verdict"] == "REAL"
+    assert r["verdict"]["g"] == pytest.approx(9.81, rel=0.06)
+    r = analyze(plain_clips["ai"], preset="soccer")
+    assert r["verdict"]["verdict"] == "AI"
+    assert r["verdict"]["g"] == pytest.approx(2.0, rel=0.1)

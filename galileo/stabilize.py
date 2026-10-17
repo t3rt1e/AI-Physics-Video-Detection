@@ -2,7 +2,9 @@
 
 A moving camera adds its own motion to the object's, so frames are laid
 back onto one reference view before tracking. Static-camera clips are
-detected and left alone.
+detected and left alone, and so are clips where the only detail to follow
+is one small patch (a ball on a plain backdrop): its motion would otherwise
+be mistaken for the camera's.
 
 Each frame is matched to a keyframe, not to the frame before it. Chaining
 frame-to-frame estimates lets anything that moves slowly (a hand pulling
@@ -28,6 +30,17 @@ import warnings
 import cv2
 import numpy as np
 
+# Camera motion read from points covering less than this share of the
+# picture (their bounding box) is probably one object's motion.
+LOCAL_SPREAD = 0.1
+# A keyframe whose strongest corner is weaker than this has no detail to
+# follow at all (a plain backdrop): its "features" are noise.
+MIN_CORNER = 0.002
+
+
+def _strength(img) -> float:
+    return float(cv2.cornerMinEigenVal(img, 7).max())
+
 
 def _gray(f):
     return cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) if f.ndim == 3 else f
@@ -46,9 +59,10 @@ def _as3(A):
 def _match(key, pts, cur, guess):
     """Background points of `key` found in `cur`, and the similarity mapping
     cur onto key. guess (3x3) maps cur onto key too. Returns (A 3x3 or None,
-    inliers, (cur points, key points))."""
+    inliers, (cur points, key points), spread): spread is the share of the
+    picture the agreeing points cover (their bounding box's area)."""
     if pts is None or len(pts) < 12:
-        return None, 0, None
+        return None, 0, None, 0.0
     Ginv = np.linalg.inv(_as3(guess))
     p = pts.reshape(-1, 2).astype(np.float64)
     q = np.hstack([p, np.ones((len(p), 1))]) @ Ginv.T
@@ -57,16 +71,20 @@ def _match(key, pts, cur, guess):
                                           flags=cv2.OPTFLOW_USE_INITIAL_FLOW)
     ok = st.ravel() == 1
     if ok.sum() < 10:
-        return None, 0, None
+        return None, 0, None, 0.0
     A, inl = cv2.estimateAffinePartial2D(nxt[ok], pts[ok], method=cv2.RANSAC,
                                          ransacReprojThreshold=1.5)
     if A is None or inl is None or inl.sum() < 8:
-        return None, 0, None
+        return None, 0, None, 0.0
     # Keep the matches a looser test accepts, for a homography later.
     src, dst = nxt[ok].reshape(-1, 2), pts[ok].reshape(-1, 2)
     pred = np.hstack([src, np.ones((len(src), 1))]) @ _as3(A).T
     loose = np.hypot(*(pred[:, :2] - dst).T) < 12.0
-    return _as3(A), int(inl.sum()), (src[loose].astype(np.float32), dst[loose].astype(np.float32))
+    h, w = key.shape[:2]
+    agree = dst[inl.ravel() > 0]
+    spread = float(np.ptp(agree[:, 0]) / w * np.ptp(agree[:, 1]) / h)
+    return (_as3(A), int(inl.sum()),
+            (src[loose].astype(np.float32), dst[loose].astype(np.float32)), spread)
 
 
 def _homography(corr, A):
@@ -96,39 +114,44 @@ def estimate_motion(frames, model: str = "auto", big_frac: float = 0.06):
     key_pts = _features(key)
     key_i = 0
     n_key = len(key_pts) if key_pts is not None else 0
-    first = (key, key_pts, n_key)          # the first keyframe, to come back to
+    key_strong = _strength(key) >= MIN_CORNER
+    first = (key, key_pts, n_key, key_strong)   # the first keyframe, to come back to
     steps = [np.eye(3)]                    # frame i -> its keyframe (similarity)
     corrs = [None]
     keys = [0]
     last = np.eye(3)                       # current frame -> keyframe, last estimate
     keyframes = 1
     sim_so_far = [np.eye(3)]
+    spreads = []                           # how much of the picture backs each estimate
     for i in range(1, n):
         cur = _gray(frames[i])
-        A, n_in, corr = _match(key, key_pts, cur, last)
+        A, n_in, corr, spread = _match(key, key_pts, cur, last)
         if key_i != 0 and first[1] is not None and i % 4 == 0:
             # Back to the first keyframe when it is in view again (someone
             # walked in front of a still camera, then out): no drift builds up.
             guess0 = sim_so_far[-1]
-            A0, n0, c0 = _match(first[0], first[1], cur, guess0)
+            A0, n0, c0, s0 = _match(first[0], first[1], cur, guess0)
             if A0 is not None and n0 >= max(12, 0.5 * first[2]) and n0 >= n_in:
-                key, key_pts, n_key, key_i = first[0], first[1], first[2], 0
-                A, n_in, corr = A0, n0, c0
+                key, key_pts, n_key, key_strong = first
+                key_i = 0
+                A, n_in, corr, spread = A0, n0, c0, s0
         if A is None or n_in < max(12, 0.3 * n_key):
             # Too few background points left in common: start a new keyframe
             # from the previous frame, whose placement is already known.
             key = _gray(frames[i - 1])
             key_pts = _features(key)
             n_key = len(key_pts) if key_pts is not None else 0
+            key_strong = _strength(key) >= MIN_CORNER
             key_i = i - 1
             keyframes += 1
-            A, n_in, corr = _match(key, key_pts, cur, np.eye(3))
+            A, n_in, corr, spread = _match(key, key_pts, cur, np.eye(3))
             if A is None:
-                A, corr = np.eye(3), None
+                A, corr, spread = np.eye(3), None, 0.0
         last = A
         steps.append(A)
         corrs.append(corr)
         keys.append(key_i)
+        spreads.append(spread if key_strong else 0.0)   # noise isn't detail
         sim_so_far.append(sim_so_far[key_i] @ A)
 
     def chain(mats):
@@ -161,9 +184,15 @@ def estimate_motion(frames, model: str = "auto", big_frac: float = 0.06):
     if not use_h:
         to_ref = sim
     step_disp = [disp(np.linalg.inv(a) @ b) for a, b in zip(to_ref, to_ref[1:])] or [0.0]
+    # On a plain backdrop the only detail to follow may be the ball itself (or
+    # the hand): its motion is then mistaken for the camera's. The background
+    # spans the picture; one object covers a small patch of it.
+    local = float(np.mean(np.asarray(spreads) < LOCAL_SPREAD)) if spreads else 0.0
     info = {"max_drift_px": max(disp(T) for T in to_ref), "drift80_px": drift,
             "median_step_px": float(np.median(step_disp)), "keyframes": keyframes,
-            "model": "homography" if use_h else "similarity"}
+            "model": "homography" if use_h else "similarity", "local_frac": local,
+            "spread_median": float(np.median(spreads)) if spreads else 0.0,
+            "unreliable": local > 0.5}
     return to_ref, info
 
 
@@ -214,8 +243,9 @@ def stabilize(frames, mode="auto", drift_px=4.0, step_px=0.15, *, big_frac: floa
     model = mode if mode in ("similarity", "homography") else "auto"
     T, info = estimate_motion(frames, model=model, big_frac=big_frac)
     moved = info["median_step_px"] > step_px or info["max_drift_px"] > drift_px
-    if mode == "auto" and not moved:
+    if mode == "auto" and (not moved or info["unreliable"]):
         info["applied"] = False
+        info["ignored"] = bool(moved)      # it looked like motion, but of one object
         return frames, None, info
     h, w = frames[0].shape[:2]
     big = info["model"] == "homography" or info["drift80_px"] > big_frac * max(w, h)

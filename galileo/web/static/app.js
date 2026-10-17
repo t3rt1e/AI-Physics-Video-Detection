@@ -472,6 +472,7 @@ class Panel {
     }
     if (r.drag && Math.abs(r.drag.factor - 1) > 0.005) add("Air drag", `corrected ${((r.drag.factor - 1) * 100).toFixed(1)}% (top speed ${r.drag.vt.toFixed(1)} m/s)`);
     if (r.stabilization && r.stabilization.applied) add("Camera motion", `removed (${r.stabilization.model === "homography" ? "pans and turns, with perspective" : "shake and drift"}; moved up to ${r.stabilization.max_drift_px.toFixed(0)} px)`);
+    else if (r.stabilization && r.stabilization.ignored) add("Camera motion", "taken as still (plain backdrop: the only detail to follow was the object)");
     const cam = r.camera || {};
     if (cam.pitched || cam.rolled) {
       const bits = [];

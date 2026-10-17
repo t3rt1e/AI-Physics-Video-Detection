@@ -47,6 +47,7 @@ class Track:
     score: float = 0.0
     kind: str = "moving"
     falls: bool = False        # has at least one clean flight that speeds up downward
+    lone: bool = False         # shadow-coloured, but nothing solid moves with it
 
     @property
     def f(self):
@@ -87,6 +88,11 @@ class Track:
     @property
     def shadow_frac(self) -> float:
         return float(np.mean([d.shadow for d in self.dets])) if self.dets else 0.0
+
+    @property
+    def is_shadow(self) -> bool:
+        """Shadow-coloured, and something solid moves along with it."""
+        return self.shadow_frac > 0.5 and not self.lone
 
     def extent_across(self, times) -> np.ndarray:
         """Outline length across the direction of motion, per detection (px).
@@ -591,10 +597,16 @@ def _steadiness(t, v) -> float:
     return float(1.4826 * np.median(np.abs(res)) / max(np.median(v[ok]), 1e-6))
 
 
-def _flight_score(t, x, y, d, dm, area=None, down=(0.0, 1.0)) -> tuple[float, bool]:
+def _flight_score(t, x, y, d, dm, area=None, down=(0.0, 1.0),
+                  dn=None) -> tuple[float, bool]:
     """How much one flight looks like a dropped object: long, smooth, steady in
-    size, and speeding up along `down`. Also says whether it is a clean fall."""
+    size, and speeding up along `down`. Also says whether it is a clean fall.
+
+    dn: the size its travel is counted in (default dm). A big ball close to
+    the camera has no room to travel many of its own widths, so the caller
+    caps it at a share of the picture."""
     from .physics import robust_fit_2d
+    dn = dm if dn is None else dn
     n = len(t)
     fit = robust_fit_2d(t, x, y)
     a_down, s_down = fit.accel_along(down)
@@ -615,8 +627,8 @@ def _flight_score(t, x, y, d, dm, area=None, down=(0.0, 1.0)) -> tuple[float, bo
     # Smooth path: the fit residual is small next to the ball's size.
     f_fit = float(np.exp(-fit.rms / (0.35 * dm + 0.7)))
     clean = (f_acc == 1.0 and cosang > 0.8 and n >= 8 and float(np.ptp(t)) >= 0.1
-             and ext >= 1.5 * dm and fit.rms < 0.5 * dm + 1.0)
-    return float(n * min(ext / dm, 25.0) * f_acc * f_dir * f_size * f_fit), bool(clean)
+             and ext >= 1.5 * dn and fit.rms < 0.5 * dm + 1.0)
+    return float(n * min(ext / dn, 25.0) * f_acc * f_dir * f_size * f_fit), bool(clean)
 
 
 def _own_down(t, x, y, dm):
@@ -631,7 +643,7 @@ def _own_down(t, x, y, dm):
     return g
 
 
-def classify_and_score(tracks: list[Track], times) -> list[Track]:
+def classify_and_score(tracks: list[Track], times, size_cap: float | None = None) -> list[Track]:
     """Score every moving track by its ballistic flights.
 
     The track is cut at bounces first and each flight is judged on its own,
@@ -641,6 +653,10 @@ def classify_and_score(tracks: list[Track], times) -> list[Track]:
     clip does that cleanly does a track that steadily speeds up some other
     way (a camera held sideways) count, at a small discount: a leg or a
     hand moving sideways mustn't outscore a ball falling down.
+
+    size_cap: travel is counted in the object's own widths, but at most in
+    this many pixels each (a share of the picture), so a big ball close to
+    the camera isn't judged to barely move.
     """
     from .physics import split_flights
     own_scores = {}
@@ -648,8 +664,9 @@ def classify_and_score(tracks: list[Track], times) -> list[Track]:
         x, y, d = tr.x, tr.y, tr.d
         dm = float(np.nanmedian(d)) if np.isfinite(d).any() else 1.0
         dm = max(dm, 1.0)
+        dn = min(dm, size_cap) if size_cap else dm
         extent = float(np.hypot(np.ptp(x), np.ptp(y)))
-        if extent < 1.0 * dm:
+        if extent < 1.0 * dn:
             tr.kind = "static"
             tr.score = 0.0
             continue
@@ -660,7 +677,7 @@ def classify_and_score(tracks: list[Track], times) -> list[Track]:
         area = tr.area
         if len(t) >= 5 and np.ptp(t) > 0:
             for idx in split_flights(t, x, y, (0.0, 1.0), diam_px=dm, min_pts=5):
-                sc_, clean = _flight_score(t[idx], x[idx], y[idx], d[idx], dm, area[idx])
+                sc_, clean = _flight_score(t[idx], x[idx], y[idx], d[idx], dm, area[idx], dn=dn)
                 score += sc_
                 tr.falls = tr.falls or clean
             own = _own_down(t, x, y, dm) if len(t) >= 12 else None
@@ -668,14 +685,14 @@ def classify_and_score(tracks: list[Track], times) -> list[Track]:
                 s2, f2 = 0.0, False
                 for idx in split_flights(t, x, y, own, diam_px=dm, min_pts=5):
                     sc_, clean = _flight_score(t[idx], x[idx], y[idx], d[idx], dm, area[idx],
-                                               down=own)
+                                               down=own, dn=dn)
                     s2 += sc_
                     f2 = f2 or clean
                 if 0.8 * s2 > score:
                     own_scores[id(tr)] = (0.8 * s2, f2)
         if score <= 0:
             # Moves, but no flight worth fitting: keep it as a weak fallback.
-            score = 0.02 * len(t) * min(extent / dm, 25.0)
+            score = 0.02 * len(t) * min(extent / dn, 25.0)
         tr.score = float(score)
     if own_scores and not any(tr.falls for tr in tracks if tr.kind == "moving"):
         for tr in tracks:
@@ -881,6 +898,36 @@ def _same_object(a: Track, b: Track, times) -> bool:
     return dist < 4.0 * max(da, db) + 1.5 * sp * gap + acc * gap * gap
 
 
+def _moves_with(a: Track, b: Track, times) -> bool:
+    """Does b move along with a, the way whatever casts a shadow moves with it?"""
+    ia = {int(f): j for j, f in enumerate(a.f)}
+    common = [(ia[int(f)], j) for j, f in enumerate(b.f) if int(f) in ia]
+    if len(common) < max(8, 0.3 * len(a.dets)):
+        return False
+    ja, jb = (np.asarray(c) for c in zip(*common))
+    t = np.asarray(times, float)[a.f[ja]]
+    if np.any(np.diff(t) <= 0):
+        return False
+    va = np.concatenate([np.gradient(a.x[ja], t), np.gradient(a.y[ja], t)])
+    vb = np.concatenate([np.gradient(b.x[jb], t), np.gradient(b.y[jb], t)])
+    if np.std(va) <= 0 or np.std(vb) <= 0:
+        return False
+    return float(np.corrcoef(va, vb)[0, 1]) > 0.7
+
+
+def _mark_lone_shadows(moving: list[Track], times, min_d: float) -> None:
+    """A shadow is cast by something that moves with it. A pale ball on a
+    bright, plain backdrop looks like a shadow by its colour alone (the
+    backdrop, only darker), but nothing solid moves along with it. Only
+    something sizeable (min_d px across) counts: a faint speck is more
+    likely the shadow of something out of the picture."""
+    solid = [t for t in moving if t.shadow_frac <= 0.5]
+    for tr in moving:
+        d = float(np.nanmedian(tr.d)) if np.isfinite(tr.d).any() else 0.0
+        tr.lone = (tr.shadow_frac > 0.5 and d >= min_d
+                   and not any(_moves_with(tr, s, times) for s in solid))
+
+
 def select_objects(moving: list[Track], times, primary: Track, max_n: int = 4) -> list[Track]:
     """The distinct falling objects, primary first.
 
@@ -896,7 +943,7 @@ def select_objects(moving: list[Track], times, primary: Track, max_n: int = 4) -
             break
         if tr is primary or not tr.falls or len(tr.dets) < 12:
             continue
-        if tr.score < 0.01 * best or tr.shadow_frac > 0.5:
+        if tr.score < 0.01 * best or tr.is_shadow:
             continue
         if any(_same_object(o, tr, times) for o in out):
             continue
@@ -932,23 +979,26 @@ def track_falling_object(frames, times, *, roi=None, bg=None, seed=None,
                    footprint=None if footprints is None else
                    np.asarray(footprints[i], np.float32).reshape(-1, 1, 2))
             for i, f in enumerate(frames)]
+    # Travel counts in the object's widths, up to a sixth of the picture each.
+    cap = min(frames[0].shape[:2]) / 6.0
     tracks = link(dets, times)
-    tracks = classify_and_score(tracks, times)
+    tracks = classify_and_score(tracks, times, size_cap=cap)
     dt = float(np.median(np.diff(times))) if len(times) > 1 else 1 / 30
     # Bridge short dropouts (bounce contact, a frame lost behind a hand),
     # judged in time so 240 fps clips get the same 40 ms as 60 fps ones.
     gap = max(4, int(round(0.04 / max(dt, 1e-6))))
     tracks = merge_fragments(tracks, times, max_gap_frames=gap)
-    tracks = classify_and_score(tracks, times)
+    tracks = classify_and_score(tracks, times, size_cap=cap)
     moving = [t for t in tracks if t.kind == "moving"]
     if not moving:
         return TrackResult(None, [], None, None, sum(len(d) for d in dets), dets=dets,
                            tracks=tracks)
+    _mark_lone_shadows(moving, times, min_d=min(frames[0].shape[:2]) / 20.0)
     main = pick_seeded(moving, times, seed) if seed else None
     seeded = main is not None
     if main is None:
         # Prefer a track with a clean fall over a busier one without.
-        falling = [t for t in moving if t.falls and t.shadow_frac <= 0.5]
+        falling = [t for t in moving if t.falls and not t.is_shadow]
         main = falling[0] if falling and falling[0].score >= 0.25 * moving[0].score else moving[0]
     objs = select_objects(moving, times, main, max_n=max_objects) if max_objects > 1 else [main]
     n_cand = sum(len(d) for d in dets)

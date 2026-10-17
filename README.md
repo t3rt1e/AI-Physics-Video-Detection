@@ -40,7 +40,8 @@ python -m galileo analyze my_drop.mp4 --object ping-pong --seed "1.25,0.48,0.33"
 python -m galileo analyze two_drops.mp4 --object volleyball tennis   # one name per object
 python -m galileo analyze phone_drop.mp4 --object phone              # not a ball: fine
 python -m galileo analyze dinner.mp4 --object "rotisserie chicken=22cm"   # anything, with its size
-python -m galileo analyze mystery.mp4                                # let Galileo name it
+python -m galileo analyze mystery.mp4                                # let Galileo name it (CLIP or --gemini)
+python -m galileo serve                                              # web page: upload a clip, nothing else to set
 python -m galileo batch path/to/real_clips --object ping-pong --expect real --csv real.csv
 ```
 
@@ -324,7 +325,9 @@ Veo clips are 24 fps and 4, 6 or 8 s long, and stay downloadable for 2 days.
    someone walking past the lens from leaving a fake drift. Small moves are a similarity
    (shift, turn, zoom); a pan or tilt that moves the view more than 6% of the picture for
    a good part of the clip is a homography, laid onto a canvas around the middle of the
-   motion. A locked-off camera is left alone.
+   motion. A locked-off camera is left alone, and so is a plain backdrop (a seamless
+   white studio wall, typical of generated clips) where the only detail to follow is the
+   ball itself: its motion would otherwise pass for the camera's.
 3. **Tracking** (`track.py`): background subtraction, then every moving thing is cut into
    flights and scored on how much each flight looks like a dropped ball: long, smooth,
    steady in size (or in area, for something long that tumbles), and speeding up
@@ -332,7 +335,10 @@ Veo clips are 24 fps and 4, 6 or 8 s long, and stay downloadable for 2 days.
    five flights of evidence. A click on the ball (a seed) overrides the score. Every
    track with a clean fall of its own is a falling object, unless it is a shadow, a piece
    of an object already chosen (a volleyball panel), or the rest of its path after a
-   dropout; colour keeps two objects apart where their paths cross. The ball's width is
+   dropout; colour keeps two objects apart where their paths cross. A pale ball on a
+   bright backdrop has a shadow's colour, but nothing solid moves along with it, so it
+   still counts. Travel is counted in the ball's own widths, but at most a sixth of the
+   picture each, so a big ball close to the camera isn't judged to barely move. The ball's width is
    measured across its direction of motion, which motion blur can't stretch; for big
    multi-coloured balls (a volleyball's panels) the outline is used, because the panels
    don't stand out from the wall equally.

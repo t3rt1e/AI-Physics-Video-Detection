@@ -276,9 +276,11 @@ def cmd_batch(a):
 def cmd_serve(a):
     import uvicorn
     from .web.app import create_app
+    live = bool(a.tower or a.fake_tower or a.camera is not None)
+    obj = a.object or ("steel-38mm" if live else "auto")   # uploads: work it out
     app = create_app(data_dir=a.data, tower_port=a.tower, fake_tower=a.fake_tower,
                      camera=a.camera, cam_size=(a.width, a.height), cam_fps=a.fps,
-                     preset=a.object, use_gemini=a.gemini, calibration=a.calibration)
+                     preset=obj, use_gemini=a.gemini, calibration=a.calibration)
     print(f"\nGalileo on http://localhost:{a.port}  (data in {os.path.abspath(a.data)})\n")
     uvicorn.run(app, host=a.host, port=a.port, log_level="warning")
 
@@ -444,7 +446,10 @@ def main(argv=None):
     s.add_argument("--width", type=int, default=1280)
     s.add_argument("--height", type=int, default=720)
     s.add_argument("--fps", type=int, default=60)
-    s.add_argument("--object", default="steel-38mm", choices=sorted(C.OBJECT_PRESETS))
+    s.add_argument("--object", default=None, choices=sorted(C.OBJECT_PRESETS) + ["auto"],
+                   help="what the page assumes is falling until you pick something else: "
+                        "'auto' lets Galileo work it out (the default; steel-38mm when a "
+                        "tower or webcam is attached)")
     s.add_argument("--gemini", action="store_true")
     s.add_argument("--calibration", help="JSON from 'calibrate --save' to apply to live drops")
     s.set_defaults(func=cmd_serve)

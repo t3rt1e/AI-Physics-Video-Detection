@@ -739,6 +739,10 @@ def _run(path: str, *, dbg: dict | None = None, preset=None,
         result["notes"].append(
             f"The camera moved a lot ({stab.get('model')}); frames were laid onto a "
             f"{cw}x{chh} canvas around frame {stab.get('reference', 0) + 1}.")
+    if stab.get("ignored"):
+        result["notes"].append(
+            "The background is too plain to see whether the camera moved (the only detail "
+            "to follow was the object itself), so the camera was taken as still.")
     roi_px = None
     if roi is not None:
         roi_px = (int(roi[0] * Ww + cox), int(roi[1] * Hw + coy), int(roi[2] * Ww + cox),
@@ -1472,18 +1476,21 @@ def _measure(o: _Obj, sh: dict, *, clock=None, keep_nums=None, say=None, manual_
 
     # Does the tracked thing fall at all? A dropped ball ends its flight moving
     # down, having come down a few of its own widths. A hand pulling away doesn't.
+    # A big ball close to the camera has no room to come down two of its own
+    # widths inside the picture, so for it a fifth of the picture is enough.
     pu_m = mf.fit.cx * gdir[0] + mf.fit.cy * gdir[1]
     tau_m = t[mf.idx] - mf.fit.t0
     u_m = pu_m[0] + pu_m[1] * tau_m + pu_m[2] * tau_m**2
     v_end = float(pu_m[1] + 2 * pu_m[2] * tau_m[-1])
     travel = float(u_m[-1] - np.min(u_m))
-    falls = travel >= 2.0 * d_ref and v_end > 0
+    need = min(2.0 * d_ref, 0.2 * (abs(gdir[0]) * geo.W + abs(gdir[1]) * geo.H))
+    falls = travel >= need and v_end > 0
     if not falls and _sure_of(idn):
         # A ball tossed up is in free flight too; "never falls" is there to
         # catch a hand pulling away, and this is known not to be a hand.
         a_m, s_m_ = mf.fit.accel_along(gdir)
         span = float(np.hypot(np.ptp(xs[mf.idx]), np.ptp(ys[mf.idx])))
-        falls = a_m > 5 * s_m_ and span >= 2.0 * d_ref
+        falls = a_m > 5 * s_m_ and span >= need
 
     light = identify.is_light(idn)
     if light:
