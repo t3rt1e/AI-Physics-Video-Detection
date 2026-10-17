@@ -269,6 +269,74 @@ def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_
     return out
 
 
+FLIP_MIN_P = 0.2     # look-alikes this likely, together, that would flip the call: ask
+
+
+def size_doubt(v: dict, label: str | None, size_m: float | None, alternatives,
+               p_main: float | None = None) -> dict:
+    """The ruler came from a guess at what the object is. When the other things
+    it could be (a practice golf ball rather than a pickleball) would together
+    have a fair chance (FLIP_MIN_P) of turning REAL into AI or back, the verdict
+    hangs on that guess: say so and ask, rather than call it. g scales with the
+    size assumed (g = s * a_px), so each one's g is this g times its size over
+    the one used.
+
+    alternatives: [{"label", "size_m", "p"}] from the identification; p_main:
+    how likely the one used is."""
+    g, sig = v.get("g"), v.get("sigma")
+    if (v.get("verdict") not in ("REAL", "AI") or g is None or not sig or not size_m
+            or not alternatives or v.get("stage") not in
+            ("ok", "physics: g too low", "physics: g too high")):
+        return v
+    g_ref = v.get("g_ref") or C.G_EARTH
+    rel = abs(sig / g) if g else 1.0
+    spread = C.Z_TOL * rel
+    far = spread > C.MAX_SPREAD
+    tol = v.get("tol") or C.TOL_REL
+
+    def call(r):
+        if far:
+            off = r * (1 + spread) < 1 - C.TOL_REL or r * (1 - spread) > 1 + C.TOL_REL
+            return "AI" if off else "UNSURE"
+        return "REAL" if abs(r - 1) <= tol else "AI"
+
+    def says(gg, verdict):
+        what = {"REAL": "Earth's gravity", "UNSURE": "too uncertain to call"}.get(
+            verdict, "too slow to be real" if gg < g_ref else "too fast to be real")
+        return f"{_fmt_g(gg, abs(gg) * rel)}, {what}"
+
+    def odds(p):
+        return f", {100 * p:.0f}% likely" if p is not None else ""
+
+    flips = []
+    for a in alternatives:
+        g_a = g * float(a["size_m"]) / float(size_m)
+        c = call(g_a / g_ref)
+        if c != v["verdict"]:
+            flips.append((a, g_a, c))
+    p_flip = sum(float(a.get("p") or 0.0) for a, _, _ in flips)
+    if not flips or p_flip < FLIP_MIN_P:
+        return v
+    name = label or "object"
+    flips.sort(key=lambda q: -float(q[0].get("p") or 0.0))
+    a = flips[0][0]
+    out = {**v, "verdict": "UNSURE", "confidence": 0.0, "stage": "ruler: which object?",
+           "size_flip": [{"label": a_["label"], "size_m": float(a_["size_m"]), "g": float(gg),
+                          "p": a_.get("p"), "verdict": cc} for a_, gg, cc in flips]}
+    out["headline"] = (f"Can't tell: it depends on what the object is ({name} or "
+                       f"{a['label']}).")
+    reasons = [f"As a {name} ({1000 * size_m:.0f} mm{odds(p_main)}) it falls at "
+               f"{says(g, v['verdict'])}."]
+    for a_, gg, cc in flips:
+        reasons.append(f"As a {a_['label']} ({1000 * a_['size_m']:.0f} mm"
+                       f"{odds(a_.get('p'))}) it would fall at {says(gg, cc)}.")
+    reasons.append("The object's size is the ruler, and these look alike in the video. Tell "
+                   "Galileo what it is (the Ruler menu in the web app, or --object on the "
+                   "command line).")
+    out["reasons"] = reasons
+    return out
+
+
 def _obj_name(o, cap=False) -> str:
     s = f"object {o['n']}" + (f" ({o['label']})" if o.get("label") else "")
     return s[0].upper() + s[1:] if cap else s

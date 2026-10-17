@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import math
 import os
 import re
 
@@ -48,6 +49,9 @@ ALIASES = {
     "knife": "table-knife", "mouse": "mouse", "controller": "game-controller",
     "battery": "aa-battery", "helmet": "bike-helmet", "bag-of-chips": "chip-bag",
     "chips": "chip-bag", "shopping-bag": "plastic-bag", "grocery-bag": "plastic-bag",
+    "dry-erase-eraser": "whiteboard-eraser", "board-eraser": "whiteboard-eraser",
+    "chalkboard-eraser": "whiteboard-eraser", "expo-eraser": "whiteboard-eraser",
+    "felt-eraser": "whiteboard-eraser",
 }
 
 
@@ -131,12 +135,24 @@ def from_name(text: str) -> dict:
     if key:
         out = from_preset(key)
         if size:
-            out.update(size_m=size, rel_unc=0.02, detail=f"size {1000 * size:.0f} mm from you")
+            out.update(size_m=size, rel_unc=0.02, detail=f"size {1000 * size:.0f} mm from you",
+                       explicit_size=True)
         out["name"] = name
         return out
     return {"key": None, "label": name, "name": name, "size_m": size,
             "rel_unc": 0.02 if size else None, "vt": None, "shape": None, "source": "you",
-            "confidence": 1.0, "detail": "" if size else "no size known for this name"}
+            "confidence": 1.0, "detail": "" if size else "no size known for this name",
+            "explicit_size": bool(size)}
+
+
+def sized_by_kind(idn: dict | None) -> bool:
+    """A name you typed whose size is only the catalog's typical one for a kind
+    of thing that comes in many sizes or shapes (an "eraser": a pencil's, or a
+    whiteboard's), not a size you gave. Worth asking Gemini to size the one in
+    the clip."""
+    idn = idn or {}
+    return bool(idn.get("source") == "you" and idn.get("key") and not idn.get("explicit_size")
+                and ((idn.get("rel_unc") or 0.0) >= 0.1 or idn.get("shape") == "rigid"))
 
 
 def is_light(idn: dict | None) -> bool:
@@ -412,11 +428,12 @@ def clip_identify(img_bgr, x, y, size_px, shape_hint: dict | None = None,
 
 
 def gemini_identify(view_img, xyd, shape_hint: dict | None = None,
-                    hint: str | None = None) -> dict | None:
+                    hint: str | None = None, crops: list | None = None) -> dict | None:
     """Gemini's answer, matched to a known object when it names one. hint: what
-    you said it is, so Gemini sizes that rather than guessing the name."""
+    you said it is, so Gemini sizes that rather than guessing the name.
+    crops: full-resolution close-ups of it, to look at closely."""
     from . import gemini
-    g = gemini.identify_object(view_img, xyd, hint=hint)
+    g = gemini.identify_object(view_img, xyd, hint=hint, crops=crops)
     if not g:
         return None
     key = resolve(g.get("object"))
@@ -424,10 +441,27 @@ def gemini_identify(view_img, xyd, shape_hint: dict | None = None,
     detail = f"Gemini: {g.get('object')} ({100 * conf:.0f}%)"
     if g.get("reason"):
         detail += f", {g['reason']}"
-    if key:
-        return from_preset(key, source="Gemini", confidence=conf, detail=detail)
     round_ = bool(g.get("is_round", True))
     size = g.get("size_m")
+    alts = _alternatives(g)
+    if alts:
+        detail += "; could also be " + ", ".join(
+            f"{a['label']} ({1000 * a['size_m']:.0f} mm, {100 * a['p']:.0f}%)" for a in alts)
+    if key:
+        e = entry(key)
+        if not size or abs(math.log(float(size) / e["size_m"])) < math.log(1.3):
+            return {**from_preset(key, source="Gemini", confidence=conf, detail=detail),
+                    "alternatives": alts}
+        # The catalog's typical one is another kind (a pencil eraser, not a
+        # whiteboard eraser): keep Gemini's size for the one it looked at.
+        rel = float(g.get("size_rel_uncertainty", 0.1))
+        return {"key": key, "label": str(g.get("object") or e["label"]), "size_m": float(size),
+                "rel_unc": rel if round_ else max(rel, C.RIGID_MIN_REL_UNC),
+                "vt": g.get("terminal_speed_m_s") or e.get("vt"),
+                "shape": "round" if round_ else "rigid", "source": "Gemini",
+                "confidence": conf, "alternatives": alts,
+                "detail": detail + f"; sized by Gemini, not as a typical {e['label']} "
+                                   f"({1000 * e['size_m']:.0f} mm)"}
     if not size:
         return {"key": None, "label": g.get("object"), "size_m": None, "source": "Gemini",
                 "confidence": conf, "detail": detail, "shape": "round" if round_ else "rigid"}
@@ -435,7 +469,25 @@ def gemini_identify(view_img, xyd, shape_hint: dict | None = None,
     return {"key": None, "label": str(g.get("object", "object")), "size_m": float(size),
             "rel_unc": rel if round_ else max(rel, C.RIGID_MIN_REL_UNC),
             "vt": g.get("terminal_speed_m_s"), "shape": "round" if round_ else "rigid",
-            "source": "Gemini", "confidence": conf, "detail": detail}
+            "source": "Gemini", "confidence": conf, "detail": detail, "alternatives": alts}
+
+
+ALT_MIN_P = 0.05     # pooled probability below this: noise, not a look-alike
+
+
+def _alternatives(g) -> list:
+    """The other things Gemini says it could plausibly be, with sizes (the
+    catalog's typical size when it knows the thing and Gemini's is close)."""
+    out = []
+    for a in g.get("alternatives") or []:
+        p, s = float(a.get("probability") or 0), float(a.get("size_m") or 0)
+        if p < ALT_MIN_P or s <= 0:
+            continue
+        k = resolve(a.get("object"))
+        if k and abs(math.log(s / entry(k)["size_m"])) < math.log(1.3):
+            s = entry(k)["size_m"]
+        out.append({"label": str(a["object"]), "size_m": s, "p": p})
+    return out
 
 
 def same_as(objs: list, j: int) -> dict | None:

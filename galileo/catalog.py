@@ -174,6 +174,8 @@ _ROWS = [
     ("marker", "marker", 0.14, 0.10, 12, X, "a felt-tip marker"),
     ("crayon", "crayon", 0.09, 0.10, 15, X, "a wax crayon"),
     ("eraser", "eraser", 0.06, 0.20, 20, X, "a rubber eraser"),
+    ("whiteboard-eraser", "whiteboard eraser", 0.14, 0.08, 15, X,
+     "a felt whiteboard eraser, a block with a dark handle"),
     ("ruler", "12 inch ruler", 0.31, 0.03, 10, X, "a straight ruler with markings"),
     ("scissors", "scissors", 0.20, 0.15, 20, X, "a pair of scissors"),
     ("stapler", "stapler", 0.17, 0.15, 30, X, "a desk stapler"),

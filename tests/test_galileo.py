@@ -777,3 +777,159 @@ def test_big_pale_ball_close_to_the_camera(plain_clips):
     r = analyze(plain_clips["ai"], preset="soccer")
     assert r["verdict"]["verdict"] == "AI"
     assert r["verdict"]["g"] == pytest.approx(2.0, rel=0.1)
+
+
+# ---- sizing the object: a typed name, Gemini ---------------------------------------
+def test_a_kind_of_object_gets_sized_by_gemini(tmp_path, monkeypatch):
+    # "eraser" brings a pencil eraser's 6 cm; the one in the clip is a 14 cm
+    # whiteboard eraser. With Gemini on, it sizes the one it sees.
+    from galileo import gemini, identify
+    from galileo.synth import Body
+    assert identify.sized_by_kind(identify.from_name("eraser"))
+    assert not identify.sized_by_kind(identify.from_name("eraser=14cm"))
+    assert not identify.sized_by_kind(identify.from_name("volleyball"))
+    sc = Scene(width=640, height=480, px_per_m=500.0, main_ball=False, bg_level=70, seed=5,
+               bodies=(Body(kind="box", size_m=0.14, width_m=0.05, bgr=(25, 25, 30), x0=320.0,
+                            y0=70.0, motion=Motion(g=9.81, t_release=0.12), omega=10.0,
+                            angle0=0.4),))
+    clip = make_clip(str(tmp_path / "eraser.mp4"), scene=sc, motion=Motion(t_release=0.12),
+                     capture_fps=60, duration=0.6)["path"]
+    seen = {}
+
+    def fake_identify(frame, xyd, hint=None, crops=None):
+        seen.update(hint=hint, crops=len(crops or []))
+        return {"object": "whiteboard eraser", "is_round": False, "size_m": 0.14,
+                "size_rel_uncertainty": 0.05, "confidence": 0.9, "terminal_speed_m_s": 15,
+                "reason": "felt block with a dark handle"}
+    monkeypatch.setattr(gemini, "available", lambda: (True, "test"))
+    monkeypatch.setattr(gemini, "identify_object", fake_identify)
+    monkeypatch.setattr(gemini, "explain", lambda r: None)
+    r = analyze(clip, preset="eraser", use_gemini=True)
+    assert seen["hint"] == "eraser" and seen["crops"] >= 2      # full-resolution close-ups
+    assert r["scale"]["rulers"][0]["detail"].startswith("eraser = 140 mm")
+    assert any("Gemini sizes this one at 140 mm" in n for n in r["notes"])
+    assert r["verdict"]["verdict"] == "REAL"
+    assert r["verdict"]["g"] == pytest.approx(9.81, rel=0.06)
+    # Without Gemini the typical size stands, and the clip reads far too slow.
+    v = analyze(clip, preset="eraser")["verdict"]
+    assert v["verdict"] == "AI" and v["g"] < 6
+
+
+def test_gemini_moves_on_when_a_model_is_busy(monkeypatch):
+    pytest.importorskip("google.genai")
+    from galileo import gemini
+
+    class Busy(Exception):
+        pass
+    tried, busy = [], set()
+
+    class Models:
+        def generate_content(self, model, contents, config):
+            tried.append(model)
+            if len(busy) < 2:
+                busy.add(model)
+            if model in busy:                       # the first two models are busy
+                raise Busy("503 UNAVAILABLE")
+            return type("R", (), {"text": '{"ok": true}'})()
+    monkeypatch.setattr(gemini, "_client", lambda: type("C", (), {"models": Models()})())
+    monkeypatch.setattr(gemini, "_RESTING", {})
+    resp, used = gemini._generate("hi", json_out=True)
+    assert gemini._json(resp) == {"ok": True}
+    assert len(tried) == 3 and used == tried[-1] and len(set(tried)) == 3
+    # The busy ones are left alone for a while: the next request starts past them.
+    tried.clear()
+    gemini._generate("hi", json_out=True)
+    assert tried == [used]
+
+
+def test_gemini_replies_are_pooled(monkeypatch):
+    # Asked twice, Gemini said "pickleball" once and "practice golf ball" once:
+    # the pooled answer keeps the golf ball as a look-alike of another size.
+    from galileo import gemini, identify
+    a = gemini._answer({"candidates": [
+        {"object": "pickleball", "is_round": True, "size_m": 0.074, "probability": 0.9},
+        {"object": "plastic practice golf ball", "is_round": True, "size_m": 0.042,
+         "probability": 0.1}]}, "m1")
+    b = gemini._answer({"candidates": [
+        {"object": "Plastic practice golf ball", "is_round": True, "size_m": 0.042,
+         "probability": 0.8},
+        {"object": "pickleball", "is_round": True, "size_m": 0.074, "probability": 0.2}]}, "m2")
+    g = gemini.pool([a, b])
+    assert g["object"] == "pickleball" and g["size_m"] == 0.074
+    assert g["confidence"] == pytest.approx(0.55)
+    assert g["alternatives"][0]["size_m"] == 0.042
+    assert g["alternatives"][0]["probability"] == pytest.approx(0.45)
+    monkeypatch.setattr(gemini, "identify_object", lambda *a_, **k_: g)
+    idn = identify.gemini_identify(np.zeros((20, 20, 3), np.uint8), (10, 10, 6))
+    assert idn["size_m"] == 0.074 and idn["alternatives"][0]["size_m"] == 0.042
+    # One sure reply: a long shot isn't a look-alike worth checking.
+    sure = gemini.pool([gemini._answer({"candidates": [
+        {"object": "volleyball", "is_round": True, "size_m": 0.21, "probability": 0.95},
+        {"object": "beach ball", "is_round": True, "size_m": 0.3, "probability": 0.03}]}, "m")])
+    monkeypatch.setattr(gemini, "identify_object", lambda *a_, **k_: sure)
+    assert identify.gemini_identify(np.zeros((20, 20, 3), np.uint8), (10, 10, 6))[
+        "alternatives"] == []
+
+
+def test_a_look_alike_of_another_size_makes_it_unsure():
+    from galileo.verdict import decide, size_doubt
+    base = dict(clock=None, tests=[], n_points=40, duration=0.4)
+    # Read as a 74 mm pickleball it falls at 9.1 m/s^2; a 42 mm practice golf
+    # ball that looks the same would fall at 5.2: the call hangs on which it is.
+    v = decide(a_px=9.1 / 0.074 * 60, a_sigma=10.0, scale={"s": 0.074 / 60, "rel_sigma": 0.03},
+               **base)
+    assert v["verdict"] == "REAL"
+    golf = [{"label": "practice golf ball", "size_m": 0.042, "p": 0.45}]
+    u = size_doubt(v, "pickleball", 0.074, golf)
+    assert u["verdict"] == "UNSURE" and u["stage"] == "ruler: which object?"
+    assert "practice golf ball" in u["headline"]
+    assert u["size_flip"][0]["g"] == pytest.approx(9.1 * 42 / 74, rel=0.01)
+    assert any("too slow" in r for r in u["reasons"])
+    # Long shots don't, unless together they make a fair chance (20%).
+    assert size_doubt(v, "pickleball", 0.074, [{**golf[0], "p": 0.1}]) is v
+    two = [{**golf[0], "p": 0.12}, {"label": "foam ball", "size_m": 0.05, "p": 0.1}]
+    assert size_doubt(v, "pickleball", 0.074, two)["verdict"] == "UNSURE"
+    # A look-alike of about the same size changes nothing...
+    assert size_doubt(v, "pickleball", 0.074, [{"label": "wiffle ball", "size_m": 0.073,
+                                                "p": 0.4}]) is v
+    # ...and nor does any size when the physics itself breaks.
+    broke = {**v, "verdict": "AI", "stage": "physics: Bounce law failed"}
+    assert size_doubt(broke, "pickleball", 0.074, golf) is broke
+
+
+def test_unsure_when_gemini_sees_look_alikes_of_other_sizes(clips, monkeypatch):
+    from galileo import gemini
+
+    def fake(frame, xyd, hint=None, crops=None):
+        return {"object": "orange toy ball", "is_round": True, "size_m": 0.038,
+                "size_rel_uncertainty": 0.03, "confidence": 0.55, "terminal_speed_m_s": None,
+                "reason": "", "model": "fake", "dimensions_m": [], "samples": 2,
+                "alternatives": alts}
+    monkeypatch.setattr(gemini, "available", lambda: (True, "test"))
+    monkeypatch.setattr(gemini, "identify_object", fake)
+    monkeypatch.setattr(gemini, "explain", lambda r: None)
+    alts = [{"object": "tennis ball", "size_m": 0.067, "probability": 0.4}]
+    v = analyze(clips["real"], use_gemini=True)["verdict"]
+    assert v["verdict"] == "UNSURE" and v["stage"] == "ruler: which object?"
+    assert v["size_flip"][0]["verdict"] == "AI"
+    alts = [{"object": "orange marble", "size_m": 0.036, "probability": 0.4}]
+    v = analyze(clips["real"], use_gemini=True)["verdict"]
+    assert v["verdict"] == "REAL" and v["g"] == pytest.approx(9.81, rel=0.06)
+
+
+def test_camera_listens_only_to_falls_that_make_sense():
+    from galileo.analyze import _camera_votes
+    prim = {"n": 1, "g2": [0.0, 1.0], "nvec": [0.02, 1.0, 0.015], "pitch": 0.9,
+            "pitch_sigma": 2.1, "roll": 1.0, "roll_sigma": 0.4}
+    other = {"n": 2, "g2": [0.0, 1.0], "nvec": [0.0, 1.0, 0.05], "pitch": 2.8,
+             "pitch_sigma": 3.4, "roll": -0.2, "roll_sigma": 1.8}
+    # A ball rolling toward the camera: its "gravity" runs along the view, and
+    # sideways in the picture, while it speeds up nowhere in the picture.
+    rolling = {"n": 3, "g2": [0.0, 1.0], "nvec": [0.43, -0.06, 0.90], "pitch": 64.2,
+               "pitch_sigma": 0.26, "roll": 98.4, "roll_sigma": 1.5}
+    tipped = {"n": 4, "g2": [0.0, 1.0], "nvec": [0.0, 0.71, 0.71], "pitch": 45.0,
+              "pitch_sigma": 1.0, "roll": 0.0, "roll_sigma": 1.0}
+    outline = {"n": 5, "g2": [0.0, 1.0], "flights": 1}            # no 3D reading
+    got = _camera_votes([prim, other, rolling, tipped, outline], 1)
+    assert [e["n"] for e in got] == [1, 2]
+    assert "speeds up" in rolling["left_out"] and "primary" in tipped["left_out"]

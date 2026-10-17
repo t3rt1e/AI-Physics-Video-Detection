@@ -133,20 +133,21 @@ def work_scale(info: ClipInfo, n_frames: int, max_side: int, budget: int) -> flo
 def iter_frames(path: str, info: ClipInfo | None = None, *, scale: float = 1.0,
                 t_start: float | None = None, t_end: float | None = None,
                 gray: bool = False, crop=None, first_num: int | None = None,
-                last_num: int | None = None, step: int = 1):
+                last_num: int | None = None, step: int = 1, numbers=None):
     """Yield (frame, time, number) one frame at a time, upright, at `scale`.
 
     time is seconds from the file's first frame (presentation timestamps);
     number is the frame's index in the file. Frames outside the time window
     or the [first_num, last_num] range are skipped without converting them,
-    and so is every frame but each step-th one (by its number).
+    and so is every frame but each step-th one (by its number), and with
+    `numbers` (a set) every frame not in it.
     crop is (x0, y0, x1, y1) in pixels of the scaled, upright frame.
     """
     info = info or probe(path)
     step = max(1, int(step))
     if av is None:
         yield from _iter_cv(path, info, scale, t_start, t_end, gray, crop, first_num, last_num,
-                            step)
+                            step, numbers)
         return
     with av.open(path) as c:
         vs = c.streams.video[0]
@@ -168,7 +169,7 @@ def iter_frames(path: str, info: ClipInfo | None = None, *, scale: float = 1.0,
                 continue
             if t_end is not None and t > t_end + 1e-9:
                 break
-            if i % step:
+            if i % step or (numbers is not None and i not in numbers):
                 continue
             sw, sh = fr.width, fr.height
             tw, th = max(2, int(round(sw * scale))), max(2, int(round(sh * scale)))
@@ -245,7 +246,7 @@ def regularize_timestamps(ts) -> np.ndarray:
 
 
 def _iter_cv(path, info, scale, t_start, t_end, gray, crop=None, first_num=None,
-             last_num=None, step=1):
+             last_num=None, step=1, numbers=None):
     cap = cv2.VideoCapture(path)
     i = 0
     fps = info.fps or 30.0
@@ -264,7 +265,7 @@ def _iter_cv(path, info, scale, t_start, t_end, gray, crop=None, first_num=None,
                 continue
             if t_end is not None and t > t_end:
                 break
-            if (i - 1) % step:
+            if (i - 1) % step or (numbers is not None and i - 1 not in numbers):
                 continue
             if scale != 1.0:
                 img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)

@@ -40,7 +40,7 @@ python -m galileo analyze my_drop.mp4 --object ping-pong --seed "1.25,0.48,0.33"
 python -m galileo analyze two_drops.mp4 --object volleyball tennis   # one name per object
 python -m galileo analyze phone_drop.mp4 --object phone              # not a ball: fine
 python -m galileo analyze dinner.mp4 --object "rotisserie chicken=22cm"   # anything, with its size
-python -m galileo analyze mystery.mp4                                # let Galileo name it (CLIP or --gemini)
+python -m galileo analyze mystery.mp4                                # let Galileo name it (Gemini or CLIP)
 python -m galileo serve                                              # web page: upload a clip, nothing else to set
 python -m galileo batch path/to/real_clips --object ping-pong --expect real --csv real.csv
 ```
@@ -143,15 +143,31 @@ phone held sideways, tilting or panning to follow the ball, walking closer, zoom
   `auto` in the list leaves one to Galileo. The object you name first is the main one
   unless you `--seed` another. In the web app, "Something else" in the ruler menu does
   the same.
-- **Or let Galileo name them.** With nothing named, Gemini (`--gemini`) or CLIP names each
-  object. CLIP is a pretrained image classifier that reads text, so it picks from the
+- **Or let Galileo name them.** With nothing named, Gemini (on whenever `GEMINI_API_KEY`
+  is set; `--no-gemini` turns it off) or CLIP names each object. Gemini is shown the
+  frame and full-resolution close-ups of the object at the moments it moved least (the
+  sharpest, and from several sides as it turns), not the working picture, where a small
+  object is a smudge. It is asked for the three things the object most likely is, with
+  their sizes and odds, and asked twice (by two different models when it can); the two
+  replies are pooled. That matters because Gemini is often sure and wrong about a small
+  ball: the same pickleball came back as a pickleball, a tennis ball or a practice golf
+  ball depending on the call, each time "85 to 98% sure". When look-alikes of another
+  size together have a fair chance (20%) of flipping the call, the verdict hangs on what
+  the object is, so Galileo says so instead of guessing: "Can't tell: it depends on what
+  the object is (pickleball or plastic practice golf ball)", with the g each would give,
+  and asks you to name it. Look-alikes of about the same size (a pickleball and a wiffle
+  ball) don't matter, and nor does any size when the physics itself breaks. CLIP is a pretrained image classifier that reads text, so it picks from the
   whole catalogue with no training; it runs offline on the CPU (`pip install torch
   transformers`; the model downloads once, about 600 MB). It is asked about each
   object's look, not just its name ("a hard plastic ball full of round holes"), and when
   it hesitates between objects of different sizes the ruler's error bar grows to match:
   torn between a tennis ball and a pickleball costs a few percent; between a ping-pong
   ball and a basketball, the answer becomes "too uncertain". Gemini can name anything at
-  all and estimate its size, and sizes a name you gave without one. Two objects that look
+  all and estimate its size, and sizes a name you gave without one. It also sizes the
+  one in the clip when your name only brings a typical size for a kind of thing that
+  comes in many sizes: "eraser" is a 6 cm pencil eraser in the catalogue, and a 14 cm
+  whiteboard eraser read as one falls at 4.3 m/s² instead of 10 (with Gemini on, it is
+  sized at 14 cm; offline, say "whiteboard eraser" or give its size). Two objects that look
   alike in size and shape are taken to be the same kind. A guessed size can never
   overturn your own: the main object's verdict stands unless an object you named
   yourself disagrees.
@@ -309,12 +325,22 @@ The correction is only applied to tower clips, and the page says when it is on.
 pip install -r requirements-ml.txt        # or just: pip install google-genai
 set GEMINI_API_KEY=...                    # PowerShell: $env:GEMINI_API_KEY="..."  macOS/Linux: export
 python -m galileo twin --image tower.jpg --out data/clips/ai_twin_veo.mp4
-python -m galileo serve --fake-tower --gemini
+python -m galileo serve --fake-tower
 ```
 
-With Gemini on, it names unknown objects so their typical size can be the ruler, and
-writes a two-sentence explanation of each verdict. Answers are cached in
-`~/.galileo_cache`, so demo clips that ran once keep working if the venue Wi-Fi drops.
+With a key set, Gemini is on by default (`--no-gemini` turns it off). It names unknown
+objects so their typical size can be the ruler, sizes the one in the clip when a name
+only gives a typical size, and writes a two-sentence explanation of each verdict.
+
+A free key gets about 20 requests a day per model. Naming an object costs two requests
+(`GALILEO_GEMINI_SAMPLES=1` makes it one, at the cost of the cross-check) and the
+explanation one, so a clip with one object costs three. Naming walks the Flash models
+(`gemini-flash-latest`, then 3.7, 3.6, 3.5 and 3 Flash) and then the Flash-Lite ones; the
+explanation starts with Flash-Lite, to leave the Flash quota for naming. A model that is
+busy (503), out of quota (429) or retired (404) is skipped and left alone for a while.
+When none answers, CLIP names the object and the run goes on. Answers are cached in
+`~/.galileo_cache`, so a clip that ran once costs nothing again, and demo clips keep
+working if the venue Wi-Fi drops: run your demo clips once beforehand.
 Model names change often: override with `GALILEO_GEMINI_MODEL` (default
 `gemini-flash-latest`) and `GALILEO_VEO_MODEL` (default `veo-3.1-generate-preview`).
 Veo clips are 24 fps and 4, 6 or 8 s long, and stay downloadable for 2 days.
@@ -363,8 +389,11 @@ Veo clips are 24 fps and 4, 6 or 8 s long, and stay downloadable for 2 days.
    the picture's centre gives K = tan(pitch) / f without knowing f. Each round object's
    flights are also followed in 3D (depth from the widths alone, Z = f·D/d, so a bend in
    the path from lens distortion or drag can't pass for depth; the rest from the
-   positions at that depth). The two are combined when they agree, the room wins when
-   they don't, and the room's horizon, if seen, gives f. Then every position and width is
+   positions at that depth). A 3D reading counts only if it points, in the picture, where
+   the object speeds up in the picture (a ball rolling toward the camera reads as
+   "gravity" along the view and would tip the camera 60°), and another object's only if
+   it agrees with the main one's. The balls and the room are combined when they agree,
+   the room wins when they don't, and the room's horizon, if seen, gives f. Then every position and width is
    mapped into the level view (`Leveler`), and how far the focal length and the tilt could
    move g is added to the error bar.
 6. **Fitting** (`physics.py`): the track is cut into flights at bounces (direction changes
@@ -402,7 +431,11 @@ Veo clips are 24 fps and 4, 6 or 8 s long, and stay downloadable for 2 days.
    `--slowmo`, a clock that explains a low g makes it real slow motion, and too fast
    can't be called (the footage may be sped up). With several objects, the main one decides; another stands in when the main
    one can't be measured and Galileo knows what the other one is, and the rest add their
-   numbers to the reasons (lowering the confidence when they disagree).
+   numbers to the reasons (lowering the confidence when they disagree). Other objects
+   that don't clearly speed up on the way down (a ball rolling across the floor, one
+   carried in a hand) are dropped however sure Galileo is of what they are, unless you
+   named them. When the ruler is Gemini's guess and a look-alike of another size would
+   flip the call, the answer is "it depends on what the object is" (see naming above).
 
 On synthetic clips with known physics (60 fps rolling-shutter webcam, 240 fps native,
 8x tagged, 4x repeated, 4x interpolated, bounces, a panning camera, AI-style floaty and

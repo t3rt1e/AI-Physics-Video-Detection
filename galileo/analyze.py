@@ -40,8 +40,8 @@ from .physics import (_noise_px, drag_factor, drag_path, fit_flights, gravity_di
 from .scale import Ruler, fuse, ruler_from_size, ruler_manual
 from .stabilize import rescale_transforms, stabilize, warp
 from .track import background, track_falling_object
-from .verdict import combine_objects, decide
-from .video import motion_window, probe, read_frames, work_scale
+from .verdict import combine_objects, decide, size_doubt
+from .video import iter_frames, motion_window, probe, read_frames, work_scale
 
 DOWN = np.array([0.0, 1.0])
 PING_PONG_VT = 8.4
@@ -120,6 +120,7 @@ class _Obj:
     p1: dict | None = None         # first-pass arrays and flights
     p2: dict | None = None         # the zoom pass, if any
     first_hop: bool = False        # the measured stretch starts at a bounce, not a release
+    full_views: dict | None = None  # full-resolution close-ups, for Gemini to name it
 
     @property
     def rigid(self) -> bool:
@@ -241,6 +242,31 @@ def _sensor_rows(geo, f, x, y, rs_axis):
     return out
 
 
+def _camera_votes(per: list, primary_n: int) -> list:
+    """The objects whose fall in 3D can speak for the camera.
+
+    A fall seen in 3D has to point, in the picture, where the object speeds up
+    in the picture: a ball rolling toward the camera reads as "gravity" along
+    the view, and must not tip the camera. The best-tracked fall (the primary)
+    leads; another object's reading counts only if it agrees with it. Marks the
+    others "left_out" (with the reason) and returns the ones that count."""
+    three_d = [e for e in per if "nvec" in e]
+    for e in three_d:
+        r2 = math.degrees(math.atan2(e["g2"][0], e["g2"][1]))
+        dr = (e["roll"] - r2 + 180.0) % 360.0 - 180.0
+        if abs(dr) > max(40.0, 3.0 * e["roll_sigma"]):
+            e["left_out"] = (f"its 3D fall points {abs(dr):.0f}° from where it speeds up in "
+                             "the picture")
+    lead = next((e for e in three_d if "left_out" not in e and e["n"] == primary_n), None)
+    for e in three_d:
+        if lead is not None and e is not lead and "left_out" not in e and \
+                abs(e["pitch"] - lead["pitch"]) > 3.0 * math.hypot(e["pitch_sigma"],
+                                                                   lead["pitch_sigma"]) + 3.0:
+            e["left_out"] = (f"its fall tips the camera {e['pitch']:.0f}°, the primary's "
+                             f"{lead['pitch']:.0f}°")
+    return [e for e in three_d if "left_out" not in e]
+
+
 def _camera_geometry(objs, info, *, hfov=None, mode="auto", notes=None, pitch=None,
                      roll=None, bg=None, bg_geo=None) -> dict:
     """Which way gravity points as the camera sees it, from every round
@@ -301,11 +327,11 @@ def _camera_geometry(objs, info, *, hfov=None, mode="auto", notes=None, pitch=No
                                          [round(v_, 1) for v_ in cam_.direction(ft["G"], ft["cov"])[1:5]]
                                          for ft in fits])
         per.append(entry)
+    three_d = _camera_votes(per, objs[0].n)
     out["objects"] = [{k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in e.items()
                        if k not in ("G", "cov")} for e in per]
     f_frac = fp["f_frac"]
     # ---- what the falls say: K = tan(pitch) / f (independent of f), and the roll
-    three_d = [e for e in per if "nvec" in e]
     K_t = sK_t = None
     if three_d:
         # Every object sees the same camera: combine their directions.
@@ -611,6 +637,62 @@ def _view(frames, tr, times, fl, size, keep_full=False):
             "fsize": float(max(size, 6.0)), "t": float(t[j])}
 
 
+def _full_views(path, info, geo, nums, o, n: int = 3) -> dict | None:
+    """Full-resolution close-ups of the object at the n moments it moved least
+    (the least motion blur; a tumbling object shows other sides at other
+    moments), and the whole frame of the first, for Gemini to name it. Small
+    in the working picture, an eraser is a dark smudge; at full size it has
+    its felt, its print and its corners."""
+    p1 = o.p1 or {}
+    if not p1.get("fl") or info.width <= 0:
+        return None
+    t, x, y, f = (np.asarray(p1[k]) for k in ("t", "x", "y", "f"))
+    speed, _ = _speeds(t, x, y, p1["fl"])
+    cand = []
+    for idx in p1["fl"]:
+        if len(idx) < 5:
+            continue
+        lo, hi = t[idx[0]], t[idx[-1]]
+        cut = 0.1 * (hi - lo)
+        cand += [j for j in idx if lo + cut <= t[j] <= hi - cut and np.isfinite(speed[j])]
+    if not cand:
+        return None
+    picks = []
+    for j in sorted(cand, key=lambda j_: speed[j_]):
+        if all(abs(t[j] - t[q]) >= 0.1 for q in picks):
+            picks.append(j)
+        if len(picks) >= n:
+            break
+    sc = float(p1.get("scale") or geo.scale)
+    size = float(p1.get("size") or p1.get("d_ref") or 10.0) / sc     # original px
+    want = {}
+    for j in picks:
+        fx, fy = geo.to_frame(int(f[j]), float(x[j]), float(y[j]))
+        want[int(nums[int(f[j])])] = (float(fx) / sc, float(fy) / sc)
+    got = {}
+    try:
+        for img, _t, num in iter_frames(path, info, first_num=min(want), last_num=max(want),
+                                        numbers=set(want)):
+            got[int(num)] = img
+    except Exception:
+        return None
+    crops, ctx = [], None
+    half = max(1.8 * size, 40.0)
+    for num, (X, Y) in want.items():
+        img = got.get(num)
+        if img is None:
+            continue
+        H, W = img.shape[:2]
+        if not (0 <= X < W and 0 <= Y < H):
+            continue
+        crops.append(identify._square_crop(img, X, Y, half))
+        if ctx is None:
+            ctx = {"context": img, "xyd": (X, Y, size)}
+    if not crops or ctx is None:
+        return None
+    return {**ctx, "crops": crops}
+
+
 def _seed_points(seed, info, times, geo):
     """A click on the ball (t, x, y) -> [(t, x, y)] in stabilized working px.
 
@@ -877,6 +959,10 @@ def _run(path: str, *, dbg: dict | None = None, preset=None,
     if clip_ok:
         clip_ok = _clip_scores([o for o in objs if o.identity is None and o.clip is None],
                                result["notes"])
+    if use_gemini and identify_mode in ("auto", "gemini"):
+        for o in objs:
+            if not (o.identity or {}).get("size_m") or identify.sized_by_kind(o.identity):
+                o.full_views = _full_views(path, info, geo, nums, o)
     _identify_rest(objs, use_gemini=use_gemini, mode=identify_mode, clip_ok=clip_ok,
                    clip_why=clip_why, notes=result["notes"])
     objs = _credible(objs, result["notes"])
@@ -934,11 +1020,16 @@ def _run(path: str, *, dbg: dict | None = None, preset=None,
             if keep:
                 keep_nums = set(int(v) for v in np.asarray(o.nums)[np.asarray(keep, int)])
 
-    # Other objects Galileo isn't sure about, and that don't fall, are noise.
+    # Other objects that don't clearly speed up on the way down aren't measuring
+    # gravity (a ball rolling across the floor, one carried in a hand), however
+    # sure Galileo is of what they are. Ones you named stay in.
     kept = [objs[0]]
     for o in objs[1:]:
         st = str(o.res["verdict"].get("stage") or "")
-        if not _sure_of(o.identity) and (st.startswith("tracking") or (o.res["fit"]["a_px"] <= 0)):
+        fit_ = o.res["fit"]
+        speeds_up = fit_["a_px"] > 3.0 * (fit_.get("a_sigma") or 0.0) and fit_["a_px"] > 0
+        if (o.identity or {}).get("source") != "you" and (st.startswith("tracking")
+                                                          or not speeds_up):
             continue
         kept.append(o)
     if len(kept) < len(objs):
@@ -1069,7 +1160,7 @@ def _assign_names(objs, presets, notes, *, size_m=None, size_rel_unc=0.01, label
         objs[0].identity = {"key": prev.get("key"), "label": prev.get("label") or label or "object",
                             "size_m": float(size_m), "rel_unc": float(size_rel_unc),
                             "vt": prev.get("vt"), "shape": prev.get("shape"), "source": "you",
-                            "confidence": 1.0, "detail": ""}
+                            "confidence": 1.0, "detail": "", "explicit_size": True}
 
 
 def _identify_rest(objs, *, use_gemini, mode, clip_ok, clip_why, notes):
@@ -1077,22 +1168,34 @@ def _identify_rest(objs, *, use_gemini, mode, clip_ok, clip_why, notes):
     mode = (mode or "auto").lower()
     for o in objs:
         mine = o.identity
-        if mine is not None and mine.get("size_m"):
+        refine = use_gemini and identify.sized_by_kind(mine)
+        if mine is not None and mine.get("size_m") and not refine:
             continue
         v = o.view or {}
-        if use_gemini and mode in ("auto", "gemini") and v.get("full") is not None:
+        fv = o.full_views
+        if use_gemini and mode in ("auto", "gemini") and (fv or v.get("full") is not None):
             try:
-                g = identify.gemini_identify(v["full"], (v["fx"], v["fy"], v["fsize"]), o.shape,
-                                             hint=(mine or {}).get("label"))
+                if fv:
+                    g = identify.gemini_identify(fv["context"], fv["xyd"], o.shape,
+                                                 hint=(mine or {}).get("label"), crops=fv["crops"])
+                else:
+                    g = identify.gemini_identify(v["full"], (v["fx"], v["fy"], v["fsize"]),
+                                                 o.shape, hint=(mine or {}).get("label"))
             except Exception as e:  # network, quota, missing key
                 notes.append(f"Gemini object ID unavailable: {e}")
                 g = None
             if g and mine:
-                # Your name, Gemini's estimate of its size.
+                # Your name, Gemini's estimate of its size (of the one in the
+                # clip, when your name only gave a typical size for its kind).
                 if g.get("size_m"):
+                    if refine and abs(math.log(g["size_m"] / mine["size_m"])) > math.log(1.3):
+                        notes.append(f"A typical {mine.get('label')} is "
+                                     f"{1000 * mine['size_m']:.0f} mm, but Gemini sizes this "
+                                     f"one at {1000 * g['size_m']:.0f} mm; used Gemini's.")
                     o.identity = {**mine, "size_m": g["size_m"], "rel_unc": g.get("rel_unc"),
                                   "vt": mine.get("vt") or g.get("vt"),
-                                  "shape": mine.get("shape") or g.get("shape"),
+                                  "shape": g.get("shape") if refine else (mine.get("shape")
+                                                                         or g.get("shape")),
                                   "detail": f"size estimated by Gemini; {g.get('detail', '')}"}
                 continue
             if g:
@@ -1357,8 +1460,9 @@ def _measure(o: _Obj, sh: dict, *, clock=None, keep_nums=None, say=None, manual_
             rd = _level_width(lev, camera, geo, rx_, ry_, tr.rest_d)
             if np.isfinite(rd):
                 samples += [rd] * 3
+    size_ruler = None
     if size_m_:
-        r = ruler_from_size(samples, size_m_, rel_, obj_label or "object")
+        r = size_ruler = ruler_from_size(samples, size_m_, rel_, obj_label or "object")
         if r:
             src = idn.get("source")
             if rigid and rigid_info:
@@ -1541,6 +1645,10 @@ def _measure(o: _Obj, sh: dict, *, clock=None, keep_nums=None, say=None, manual_
                real_time=sh.get("real_time", C.ASSUME_REAL_TIME))
     if v["stage"] == "ruler: missing" and o.n > 1:
         v["headline"] = "Can't tell: no ruler (its size isn't known)."
+    if size_ruler is not None and len(rulers) == 1 and idn.get("source") != "you":
+        # The size is a guess at what it is: does the call hang on that guess?
+        v = size_doubt(v, obj_label, size_m_, idn.get("alternatives"),
+                       p_main=idn.get("confidence") if idn.get("alternatives") else None)
 
     # ---- payload ----------------------------------------------------------------------
     k_used = v.get("k", 1.0)

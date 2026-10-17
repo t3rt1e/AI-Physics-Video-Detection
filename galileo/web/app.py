@@ -261,7 +261,7 @@ def create_app(data_dir: str = "data", *, tower_port: str | None = None,
         opts = {"object": obj, "size_mm": size_mm, "gemini": gem, "roi": roi,
                 "seed": [round(v, 4) for v in seed] if seed else None,
                 "corr": scale_corr if p.parent.name == "drops" else 1.0, "v": __version__,
-                "pipeline": 6, "hfov": hfov}
+                "pipeline": 7, "hfov": hfov}
         key = _file_key(p) + "_" + hashlib.sha1(json.dumps(opts, sort_keys=True)
                                                 .encode()).hexdigest()[:10]
         cache = data / "cache" / f"{key}.json"

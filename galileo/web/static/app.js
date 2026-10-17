@@ -370,6 +370,8 @@ class Panel {
     // Lost the ball? Point at the pick button.
     const stage = v.stage || "";
     this.pickBtn.classList.toggle("suggest", stage.startsWith("tracking") && !this.seed);
+    // No ruler, or one that hangs on what the object is? Point at the Ruler menu.
+    this.objSel.classList.toggle("suggest", stage.startsWith("ruler"));
     this.renderObjects(r);
     this.renderTests(r.tests || []);
     this.renderFacts(r);

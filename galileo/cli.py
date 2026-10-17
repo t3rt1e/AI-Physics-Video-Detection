@@ -79,9 +79,17 @@ def _objects(tokens):
     return out
 
 
+def _gemini_on(a) -> bool:
+    """--gemini / --no-gemini, else on whenever a key is set and the library is in."""
+    if a.gemini is not None:
+        return bool(a.gemini)
+    from .gemini import available
+    return available()[0]
+
+
 def _analyze_kwargs(a):
     return dict(preset=_objects(a.object), size_m=a.size_mm / 1000 if a.size_mm else None,
-                size_rel_unc=a.size_unc, use_gemini=a.gemini, use_depth=a.depth,
+                size_rel_unc=a.size_unc, use_gemini=_gemini_on(a), use_depth=a.depth,
                 tracker="sam2" if a.sam2 else "classical",
                 scale_correction=a.scale_correction, zoom=not a.no_zoom, drag_vt=a.drag_vt,
                 identify_mode=a.identify, max_objects=a.max_objects, hfov=a.hfov,
@@ -281,7 +289,7 @@ def cmd_serve(a):
     obj = a.object or ("steel-38mm" if live else "auto")   # uploads: work it out
     app = create_app(data_dir=a.data, tower_port=a.tower, fake_tower=a.fake_tower,
                      camera=a.camera, cam_size=(a.width, a.height), cam_fps=a.fps,
-                     preset=obj, use_gemini=a.gemini, calibration=a.calibration)
+                     preset=obj, use_gemini=_gemini_on(a), calibration=a.calibration)
     print(f"\nGalileo on http://localhost:{a.port}  (data in {os.path.abspath(a.data)})\n")
     uvicorn.run(app, host=a.host, port=a.port, log_level="warning")
 
@@ -390,7 +398,9 @@ def main(argv=None):
                             "(ping-pong 8.4; presets set it for you)")
         s.add_argument("--no-zoom", action="store_true",
                        help="skip the full-resolution second pass on small balls")
-        s.add_argument("--gemini", action="store_true", help="Gemini names the object and explains")
+        s.add_argument("--gemini", action=argparse.BooleanOptionalAction, default=None,
+                       help="Gemini names and sizes the object and explains the verdict (on "
+                            "by default when GEMINI_API_KEY is set; --no-gemini turns it off)")
         s.add_argument("--depth", action="store_true", help="add Depth Pro as a second ruler")
         s.add_argument("--sam2", action="store_true", help="track with SAM 2 instead")
         s.add_argument("--scale-correction", type=float, default=1.0)
@@ -455,7 +465,8 @@ def main(argv=None):
                    help="what the page assumes is falling until you pick something else: "
                         "'auto' lets Galileo work it out (the default; steel-38mm when a "
                         "tower or webcam is attached)")
-    s.add_argument("--gemini", action="store_true")
+    s.add_argument("--gemini", action=argparse.BooleanOptionalAction, default=None,
+                   help="on by default when GEMINI_API_KEY is set")
     s.add_argument("--calibration", help="JSON from 'calibrate --save' to apply to live drops")
     s.set_defaults(func=cmd_serve)
 
