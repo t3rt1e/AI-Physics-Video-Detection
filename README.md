@@ -1,6 +1,6 @@
 # Galileo
 
-Catch AI-generated video by measuring physics instead of asking another model.
+Goal : Catch AI-generated video by measuring physics instead of asking another model.
 Real things fall at 9.8 m/s² and every clock in a real scene agrees; generated
 video usually doesn't.
 
