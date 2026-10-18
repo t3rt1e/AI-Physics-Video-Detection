@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NØVEX</title>
+<link rel="icon" type="image/svg+xml" href="/static/logo.svg">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="masthead">
+  <div class="brand">
+    <h1><img class="mark" src="/static/logo.svg" alt="" width="52" height="52">NØVEX</h1>
+    <p class="tagline">Measuring beats asking. Real things fall at 9.8&nbsp;m/s², and generated video usually doesn't.</p>
+  </div>
+  <ul class="status" id="status" aria-live="polite"></ul>
+</header>
+
+<section class="tower" id="tower" hidden aria-labelledby="tower-title">
+  <div class="tower-head">
+    <h2 id="tower-title">NØVEX Tower</h2>
+    <p class="tower-state" id="tower-state" aria-live="polite">Waiting for the button.</p>
+    <button class="btn" id="sim-drop" hidden>Drop the ball</button>
+    <label class="follow"><input type="checkbox" id="follow" checked> Show each drop on the left</label>
+  </div>
+  <div class="tower-readout">
+    <div class="readout">
+      <span class="readout-label">Tower sensors</span>
+      <span class="readout-value" id="tower-g">–</span>
+    </div>
+    <div class="readout">
+      <span class="readout-label">Video</span>
+      <span class="readout-value" id="video-g">–</span>
+    </div>
+    <p class="agree" id="tower-agree"></p>
+  </div>
+  <ol class="drops" id="drops" reversed></ol>
+</section>
+
+<main class="bench">
+  <article class="panel" id="panel-a" aria-label="Left clip"></article>
+  <article class="panel" id="panel-b" aria-label="Right clip"></article>
+</main>
+
+<footer class="colophon">
+  <p>NØVEX measures acceleration with g = s × a<sub>px</sub> × k²: meters per pixel from the object's own size,
+  pixels per second² from the fitted fall, and k from the clip's clocks (timestamps, repeated frames, interpolation).
+  Rehearsal clips made with <code>novex synth</code> are labeled synthetic.</p>
+</footer>
+
+<template id="panel-tpl">
+  <div class="panel-controls">
+    <label class="field field-clip">
+      <span>Clip</span>
+      <select class="clip-select"></select>
+    </label>
+    <label class="field">
+      <span>Ruler</span>
+      <select class="object-select"></select>
+    </label>
+    <label class="btn btn-quiet upload">
+      <input type="file" accept="video/*,.mov,.mp4" class="visually-hidden">
+      Upload
+    </label>
+    <button class="btn analyze" type="button">Measure</button>
+    <button class="btn btn-quiet pick" type="button" aria-pressed="false"
+            title="Click the ball in the video so NØVEX follows it">Pick the ball</button>
+    <button class="btn btn-quiet pick-clear" type="button" hidden>Clear pick</button>
+  </div>
+  <p class="clip-note" hidden></p>
+  <p class="pick-hint" role="status" hidden>Pause on a frame where the ball is in the air, then click the ball. Press Esc to cancel.</p>
+  <div class="video-wrap">
+    <video class="video" controls muted playsinline loop preload="auto"></video>
+    <canvas class="overlay" aria-hidden="true"></canvas>
+    <div class="pick-layer" hidden></div>
+    <div class="busy" hidden><span class="busy-text">Measuring…</span></div>
+  </div>
+  <p class="overlay-key" hidden>
+    <span class="key key-clip"></span> tracked ball
+    <span class="key key-earth"></span> where Earth's gravity would have it
+    <span class="key-more" hidden><span class="key key-other"></span> other falling objects, numbered</span>
+  </p>
+  <p class="message" role="status" hidden></p>
+  <div class="result" hidden>
+    <div class="headline-row">
+      <p class="g-value"><span class="g-num"></span> <span class="g-unit">m/s²</span></p>
+      <p class="verdict"><span class="verdict-icon" aria-hidden="true"></span><span class="verdict-word"></span></p>
+    </div>
+    <p class="headline"></p>
+    <p class="explanation" hidden></p>
+    <div class="evidence">
+      <figure class="plate">
+        <canvas class="plate-canvas" role="img"></canvas>
+        <figcaption class="plate-caption"></figcaption>
+      </figure>
+      <div class="evidence-text">
+        <ul class="reasons"></ul>
+        <figure class="chart">
+          <figcaption class="chart-title">Distance fallen against time</figcaption>
+          <div class="legend"></div>
+          <div class="chart-box">
+            <canvas class="chart-canvas" role="img"></canvas>
+            <div class="tooltip" hidden></div>
+          </div>
+        </figure>
+      </div>
+    </div>
+    <table class="objects" hidden>
+      <caption>Falling objects</caption>
+      <thead><tr><th scope="col">#</th><th scope="col">Object</th><th scope="col">g (m/s²)</th><th scope="col">Result</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <table class="tests">
+      <caption>Checks that slow motion and scale can't fool</caption>
+      <thead><tr><th scope="col">Check</th><th scope="col">Result</th><th scope="col">What NØVEX saw</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <details class="more">
+      <summary>Measurement details</summary>
+      <dl class="facts"></dl>
+      <details class="points-wrap">
+        <summary>Tracked points</summary>
+        <table class="points"><thead><tr><th scope="col">Time (s)</th><th scope="col">Fallen (m)</th><th scope="col">Flight</th></tr></thead><tbody></tbody></table>
+      </details>
+    </details>
+  </div>
+</template>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

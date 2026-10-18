@@ -1,4 +1,4 @@
-# Galileo
+# NØVEX
 
 Goal : Catch AI-generated video by measuring physics instead of asking another model.
 Real things fall at 9.8 m/s² and every clock in a real scene agrees; generated
@@ -20,32 +20,32 @@ python -m venv .venv
 # Windows: .venv\Scripts\activate     macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 
-python -m galileo synth                 # rehearsal clips with known physics (about a minute)
-python -m galileo serve --fake-tower    # open http://localhost:8000
+python -m novex synth                   # rehearsal clips with known physics (about a minute)
+python -m novex serve --fake-tower      # open http://localhost:8000
 ```
 
 Press **Drop the ball** for a simulated tower drop, or pick clips on either side and
 press **Measure**. One clip on the command line:
 
 ```bash
-python -m galileo analyze data/clips/synthetic_ai_floaty_24fps.mp4 --object steel-38mm
+python -m novex analyze data/clips/synthetic_ai_floaty_24fps.mp4 --object steel-38mm
 ```
 
 ## Measuring your own clips
 
 ```bash
-python -m galileo analyze my_drop.mp4 --object ping-pong      # or --size-mm 40 for any ball
-python -m galileo analyze my_drop.mp4 --object ping-pong --debug-video
-python -m galileo analyze my_drop.mp4 --object ping-pong --seed "1.25,0.48,0.33"
-python -m galileo analyze two_drops.mp4 --object volleyball tennis   # one name per object
-python -m galileo analyze phone_drop.mp4 --object phone              # not a ball: fine
-python -m galileo analyze dinner.mp4 --object "rotisserie chicken=22cm"   # anything, with its size
-python -m galileo analyze mystery.mp4                                # let Galileo name it (Gemini or CLIP)
-python -m galileo serve                                              # web page: upload a clip, nothing else to set
-python -m galileo batch path/to/real_clips --object ping-pong --expect real --csv real.csv
+python -m novex analyze my_drop.mp4 --object ping-pong        # or --size-mm 40 for any ball
+python -m novex analyze my_drop.mp4 --object ping-pong --debug-video
+python -m novex analyze my_drop.mp4 --object ping-pong --seed "1.25,0.48,0.33"
+python -m novex analyze two_drops.mp4 --object volleyball tennis     # one name per object
+python -m novex analyze phone_drop.mp4 --object phone                # not a ball: fine
+python -m novex analyze dinner.mp4 --object "rotisserie chicken=22cm"     # anything, with its size
+python -m novex analyze mystery.mp4                                  # let NØVEX name it (Gemini or CLIP)
+python -m novex serve                                                # web page: upload a clip, nothing else to set
+python -m novex batch path/to/real_clips --object ping-pong --expect real --csv real.csv
 ```
 
-- **See what Galileo saw.** `--debug-video` writes `my_drop_debug.mp4` next to the clip
+- **See what NØVEX saw.** `--debug-video` writes `my_drop_debug.mp4` next to the clip
   (or give it a path). Every frame shows the blobs it considered (grey rings), other
   moving things with their scores, the tracked ball (one colour per flight, grey where a
   frame was left out of the fit), the fitted path, the velocity (white arrow) and
@@ -58,7 +58,7 @@ python -m galileo batch path/to/real_clips --object ping-pong --expect real --cs
 
 - **Name the ball.** `--object` is the ruler (its real size). For light balls it also
   turns on the air-drag correction: a ping-pong ball dropped from a meter falls 5 to 20%
-  slower than gravity alone would make it, and Galileo puts that back. `--size-mm` gives
+  slower than gravity alone would make it, and NØVEX puts that back. `--size-mm` gives
   the size but not the drag, so prefer the preset when there is one (or add
   `--drag-vt 8.4`, the ball's top speed in m/s).
 - **Point at the ball when it tracks the wrong thing.** `--seed T,X,Y` is a time in
@@ -72,11 +72,11 @@ python -m galileo batch path/to/real_clips --object ping-pong --expect real --cs
   `--json-dir` keeps every full result.
 - **Small balls get a second look.** High-frame-rate clips are scaled down to fit in
   memory, which can leave a ping-pong ball 5 to 8 px wide. When the ball comes out
-  smaller than about 40 px, Galileo decodes just the patch and stretch of time where it
+  smaller than about 40 px, NØVEX decodes just the patch and stretch of time where it
   flew at up to full resolution and measures it again (`--no-zoom` turns this off).
 
 - **Throws are fine.** A throw adds speed, not acceleration: the ball is in free fall the
-  moment it leaves the hand. Galileo cuts the frames where the hand is still pushing (it
+  moment it leaves the hand. NØVEX cuts the frames where the hand is still pushing (it
   spots them by their acceleration, far from gravity's). If the ball was already moving
   fast when first seen and it bounces, the flights after the first bounce measure g and
   the throw is shown (dashed in the debug video) but not counted: a hard throw is short,
@@ -92,7 +92,7 @@ phone held sideways, tilting or panning to follow the ball, walking closer, zoom
 
 - **Tipped up or down.** A camera looking 35° down at a drop sees only cos 35° = 82% of
   the fall in the picture; the rest is the ball moving away and shrinking. The old
-  assumption (a level camera) would call that 8 m/s² and say "AI". Galileo reads how the
+  assumption (a level camera) would call that 8 m/s² and say "AI". NØVEX reads how the
   camera is tipped from the room: door frames, wall corners and shelf uprights are
   vertical, and the faster they lean together in the picture, the steeper the camera
   looks down (or up). It needs three uprights spread across the picture, or two long ones
@@ -109,10 +109,10 @@ phone held sideways, tilting or panning to follow the ball, walking closer, zoom
   perspective to matter is matched with a full homography, and the frames are laid onto a
   canvas big enough to hold the whole motion, centred on its middle; each frame's outline
   is kept so a ball cut off by the edge of the picture isn't measured. Someone walking
-  right past a still camera no longer reads as camera motion (Galileo goes back to its
+  right past a still camera no longer reads as camera motion (NØVEX goes back to its
   first keyframe as soon as the room is in view again).
 - **The lens.** How steeply the camera looks only matters through the focal length: a wrong
-  one changes g by about (its error) × sin²(tilt). Galileo reads it from the file when it
+  one changes g by about (its error) × sin²(tilt). NØVEX reads it from the file when it
   can, from the room when it sees both uprights and the horizon (floor seams running
   away), and otherwise assumes a phone's main camera with ±30%. That makes a 35° view about
   ±10%; `--hfov 70` (the field of view across the long side, if you know it) brings it to
@@ -130,20 +130,20 @@ phone held sideways, tilting or panning to follow the ball, walking closer, zoom
   verdict, and "Equal falls" compares them in m/s² (each through its own ruler, so
   distance from the camera doesn't matter). Edges, arms and shadows that a moving camera
   or a person turn into tracks are left out: a shadow is the backdrop with every colour
-  channel dimmed by the same factor, and anything Galileo can't name has to look like a
+  channel dimmed by the same factor, and anything NØVEX can't name has to look like a
   compact object with a good long fall.
 - **Name anything, in any order.** `--object volleyball tennis` gives one name per object.
   A name can be anything: a few hundred everyday objects are known with their typical
-  size and air drag (`galileo/catalog.py`: balls, fruit, food, kitchen and office
+  size and air drag (`novex/catalog.py`: balls, fruit, food, kitchen and office
   things, toys, tools; "rotisserie chicken" is 22 cm ±20%), and anything else works with
   its size: `"grandma's vase=31cm"` (mm, cm, m, in or ft; a ball's diameter, or the
   longest side of anything else). A size you measure beats a typical one: ±2% instead
-  of ±20%. Galileo matches names to objects by how they look (CLIP reads any words, not
+  of ±20%. NØVEX matches names to objects by how they look (CLIP reads any words, not
   just its list) or, without CLIP, by size (the bigger object gets the bigger name).
-  `auto` in the list leaves one to Galileo. The object you name first is the main one
+  `auto` in the list leaves one to NØVEX. The object you name first is the main one
   unless you `--seed` another. In the web app, "Something else" in the ruler menu does
   the same.
-- **Or let Galileo name them.** With nothing named, Gemini (on whenever `GEMINI_API_KEY`
+- **Or let NØVEX name them.** With nothing named, Gemini (on whenever `GEMINI_API_KEY`
   is set; `--no-gemini` turns it off) or CLIP names each object. Gemini is shown the
   frame and full-resolution close-ups of the object at the moments it moved least (the
   sharpest, and from several sides as it turns), not the working picture, where a small
@@ -153,7 +153,7 @@ phone held sideways, tilting or panning to follow the ball, walking closer, zoom
   ball: the same pickleball came back as a pickleball, a tennis ball or a practice golf
   ball depending on the call, each time "85 to 98% sure". When look-alikes of another
   size together have a fair chance (20%) of flipping the call, the verdict hangs on what
-  the object is, so Galileo says so instead of guessing: "Can't tell: it depends on what
+  the object is, so NØVEX says so instead of guessing: "Can't tell: it depends on what
   the object is (pickleball or plastic practice golf ball)", with the g each would give,
   and asks you to name it. Look-alikes of about the same size (a pickleball and a wiffle
   ball) don't matter, and nor does any size when the physics itself breaks. CLIP is a pretrained image classifier that reads text, so it picks from the
@@ -177,8 +177,8 @@ phone held sideways, tilting or panning to follow the ball, walking closer, zoom
   best next to a size.
 - **Things air drag rules.** A feather, a balloon, a sheet of paper, a beach ball reach
   their top speed almost at once and drift down. That is what the real ones do, so for
-  those Galileo says it can't tell instead of calling a slow fall fake.
-- **Not round is fine, and nothing about the shape needs to be known.** Galileo tells a
+  those NØVEX says it can't tell instead of calling a slow fall fake.
+- **Not round is fine, and nothing about the shape needs to be known.** NØVEX tells a
   ball from anything else by its outline on the sharpest frames (roundness, length
   against width) and whether its width flickers as it turns. To find the centre of
   gravity of anything else it uses two things:
@@ -188,7 +188,7 @@ phone held sideways, tilting or panning to follow the ball, walking closer, zoom
     chicken it lands much nearer the real centre of mass than the outline's plain centre.
   - *The motion.* In free fall only the centre of mass moves on a parabola; the body
     turns about it. So whatever the outline's centre does in step with the turning is the
-    gap between the two, and Galileo takes it out. It reads the turning from the outline's
+    gap between the two, and NØVEX takes it out. It reads the turning from the outline's
     long axis (steady for something spinning in the picture's plane, uneven for a
     tumble toward the camera), or, for a lumpy roundish outline with no clear axis, from
     the rhythm of its area and stretch. This finds a hammer's centre of mass near its
@@ -211,11 +211,11 @@ in the CSV):
 | `tracking: too few frames or jitter` | Too short or too shaky a track | Film closer, steadier, with more of the fall in view |
 | `measurement: too uncertain` | The error bar is too wide to call | Bigger ball in the frame, longer fall, better light, or give the object's measured size |
 | `physics: air drag rules` | A feather, balloon or sheet of paper: drag, not gravity, sets its fall | Drop something heavier and more compact |
-| `ruler: missing` | No size given, and Galileo couldn't name it | Add `--object` or `--size-mm` |
+| `ruler: missing` | No size given, and NØVEX couldn't name it | Add `--object` or `--size-mm` |
 
 ## Does anything need training?
 
-**No.** Nothing in Galileo is trained, on your laptop or anywhere else.
+**No.** Nothing in NØVEX is trained, on your laptop or anywhere else.
 
 - **The measurement is physics.** Background subtraction finds the ball, a weighted
   least-squares parabola gives its acceleration, and the clocks are pattern checks on
@@ -243,7 +243,7 @@ in the CSV):
 | --- | --- | --- |
 | Live drop | `serve --tower COM5 --camera 0` (or `--fake-tower` to rehearse) | Button, then TOWER g and VIDEO g side by side within seconds |
 | AI twin | `twin --image tower.jpg`, then pick it on the right | Same tower, wrong gravity, strobe view with the ball lagging Earth's rings |
-| Slow-motion trap | Pick the 240 fps phone clip (`--slowmo` on the command line) | "As played: 0.15 m/s²", Galileo reads the 240 fps clock and reports 9.8 |
+| Slow-motion trap | Pick the 240 fps phone clip (`--slowmo` on the command line) | "As played: 0.15 m/s²", NØVEX reads the 240 fps clock and reports 9.8 |
 | In the wild | Upload any clip of something falling, pick the object as the ruler | Verdict with reasons and error bars |
 
 The left panel follows live drops automatically. Each result shows:
@@ -261,16 +261,16 @@ The left panel follows live drops automatically. Each result shows:
 By default every clip is taken as playing at the speed it was filmed: no slow motion,
 no speed-up. Then g inside Earth's interval (shown with every result, e.g. "counts as real
 between 8.3 and 11.3 m/s²") is real, and outside it, too slow or too fast, is AI. To let
-Galileo read the file's clocks and allow real slow motion (and sped-up footage), pass
+NØVEX read the file's clocks and allow real slow motion (and sped-up footage), pass
 `--slowmo` (or set `ASSUME_REAL_TIME = False` in `config.py`). Then use the original
 file from the phone so its clock survives:
 
 - **iPhone:** AirDrop with Options, All Photos Data on, or export the unmodified original.
-  The 240 fps timestamps let Galileo read real time directly.
-- **Android:** the file keeps a `com.android.capture.fps` tag; Galileo reads it.
+  The 240 fps timestamps let NØVEX read real time directly.
+- **Android:** the file keeps a `com.android.capture.fps` tag; NØVEX reads it.
 - A slow-mo re-rendered to 30 fps with all tags stripped is still caught if it repeats
   frames or interpolates them. If it has neither, physics alone can't tell it from AI,
-  and Galileo says so in the reasons.
+  and NØVEX says so in the reasons.
 
 ## Hooking up the tower
 
@@ -283,9 +283,9 @@ LAPTOP -> TOWER  VIDEOG,id,g,sigma,verdict   SHOW,text
 ```
 
 ```bash
-python -m galileo ports                        # find the Pico, e.g. COM5 or /dev/ttyACM0
-python -m galileo monitor --port COM5          # watch raw lines while wiring
-python -m galileo serve --tower COM5 --camera 0
+python -m novex ports                          # find the Pico, e.g. COM5 or /dev/ttyACM0
+python -m novex monitor --port COM5            # watch raw lines while wiring
+python -m novex serve --tower COM5 --camera 0
 ```
 
 On ARM the laptop starts recording the webcam; 1.4 s after REL it cuts the window
@@ -312,9 +312,9 @@ its CONFIG block first.
 After 15 to 20 real tower drops:
 
 ```bash
-python -m galileo calibrate                       # prints the spread for the pitch
-python -m galileo calibrate --save data/calibration.json
-python -m galileo serve --tower COM5 --camera 0 --calibration data/calibration.json
+python -m novex calibrate                         # prints the spread for the pitch
+python -m novex calibrate --save data/calibration.json
+python -m novex serve --tower COM5 --camera 0 --calibration data/calibration.json
 ```
 
 The correction is only applied to tower clips, and the page says when it is on.
@@ -324,8 +324,8 @@ The correction is only applied to tower clips, and the page says when it is on.
 ```bash
 pip install -r requirements-ml.txt        # or just: pip install google-genai
 set GEMINI_API_KEY=...                    # PowerShell: $env:GEMINI_API_KEY="..."  macOS/Linux: export
-python -m galileo twin --image tower.jpg --out data/clips/ai_twin_veo.mp4
-python -m galileo serve --fake-tower
+python -m novex twin --image tower.jpg --out data/clips/ai_twin_veo.mp4
+python -m novex serve --fake-tower
 ```
 
 With a key set, Gemini is on by default (`--no-gemini` turns it off). It names unknown
@@ -333,16 +333,16 @@ objects so their typical size can be the ruler, sizes the one in the clip when a
 only gives a typical size, and writes a two-sentence explanation of each verdict.
 
 A free key gets about 20 requests a day per model. Naming an object costs two requests
-(`GALILEO_GEMINI_SAMPLES=1` makes it one, at the cost of the cross-check) and the
+(`NOVEX_GEMINI_SAMPLES=1` makes it one, at the cost of the cross-check) and the
 explanation one, so a clip with one object costs three. Naming walks the Flash models
 (`gemini-flash-latest`, then 3.7, 3.6, 3.5 and 3 Flash) and then the Flash-Lite ones; the
 explanation starts with Flash-Lite, to leave the Flash quota for naming. A model that is
 busy (503), out of quota (429) or retired (404) is skipped and left alone for a while.
 When none answers, CLIP names the object and the run goes on. Answers are cached in
-`~/.galileo_cache`, so a clip that ran once costs nothing again, and demo clips keep
+`~/.novex_cache`, so a clip that ran once costs nothing again, and demo clips keep
 working if the venue Wi-Fi drops: run your demo clips once beforehand.
-Model names change often: override with `GALILEO_GEMINI_MODEL` (default
-`gemini-flash-latest`) and `GALILEO_VEO_MODEL` (default `veo-3.1-generate-preview`).
+Model names change often: override with `NOVEX_GEMINI_MODEL` (default
+`gemini-flash-latest`) and `NOVEX_VEO_MODEL` (default `veo-3.1-generate-preview`).
 Veo clips are 24 fps and 4, 6 or 8 s long, and stay downloadable for 2 days.
 
 ## How it works
@@ -405,7 +405,7 @@ Veo clips are 24 fps and 4, 6 or 8 s long, and stay downloadable for 2 days.
    helps; uncorrected, a 60 fps webcam can read 5 to 10% high. This runs in the level
    view, so gravity points down the picture; the rolling-shutter term still uses each
    point's row on the sensor as filmed.
-7. **Air drag**: for light balls Galileo works out, from the measured speed, how far drag
+7. **Air drag**: for light balls NØVEX works out, from the measured speed, how far drag
    pushed the ball off a vacuum path at every frame, takes that out of the positions and
    fits again. The parabola and the rolling-shutter term then see pure gravity instead of
    bending to absorb drag. Rising and falling hops barely need it; a long first drop
@@ -473,7 +473,7 @@ Veo clips are 24 fps and 4, 6 or 8 s long, and stay downloadable for 2 days.
    is wider than ±35% the answer is "too uncertain" unless g is far off anyway. With
    `--slowmo`, a clock that explains a low g makes it real slow motion, and too fast
    can't be called (the footage may be sped up). With several objects, the main one decides; another stands in when the main
-   one can't be measured and Galileo knows what the other one is, and the rest add their
+   one can't be measured and NØVEX knows what the other one is, and the rest add their
    numbers to the reasons (lowering the confidence when they disagree). One check
    failing on its own, with nothing gross about it, doesn't make a clip AI: real footage
    trips one law now and then through a slip in measuring, while a generated clip tends
@@ -482,7 +482,7 @@ Veo clips are 24 fps and 4, 6 or 8 s long, and stay downloadable for 2 days.
    So a lone ordinary failure is weighed as a warning: gravity and the other checks
    decide, the confidence is capped at 60%, and the reasons say so. Other objects
    that don't clearly speed up on the way down (a ball rolling across the floor, one
-   carried in a hand) are dropped however sure Galileo is of what they are, unless you
+   carried in a hand) are dropped however sure NØVEX is of what they are, unless you
    named them. When the ruler is Gemini's guess and a look-alike of another size would
    flip the call, the answer is "it depends on what the object is" (see naming above).
 
@@ -505,7 +505,7 @@ check them before the tower is up.
 ## Project layout
 
 ```
-galileo/
+novex/
   analyze.py     the pipeline, video in, verdict out
   physics.py     fits, flights, rolling shutter          (David)
   checks.py      scale-free tests                        (David)

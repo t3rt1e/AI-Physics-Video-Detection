@@ -1,8 +1,8 @@
-# Galileo Tower: reference firmware for a Raspberry Pi Pico (MicroPython).
+# Novex Tower: reference firmware for a Raspberry Pi Pico (MicroPython).
 #
 # NOT YET RUN ON HARDWARE. Pin numbers are placeholders: wire, then edit the
 # CONFIG block. It speaks the serial contract from the game plan, so the
-# laptop side (python -m galileo serve --tower PORT) works unchanged.
+# laptop side (python -m novex serve --tower PORT) works unchanged.
 #
 #   TOWER -> LAPTOP  ARM,id  REL,id,t_us  GATE,id,k,h_mm,t_us  TOWERG,id,g,sigma  BOUNCE,id,n,t_us
 #   LAPTOP -> TOWER  VIDEOG,id,g,sigma,verdict   SHOW,text
@@ -235,7 +235,7 @@ def run_drop():
 
 
 def main():
-    show_text("GALILEO")
+    show_text("NOVEX")
     magnet.value(1)
     on_since = time.ticks_ms()
     while True:
