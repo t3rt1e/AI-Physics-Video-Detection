@@ -204,15 +204,35 @@ class JobPage {
     if (d.frames && !this.frames) { this.frames = d.frames; }
     if (!this.rendered && (j.status === "done" || j.preview)) { this.render(); }
     else if (this.rendered) { this.update(); }
-    else { view.innerHTML = this.working(j); }
+    else {
+      const card = $(".workcard", view);
+      if (!card) { view.innerHTML = this.working(j); }
+      else {
+        const heading = $("h2", card), filename = String(j.filename ?? "");
+        if (heading.textContent !== filename) heading.textContent = filename;
+        this.updateSteps(j, card);
+      }
+    }
     if (j.status !== "done") this.timer = setTimeout(() => this.poll(), 1200);
   }
-  stepsHtml(j) {
+  stepIndex(j) {
     const st = (j.stage || "").toLowerCase();
-    let k = /read/.test(st) ? 0 : /prepar/.test(st) ? 1 : /debug|draw/.test(st) ? 3 : 2;
-    if (j.status === "queued") k = 0;
+    return j.status === "queued" || /read/.test(st) ? 0 : /prepar/.test(st) ? 1 : /debug|draw/.test(st) ? 3 : 2;
+  }
+  stepsHtml(j) {
+    const k = this.stepIndex(j);
     const L = ["Reading the video", "Preparing frames for playback", "Measuring the fall", "Drawing the debug video"];
     return `<ol class="steps" role="status">${L.map((l, i) => `<li class="${i < k ? "done" : i === k ? "now" : ""}">${l}</li>`).join("")}</ol>`;
+  }
+  updateSteps(j, container) {
+    const steps = $(".steps", container);
+    if (!steps) { container.innerHTML = this.stepsHtml(j); return; }
+    // Keep the same nodes and animation timeline between status polls.
+    const k = this.stepIndex(j);
+    [...steps.children].forEach((step, i) => {
+      const state = i < k ? "done" : i === k ? "now" : "";
+      if (step.className !== state) step.className = state;
+    });
   }
   working(j) {
     return `<div class="card workcard"><h2>${esc(j.filename)}</h2>${this.stepsHtml(j)}<p class="hint">You can leave this page and find the result in History.</p></div>`;
@@ -283,7 +303,10 @@ class JobPage {
     const j = this.data.job, r = this.data.result;
     if (this.frames && !this.videosReady) this.setupVideos();
     const w = $("#working");
-    if (w) { w.hidden = j.status === "done"; $("#working-t").innerHTML = this.stepsHtml(j); }
+    if (w) {
+      w.hidden = j.status === "done";
+      if (!w.hidden) this.updateSteps(j, $("#working-t"));
+    }
     if (j.status === "done" && r && !this.done) {
       this.done = true;
       this.frames = this.data.frames;
