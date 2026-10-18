@@ -286,7 +286,11 @@ def create_app(data_dir: str = "site_data") -> FastAPI:
                                 "object": meta.get("object")})
         return clean({"version": __version__, "g_ref": C.G_EARTH, "presets": presets,
                       "auto": {"available": c_ok or g_ok, "clip": c_ok, "gemini": g_ok,
-                               "detail": c_why if not (c_ok or g_ok) else None},
+                               "preferred": "gemini" if g_ok else "clip" if c_ok else None,
+                               "fallback": "clip" if g_ok and c_ok else None,
+                               "gemini_detail": None if g_ok else g_why,
+                               "clip_detail": None if c_ok else c_why,
+                               "detail": f"Gemini: {g_why}. CLIP: {c_why}." if not (c_ok or g_ok) else None},
                       "samples": samples})
 
     @app.get("/api/jobs")
