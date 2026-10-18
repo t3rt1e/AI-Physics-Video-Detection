@@ -1192,3 +1192,46 @@ def test_a_hand_toss_above_the_floor_is_not_a_bounce():
     r = checks.bounce_check(t, jf, 1 / 240, diam_px=40.0)
     assert r["status"] == "pass"
     assert [b["off_floor"] for b in r["detail"]["bounces"]] == [False, True]
+
+
+def test_a_landing_without_a_bounce_ends_the_flight():
+    # A can thrown in an arc lands and skids toward the camera instead of
+    # bouncing: its fall stops dead without ever turning upward. The flight
+    # ends at the landing, and the slide, longer and smoother than the flight
+    # and with a tiny but "clear" acceleration, is no free flight to measure.
+    rng = np.random.default_rng(6)
+    fps = 240.0
+    t = np.arange(0, 1.5, 1 / fps)
+    t_land, v0 = 0.6, -400.0                            # thrown upward, px/s
+    y_land = 100 + v0 * t_land + 0.5 * A_TRUE * t_land ** 2
+    s = t - t_land
+    y = np.where(t < t_land, 100 + v0 * t + 0.5 * A_TRUE * t ** 2,
+                 y_land + 200.0 * s + 0.5 * 20.0 * s ** 2)
+    x = 700 - 400 * t + rng.normal(0, 0.3, len(t))
+    y = y + rng.normal(0, 0.3, len(t))
+    fl = split_flights(t, x, y, diam_px=30.0)
+    assert t[fl[0][-1]] == pytest.approx(t_land, abs=0.02)
+    jf = fit_flights(t, x, y, np.ones(len(t)), fl, fps=fps, n_px_axis=720)
+    assert t[jf.flights[jf.main].idx[-1]] < t_land + 0.02
+    assert jf.a_px == pytest.approx(A_TRUE, rel=0.02)
+
+
+def test_a_tube_that_breaks_into_pieces_is_still_one_object():
+    # A white tube on a beige wall breaks into pieces where its colour matches
+    # the wall: the track of its top piece ends a frame after the track of its
+    # bottom piece begins, half a tube away. That is one tube, not two.
+    from novex.track import Det, Track, _same_object
+    times = np.arange(60) / 240.0
+
+    def piece(frames, y0, dy):
+        return Track(dets=[Det(f=i, x=400.0 - 2 * i, y=y0 + dy * i, d=26, area=900, elong=3.4,
+                               contrast=40) for i in frames], kind="moving")
+    top = piece(range(0, 31), 140.0, 1.0)
+    bottom = piece(range(30, 60), 190.0, 1.0)            # 50 px below it at frames 30-31
+    assert _same_object(top, bottom, times) and _same_object(bottom, top, times)
+    # Two balls whose paths meet for a frame, far apart for their size, are two.
+    ball = Track(dets=[Det(f=i, x=200.0, y=bottom.dets[i - 30].y, d=26, area=530, elong=1.0,
+                           contrast=40) for i in range(30, 60)], kind="moving")
+    ball_top = Track(dets=[Det(f=i, x=260.0, y=100.0 + i, d=26, area=530, elong=1.0, contrast=40)
+                           for i in range(0, 31)], kind="moving")
+    assert not _same_object(ball_top, ball, times)

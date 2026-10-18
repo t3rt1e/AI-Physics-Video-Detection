@@ -866,6 +866,12 @@ def refine_widths(frames, bg, tr: Track, times, max_n: int = 40) -> np.ndarray:
     return out
 
 
+def _length(tr: Track) -> float:
+    """A track's typical size along its longest side, px (its width for a ball)."""
+    v = [q.d * max(float(q.elong), 1.0) for q in tr.dets if np.isfinite(q.d)]
+    return float(np.median(v)) if v else 4.0
+
+
 def _same_object(a: Track, b: Track, times) -> bool:
     """Is b a piece of a (a panel, a highlight) or the rest of a's own path
     after a dropout, rather than a second object?"""
@@ -873,14 +879,23 @@ def _same_object(a: Track, b: Track, times) -> bool:
     db = max(float(np.nanmedian(b.d)) if np.isfinite(b.d).any() else 4.0, 2.0)
     ia = {int(f): j for j, f in enumerate(a.f)}
     common = [int(f) for f in b.f if int(f) in ia]
-    if len(common) >= 3:
+    if common:
         ib = {int(f): j for j, f in enumerate(b.f)}
         sep = np.array([np.hypot(a.x[ia[f]] - b.x[ib[f]], a.y[ia[f]] - b.y[ib[f]])
                         for f in common])
         # Overlapping pieces that move as one. Two balls dropped side by side
         # also move together, but they sit more than a ball apart.
-        return bool(np.median(sep) < 0.6 * (da + db) and np.ptp(sep) < 0.6 * max(da, db))
-    if len(common) > 0:
+        if (len(common) >= 3 and np.median(sep) < 0.6 * (da + db)
+                and np.ptp(sep) < 0.6 * max(da, db)):
+            return True
+        # A hand-off: a pale or long object (a white tube on a beige wall)
+        # breaks into pieces where it passes something its own colour, and
+        # one piece's track takes over from another's within a few frames,
+        # less than the object's length away.
+        first, second = (a, b) if a.f[0] <= b.f[0] else (b, a)
+        if (len(common) <= 3 and int(first.f[-1]) - int(second.f[0]) <= 3
+                and int(first.f[-1]) < int(second.f[-1])):
+            return bool(np.max(sep) < 0.75 * max(_length(a), _length(b)))
         return False
     # No shared frames: is b where a would be, a moment later (or earlier)?
     first, second = (a, b) if a.f[-1] < b.f[0] else (b, a)

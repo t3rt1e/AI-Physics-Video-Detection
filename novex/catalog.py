@@ -233,6 +233,10 @@ _ROWS = [
     ("keys", "bunch of keys", 0.10, 0.30, 20, X, "a bunch of keys on a ring"),
     ("paint-can", "paint can", 0.19, 0.10, 50, X, "a metal paint can"),
     ("spray-can", "spray can", 0.20, 0.10, 40, X, "an aerosol spray can"),
+    ("pickleball-can", "pickleball can", 0.23, 0.12, 40, X,
+     "a tall plastic tube of pickleballs with a colored cap"),
+    ("tennis-ball-can", "tennis ball can", 0.21, 0.12, 40, X,
+     "a tube-shaped can of tennis balls with a plastic lid"),
     ("tire", "car tire", 0.65, 0.15, 40, R, "a black car tire"),
     # ---- around the house -----------------------------------------------------------
     ("pillow", "pillow", 0.65, 0.15, 4, X, "a bed pillow"),

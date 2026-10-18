@@ -258,7 +258,14 @@ def split_flights(t, x, y, gdir=(0.0, 1.0), *, min_pts=5, max_gap_s=0.2,
                 fast = float(np.max(v[-3:])) >= 0.3 * float(np.max(v))
             if low and fast:
                 keep.append(b)
-        bounces = keep
+        # A landing that doesn't bounce (a can or a phone hits the floor and
+        # skids, a hand catches it) never turns upward, but the fall stops at
+        # once. Free flight only ever speeds a fall up, so a downward speed
+        # that collapses within ~30 ms and stays down is a contact too.
+        for s in _stops(uu, t[idx], step, eps):
+            if all(abs(s - b) > 2 * step for b in keep):
+                keep.append(s)
+        bounces = sorted(keep)
         cuts = [0] + bounces + [len(idx) - 1]
         for j in range(len(cuts) - 1):
             a, b = cuts[j], cuts[j + 1]
@@ -270,6 +277,51 @@ def split_flights(t, x, y, gdir=(0.0, 1.0), *, min_pts=5, max_gap_s=0.2,
             if len(seg) >= min_pts:
                 flights.append(seg)
     return flights
+
+
+def _stops(uu: np.ndarray, tt: np.ndarray, step: int, eps: float) -> list[int]:
+    """Where a fall stops dead: positions in uu (along gravity) of contacts
+    that don't rebound. The downward speed coming in is high and then, ~30 ms
+    later, has collapsed to a third or less for a while.
+
+    Speeds are averages over L frames (at least 40 ms), and "a while" is up
+    to three of those: a slow-motion clip that repeats each frame a few times
+    moves in jumps with stills between them, and its average speed doesn't
+    drop."""
+    n = len(uu)
+    dt = float(np.median(np.diff(tt))) if n > 1 else 1.0
+    w = max(1, int(round(0.03 / max(dt, 1e-6))))   # ~30 ms, in frames
+    L = max(step, 4, int(round(0.04 / max(dt, 1e-6))))
+    if n < 2 * L + w + 4:
+        return []
+    v = (uu[L:] - uu[:-L]) / L                      # v[j]: px per frame from j to j + L
+    v_hit = max(0.35 * float(np.max(v)), 3.0 * eps / L)
+    out: list[int] = []
+    k = 0
+    while k + 2 * L + w < n:
+        vin = float(v[k])
+        c = k + L                                    # where that speed arrives
+        if vin >= v_hit:
+            after = v[c + w:min(c + w + 2 * L, len(v))]
+            if len(after) and float(np.max(after)) <= 0.35 * vin:
+                # The contact: where the speed (over ~10 ms) first falls to
+                # half. It can keep sliding down the picture after that, so
+                # the lowest point would come too late.
+                hi = min(c + w + L, n - 1)
+                m = max(1, w // 3)
+                sp = (uu[k + m:hi + 1] - uu[k:hi + 1 - m]) / m
+                fast = np.flatnonzero(sp >= 0.8 * vin)
+                slow = (np.flatnonzero(sp[fast[0]:] < 0.5 * vin) + fast[0]) if len(fast) else []
+                if len(slow):
+                    b = k + int(slow[0])
+                else:
+                    seg = uu[k:hi + 1]
+                    b = k + int(np.flatnonzero(seg >= float(np.max(seg)) - eps)[0])
+                out.append(b)
+                k = hi + 1
+                continue
+        k += 1
+    return out
 
 
 def _trim_stationary(seg: np.ndarray, u: np.ndarray, eps: float, step: int = 1) -> np.ndarray:
@@ -406,6 +458,25 @@ def fit_flights(t, x, y, w0, flights, *, fps, n_px_axis, rs_axis="y",
     return jf
 
 
+def sagitta(f: "FlightResult") -> float:
+    """How far gravity bends a flight off a straight line, px: a T^2 / 8."""
+    return max(float(f.a_along), 0.0) * float(f.duration) ** 2 / 8.0
+
+
+def airborne(flights: list["FlightResult"]) -> list[int]:
+    """Flights that are free flight: a clear downward acceleration, at least a
+    quarter of the one in the most bent flight, that bends the path by a
+    pixel or more. A slide along the floor can be long and precise, with a
+    "clear" acceleration that is still tiny next to gravity's; a short hop
+    after a bounce bends little but speeds up like the main flight."""
+    ok = [j for j, f in enumerate(flights)
+          if len(f.idx) >= 6 and np.isfinite(f.a_sigma) and f.a_along > 3 * f.a_sigma > 0]
+    if not ok:
+        return []
+    a_top = float(flights[max(ok, key=lambda j: sagitta(flights[j]))].a_along)
+    return [j for j in ok if flights[j].a_along >= 0.25 * a_top and sagitta(flights[j]) >= 1.0]
+
+
 def _combine(jf: JointFit):
     """Main flight = most points. a_px = weighted mean of flights that agree with it.
 
@@ -418,8 +489,14 @@ def _combine(jf: JointFit):
         cand = list(range(len(jf.flights)))
     # The main flight is the longest real fall: a stretch with no clear
     # downward acceleration (a ball rolling across the floor at the end) is
-    # no free flight, however long it is.
-    falling = [j for j in cand if jf.flights[j].a_along > 3 * jf.flights[j].a_sigma > 0]
+    # no free flight, however long it is. Nor is one that speeds up far less
+    # than the real flight does (a can skidding along the floor after
+    # landing): a long, precise slide can show a tiny but "clear" acceleration.
+    air = airborne(jf.flights)
+    falling = [j for j in cand if j in air]
+    if not falling and air:
+        falling = air          # only an excluded flight (a throw) is in the air: use it
+        cand = sorted(set(cand) | set(air))
     jf.main = int(max(falling or cand, key=lambda j: len(jf.flights[j].idx)))
     m = jf.flights[jf.main]
     vals, wts, used = [], [], []

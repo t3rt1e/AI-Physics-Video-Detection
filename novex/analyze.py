@@ -36,9 +36,9 @@ from . import shadow as shadow_
 from . import spin as spin_
 from . import config as C
 from . import shape as shp
-from .physics import (_noise_px, drag_factor, drag_path, fit_flights, gravity_direction,
-                      launch_velocity, robust_fit_2d, rolling_shutter_effect, split_flights,
-                      trim_release)
+from .physics import (_noise_px, airborne, drag_factor, drag_path, fit_flights,
+                      gravity_direction, launch_velocity, robust_fit_2d, rolling_shutter_effect,
+                      split_flights, trim_release)
 from .scale import Ruler, fuse, ruler_from_size, ruler_manual
 from .stabilize import rescale_transforms, stabilize, warp
 from .track import background, track_falling_object
@@ -1654,6 +1654,24 @@ def _measure(o: _Obj, sh: dict, *, clock=None, keep_nums=None, say=None, manual_
         span = float(np.hypot(np.ptp(xs[mf.idx]), np.ptp(ys[mf.idx])))
         falls = a_m > 5 * s_m_ and span >= need
 
+    def _tossed(fr_):
+        # Up, over the top and down again on a clean parabola is free flight,
+        # whatever the object is: a hand pulling away doesn't move like that.
+        a_f, s_f = fr_.fit.accel_along(gdir)
+        if len(fr_.idx) < 25 or not a_f > 20 * s_f > 0 or fr_.fit.rms > max(1.5, 0.08 * d_ref):
+            return False
+        pu = fr_.fit.cx * gdir[0] + fr_.fit.cy * gdir[1]
+        tau = t[fr_.idx] - fr_.fit.t0
+        tv = -pu[1] / (2.0 * pu[2])
+        span_t = float(tau[-1] - tau[0])
+        if not tau[0] + 0.15 * span_t < tv < tau[-1] - 0.15 * span_t:
+            return False
+        rise = float(pu[1] * (tau[0] - tv) + pu[2] * (tau[0] ** 2 - tv ** 2))
+        drop = float(pu[1] * (tau[-1] - tv) + pu[2] * (tau[-1] ** 2 - tv ** 2))
+        return min(rise, drop) >= 0.5 * d_ref and rise + drop >= need
+    if not falls:
+        falls = any(_tossed(fr_) for fr_ in jf.flights)
+
     light = identify.is_light(idn)
     if light:
         # Drag bends a feather's fall: a changing acceleration is what a real one does.
@@ -2003,9 +2021,10 @@ def _launch(t, xs, ys, fl, jf, gdir, first_hop=False):
     if not fl:
         return fl, info
     hop = [bool(first_hop)] + [float(t[b[0]] - t[a[-1]]) <= 0.12 for a, b in zip(fl, fl[1:])]
-    hops = [j for j in range(len(fl)) if hop[j] and len(fl[j]) >= 8
-            and jf.flights[j].a_along > 0 and np.isfinite(jf.flights[j].a_sigma)
-            and jf.flights[j].a_sigma > 0]
+    # Only hops in the air: after a landing that doesn't bounce, the object
+    # slides or rolls along the floor, and that stretch measures nothing.
+    air = airborne(jf.flights)
+    hops = [j for j in range(len(fl)) if hop[j] and len(fl[j]) >= 8 and j in air]
     a_ref = s_ref = None
     if hops:
         w = np.array([1.0 / jf.flights[j].a_sigma ** 2 for j in hops])
