@@ -434,7 +434,7 @@ class Panel {
     for (const t of tests) {
       const tr = document.createElement("tr");
       const name = document.createElement("td");
-      name.textContent = t.name;
+      name.textContent = t.experimental ? `${t.name} (new)` : t.name;
       const st = document.createElement("td");
       st.innerHTML = `<span class="st st-${t.status}"><b aria-hidden="true">${STATUS_MARK[t.status] || ""}</b>${STATUS_WORD[t.status] || t.status}</span>`;
       const sum = document.createElement("td");

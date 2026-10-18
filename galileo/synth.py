@@ -38,6 +38,11 @@ class Scene:
     seed: int = 0
     main_ball: bool = True         # draw the main ball (False: only `bodies`)
     bodies: tuple = ()             # more falling objects (Body), each with its own motion
+    # A shadow on the floor (needs floor_y): (sideways, depthward) offset of its
+    # centre per px of the ball's height, and how much darker it is at contact.
+    shadow: tuple | None = None
+    shadow_still: bool = False     # AI-like: the shadow stays where the ball first lands
+    shadow_gap: float = 0.0        # AI-like: the shadow sits this many ball-widths aside
 
 
 @dataclass
@@ -101,6 +106,10 @@ class Motion:
     shake: float = 0.0              # handheld camera sway, px (rough amplitude)
     vy0: float = 0.0                # thrown: downward speed at release, m/s
     push: float = 0.0               # thrown: seconds the hand accelerates it before release
+    spin: float = 0.0               # spin at release, rad/s, clockwise in the picture
+    grip: float = 0.0               # share of the skid at the floor that friction takes out
+    inertia: float = 2.0 / 3.0      # I / (m r^2): 2/3 a hollow ball, 2/5 a solid one
+    spin_kick: float = 0.0          # AI-like: random spin change at each bounce, rad/s (sd)
 
 
 def _integrate(m: Motion, sc: Scene, t_end: float):
@@ -116,18 +125,33 @@ def _integrate(m: Motion, sc: Scene, t_end: float):
     floor = None if sc.floor_y is None or m.restitution is None else (sc.floor_y - sc.y0) / ppm
     kdrag = m.g / m.vt**2 if m.vt else 0.0
     rng = np.random.default_rng(sc.seed + 17)
+    r = 0.5 * sc.ball_d_m
+    w, phi = m.spin, 0.0
+    PHI = np.empty(n)
     for i in range(n):
         X[i] = x0 + px * ppm
         Y[i] = sc.y0 + py * ppm
+        PHI[i] = phi
         sp = math.hypot(vx, vy)
         vx += -kdrag * sp * vx * dt
         vy += (m.g - kdrag * sp * vy) * dt
         px += vx * dt
         py += vy * dt
+        phi += w * dt
         if floor is not None and py >= floor and vy > 0:
             py = 2 * floor - py
             vy = -m.restitution * vy
             vx += rng.normal(0.0, m.kick) if m.kick else 0.0
+            if m.grip:
+                # One push at the floor changes speed and spin together:
+                # dv = J/m, dw = -r J / I (clockwise), taking out `grip` of the skid.
+                slip = vx - w * r
+                jm = -m.grip * slip / (1.0 + 1.0 / m.inertia)
+                vx += jm
+                w += -jm / (m.inertia * r)
+            if m.spin_kick:
+                w += rng.normal(0.0, m.spin_kick)
+    m._phi = PHI
     return np.arange(n) * dt, X, Y
 
 
@@ -152,7 +176,7 @@ def _trajectory(m: Motion, sc: Scene, t: np.ndarray) -> tuple[np.ndarray, np.nda
 
 def _trajectory_free(m: Motion, sc: Scene, t: np.ndarray, x0: float):
     tr = np.clip(t - m.t_release, 0, None)
-    if m.vt or m.kick or m.vy0:
+    if m.vt or m.kick or m.vy0 or m.spin or m.grip or m.spin_kick:
         path = getattr(m, "_path", None)
         if path is None or path[0][-1] < float(np.max(tr)):
             path = _integrate(m, sc, max(float(np.max(tr)) + 0.5, 3.0))
@@ -170,6 +194,17 @@ def _trajectory_free(m: Motion, sc: Scene, t: np.ndarray, x0: float):
         yy = np.array([_y_bounce(ti, m, sc) for ti in tr])
     xx = x0 + m.vx * tr * sc.px_per_m
     return xx, yy
+
+
+def spin_angle(m: Motion, sc: Scene, t) -> np.ndarray:
+    """How far the ball has turned (rad, clockwise) at times t."""
+    t = np.asarray(t, float)
+    if not (m.spin or m.grip or m.spin_kick):
+        return np.zeros_like(t)
+    tr = np.clip(t - m.t_release, 0, None)
+    _trajectory(m, sc, np.atleast_1d(t))            # makes sure the path is there
+    g = m._path[0]
+    return np.interp(tr, g, m._phi[:len(g)])
 
 
 def _y_bounce(tr: float, m: Motion, sc: Scene) -> float:
@@ -241,6 +276,8 @@ def render_frame(t_frame: float, m: Motion, sc: Scene, bg: np.ndarray, rng, *,
     c0 = int(max(np.floor(px.min() - R - 3), 0))
     c1 = int(min(np.ceil(px.max() + R + 3), w - 1))
     img = bg.copy()
+    if sc.shadow is not None and sc.floor_y is not None and sc.main_ball:
+        _draw_shadow(img, m, sc, t_frame + 0.5 * exposure, R)
     if r1 > r0 and c1 > c0 and sc.main_ball:
         rr = rows[r0:r1 + 1].astype(np.float64) + 0.5
         cc = np.arange(c0, c1 + 1, dtype=np.float64) + 0.5
@@ -266,6 +303,8 @@ def render_frame(t_frame: float, m: Motion, sc: Scene, bg: np.ndarray, rng, *,
             shade += sh
             if panels is not None:
                 ang = np.arctan2(np.broadcast_to(dy[:, None], sdx.shape), sdx)
+                if m.spin or m.grip or m.spin_kick:
+                    ang = ang - spin_angle(m, sc, tau)[:, None]
                 sec = np.floor((ang + np.pi) / (2 * np.pi) * len(panels)).astype(int) % len(panels)
                 colacc += sh[:, :, None] * panels[sec]
         cov_sum = np.maximum(cov, 1e-9)
@@ -291,6 +330,36 @@ def render_frame(t_frame: float, m: Motion, sc: Scene, bg: np.ndarray, rng, *,
         img = cv2.warpAffine(img, A, (w, h), borderMode=cv2.BORDER_REPLICATE)
     img += rng.normal(0, sc.noise, img.shape).astype(np.float32)
     return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def _draw_shadow(img, m: Motion, sc: Scene, t: float, R: float):
+    """A soft dark ellipse on the floor under (or beside) the ball: its centre
+    is the foot point plus the height times the light's offsets; it grows
+    and fades as the ball rises."""
+    bx, by = _trajectory(m, sc, np.array([t]))
+    bx, by = float(bx[0]), float(by[0])
+    h = max(sc.floor_y - by, 0.0)                     # centre height above contact, px
+    floor_line = sc.floor_y + R                       # where the ball's bottom touches
+    ax, ay, strength = sc.shadow
+    if sc.shadow_still:
+        x_land = float(_trajectory(m, sc, np.array([m.t_release + 0.01]))[0][0])
+        cx = x_land
+    else:
+        cx = bx + ax * (h + R)
+    cx += sc.shadow_gap * 2 * R
+    cy = floor_line + ay * (h + R)
+    grow = 1.0 + 0.5 * h / max(4 * R, 1.0)
+    rx, ry = R * grow, 0.35 * R * grow
+    a = strength / grow
+    hgt, wid = img.shape[:2]
+    x0, x1 = int(max(cx - 2 * rx, 0)), int(min(cx + 2 * rx, wid - 1))
+    y0, y1 = int(max(cy - 2 * ry, 0)), int(min(cy + 2 * ry, hgt - 1))
+    if x1 <= x0 or y1 <= y0:
+        return
+    yy, xx = np.mgrid[y0:y1 + 1, x0:x1 + 1]
+    q = ((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2
+    dark = a * np.clip(1.2 - q, 0, 1)
+    img[y0:y1 + 1, x0:x1 + 1] *= (1.0 - dark)[:, :, None]
 
 
 def _body_scene(b: Body, sc: Scene) -> Scene:

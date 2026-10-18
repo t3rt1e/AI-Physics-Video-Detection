@@ -54,8 +54,14 @@ def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_
            "g": None, "sigma": None, "g_naive": None, "g_ref": g_ref, "ratio": None,
            "k": 1.0, "tol": None, "stage": None, "camera_rel": float(geom_rel or 0.0)}
 
-    fails = [t for t in tests if t["status"] == "fail"]
-    warns = [t for t in tests if t["status"] == "warn"]
+    # The newer laws (marked experimental) count only when config says so;
+    # otherwise their failures read as warnings. Their passes stay in the
+    # checks table, not the reasons, to keep the reasons short.
+    counted = [t for t in tests if C.EXPERIMENTAL_CHECKS_DECIDE or not t.get("experimental")]
+    fails = [t for t in counted if t["status"] == "fail"]
+    warns = [t for t in tests if t["status"] == "warn"
+             or (t["status"] == "fail" and not any(t is c for c in counted))]
+    passes = [t for t in tests if t["status"] == "pass" and not t.get("experimental")]
 
     if n_points < C.MIN_FLIGHT_POINTS or duration < C.MIN_FLIGHT_SECONDS or not tracking_ok:
         out["stage"] = "tracking: too few frames or jitter"
@@ -200,7 +206,7 @@ def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_
                                "real time.")
         if drag_line:
             reasons.append(drag_line)
-        reasons.extend(t["summary"] for t in tests if t["status"] == "pass")
+        reasons.extend(t["summary"] for t in passes)
         reasons.extend(t["summary"] for t in warns)
         return out
 
@@ -240,7 +246,7 @@ def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_
                            "could make this real footage.")
         if drag_line:
             reasons.append(drag_line)
-        reasons.extend(t["summary"] for t in tests if t["status"] == "pass")
+        reasons.extend(t["summary"] for t in passes)
         reasons.extend(t["summary"] for t in warns)
         return out
 
@@ -257,7 +263,7 @@ def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_
                        f"A real one would have to be {1 / ratio:.2f}x the size assumed for it.")
         if drag_line:
             reasons.append(drag_line)
-        reasons.extend(t["summary"] for t in tests if t["status"] == "pass")
+        reasons.extend(t["summary"] for t in passes)
         reasons.extend(t["summary"] for t in warns)
         return out
     out.update(verdict="UNSURE", confidence=0.5, stage="physics: g too high")

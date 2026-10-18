@@ -933,3 +933,164 @@ def test_camera_listens_only_to_falls_that_make_sense():
     got = _camera_votes([prim, other, rolling, tipped, outline], 1)
     assert [e["n"] for e in got] == [1, 2]
     assert "speeds up" in rolling["left_out"] and "primary" in tipped["left_out"]
+
+
+# ---- the newer laws: spin, shadows, floor, sideways, bounciness, size ----------
+def _sphere_views(axis, deg, seed=1):
+    """Two close-ups of a marked ball, the second turned by deg about axis
+    (x right, y down, z away from the camera)."""
+    import math
+    rng = np.random.default_rng(seed)
+    c3 = rng.normal(size=(60, 3))
+    c3 /= np.linalg.norm(c3, axis=1, keepdims=True)
+    vals = rng.uniform(-1, 1, 60)
+
+    def rot(ax, ang):
+        k = np.asarray(ax, float) / np.linalg.norm(ax)
+        K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+        return np.eye(3) + math.sin(ang) * K + (1 - math.cos(ang)) * K @ K
+
+    def render(R_, R=60, H=200):
+        yy, xx = np.mgrid[0:H, 0:H].astype(float)
+        u, v = (xx - 100.3) / R, (yy - 99.6) / R
+        w = np.sqrt(np.clip(1 - u ** 2 - v ** 2, 0, 1))
+        p = np.stack([u, v, -w], axis=-1) @ R_
+        tex = (np.exp((p @ c3.T - 1) / 0.03) * vals).sum(axis=-1)
+        img = np.full((H, H), 120.0)
+        inside = u ** 2 + v ** 2 <= 1
+        img[inside] = ((140 + 60 * tex) * (0.7 + 0.3 * w))[inside]
+        return np.clip(img + rng.normal(0, 1.5, img.shape), 0, 255).astype(np.uint8)
+    R0 = rot((0.3, 0.5, 0.8), 0.7)
+    return render(R0), render(rot(axis, math.radians(deg)) @ R0)
+
+
+def test_spin_reader_reads_the_turn_about_the_line_of_sight():
+    from galileo import spin
+    for axis, deg, want_z in [((0, 0, 1), 6.0, 6.0), ((0, 0, 1), -10.0, -10.0),
+                              ((1, 0, 0), 10.0, 0.0), ((1, 1, 1), 6.0, 6.0 / np.sqrt(3))]:
+        a, b = _sphere_views(axis, deg)
+        w, match, _ = spin.turn3d(spin.close_up(a, 100.3, 99.6, 120),
+                                  spin.close_up(b, 100.0, 100.0, 120))
+        assert match > 0.9
+        assert np.degrees(w[2]) == pytest.approx(want_z, abs=0.6)
+
+
+def _spin_clip(path, **motion):
+    panels = ((40, 60, 220), (230, 230, 230), (200, 120, 30), (40, 200, 230), (230, 230, 230),
+              (60, 160, 60))
+    sc = Scene(width=640, height=480, px_per_m=400.0, ball_d_m=0.21, panels=panels, shading=0.2,
+               bg_level=40, y0=70.0, floor_y=400.0, x0=200.0, seed=3)
+    m = Motion(g=9.81, restitution=0.75, vx=0.6, t_release=0.1, **motion)
+    return make_clip(str(path), scene=sc, motion=m, capture_fps=120, duration=1.7)["path"]
+
+
+def _test(r, name):
+    return next(t for t in r["tests"] if t["name"] == name)
+
+
+def test_bounce_keeps_angular_momentum_about_the_contact(tmp_path):
+    # Real: the floor's friction slows the ball sideways and spins it up,
+    # together, keeping its angular momentum about the contact point.
+    r = analyze(_spin_clip(tmp_path / "grip.mp4", grip=0.7), preset="volleyball")
+    t = _test(r, "Spin at bounces")
+    assert t["status"] == "pass"
+    rows = t["detail"]["bounces"]
+    assert rows and all(abs(b["gain"]) < 0.03 for b in rows)
+    assert any(b["spin_after"] - b["spin_before"] > 1.0 for b in rows)      # it did spin up
+    assert _test(r, "Steady spin")["status"] == "pass"
+    assert r["verdict"]["verdict"] == "REAL"
+    # Generated: the spin jumps at each bounce with no sideways push to cause it.
+    r = analyze(_spin_clip(tmp_path / "kick.mp4", spin_kick=12.0), preset="volleyball")
+    assert _test(r, "Spin at bounces")["status"] == "fail"
+    assert r["verdict"]["verdict"] == "AI"
+    assert r["verdict"]["stage"] == "physics: Spin at bounces failed"
+
+
+def _shadow_clip(path, **scene):
+    sc = Scene(width=640, height=480, px_per_m=400.0, ball_d_m=0.067, ball_bgr=(40, 200, 230),
+               shading=0.3, bg_level=170, y0=70.0, floor_y=400.0, x0=150.0, seed=4,
+               shadow=(0.35, 0.03, 0.5), **scene)
+    m = Motion(g=9.81, restitution=0.7, vx=0.5, t_release=0.1)
+    return make_clip(str(path), scene=sc, motion=m, capture_fps=120, duration=1.6)["path"]
+
+
+def test_ball_meets_its_shadow_at_every_bounce(tmp_path):
+    r = analyze(_shadow_clip(tmp_path / "lit.mp4"), preset="tennis")
+    assert _test(r, "Shadow follows")["status"] == "pass"
+    assert _test(r, "Shadow follows")["detail"]["slope_x"] == pytest.approx(0.35, abs=0.08)
+    assert _test(r, "Ball meets its shadow")["status"] == "pass"
+    assert r["verdict"]["verdict"] == "REAL"
+    # A shadow painted a ball-width and a half to the side never meets the ball.
+    r = analyze(_shadow_clip(tmp_path / "apart.mp4", shadow_gap=1.6), preset="tennis")
+    assert _test(r, "Ball meets its shadow")["status"] == "fail"
+    assert r["verdict"]["verdict"] == "AI"
+
+
+def test_floor_sideways_bounciness_and_size_laws():
+    from galileo import checks as ck
+    from galileo.physics import fit_flights
+    # One flat floor: bottoms (scaled to the reference distance) agree.
+    pts = [{"t": 0.5, "bottom": 400.0, "q": 1.0}, {"t": 1.1, "bottom": 403.0, "q": 1.01},
+           {"t": 1.6, "bottom": 398.0, "q": 1.0}]
+    assert ck.floor_check(pts, 40.0)["status"] == "pass"
+    pts[1]["bottom"] = 440.0                                      # a full width lower
+    assert ck.floor_check(pts, 40.0)["status"] == "fail"
+    assert ck.floor_check(pts[:1], 40.0)["status"] == "skip"
+    # No sideways push: two hops, the second pushed sideways at 30% of g.
+    t = np.arange(0, 1.2, 1 / 120)
+    a = 9.81 * 400
+
+    def hops(side):
+        x, y = np.empty_like(t), np.empty_like(t)
+        for k, (t0, t1) in enumerate([(0.0, 0.6), (0.6, 1.2)]):
+            sel = (t >= t0) & (t < t1)
+            tau = t[sel] - (t0 + t1) / 2
+            y[sel] = 300 + 0.5 * a * tau ** 2
+            x[sel] = 200 + 50 * tau + (0.5 * side * a * tau ** 2 if k == 1 else 0)
+        rng = np.random.default_rng(0)
+        return x + rng.normal(0, 0.2, len(t)), y + rng.normal(0, 0.2, len(t))
+    fl = [np.flatnonzero(t < 0.595), np.flatnonzero(t > 0.605)]
+    for side, want in ((0.0, "pass"), (0.3, "fail")):
+        x, y = hops(side)
+        jf = fit_flights(t, x, y, np.ones(len(t)), fl, fps=120, n_px_axis=480)
+        assert ck.sideways_check(jf, t)["status"] == want
+    # Steady bounces: one bounce keeping far more of its speed than the rest.
+    b = [{"v_in": v, "restitution_t": e, "restitution_t_sigma": 0.01, "restitution": e,
+          "restitution_sigma": 0.01} for v, e in ((1500, 0.76), (1150, 0.78), (900, 0.79),
+                                                   (700, 0.80))]
+    assert ck.steady_bounce_check(b)["status"] == "pass"
+    b[2]["restitution_t"] = 1.05
+    assert ck.steady_bounce_check(b)["status"] == "fail"
+    # Constant size: a ball whose width swells 40% partway through a flight.
+    tt = np.linspace(0, 0.6, 72)
+    d = 50.0 / (1 + 0.1 * tt) + np.random.default_rng(1).normal(0, 0.2, len(tt))
+    assert ck.size_check(tt, d, [np.arange(len(tt))])["status"] == "pass"
+    swell = d * (1 + 0.40 * np.exp(-((tt - 0.3) / 0.06) ** 2))
+    assert ck.size_check(tt, swell, [np.arange(len(tt))])["status"] == "warn"
+
+
+def test_rolling_ball_turns_once_per_circumference():
+    from galileo import checks as ck
+    t = np.arange(60) / 60.0
+    x = 100 + 120 * t                               # 120 px/s along the floor
+    d = np.full(60, 40.0)                           # radius 20 px: rolling spin 6 rad/s
+    for spin_rate, want in ((6.0, "pass"), (0.0, "fail")):
+        sp = {"i": np.arange(59), "j": np.arange(1, 60), "t": t[:-1] + 1 / 120,
+              "w3": np.column_stack([np.zeros(59), np.zeros(59),
+                                     spin_rate + np.random.default_rng(2).normal(0, 0.2, 59)]),
+              "readable": 1.0, "tried": 59}
+        sp["omega"] = sp["w3"][:, 2]
+        assert ck.rolling_check(sp, t, x, d, [np.arange(60)])["status"] == want
+
+
+def test_newer_laws_can_be_made_advisory(monkeypatch):
+    from galileo import config as Cfg
+    from galileo.verdict import decide
+    fail = {"name": "One flat floor", "status": "fail", "summary": "Lands on two floors.",
+            "detail": {}, "experimental": True}
+    base = dict(a_px=3900.0, a_sigma=30.0, scale={"s": 1 / 400.0, "rel_sigma": 0.02},
+                clock=None, tests=[fail], n_points=40, duration=0.4)
+    assert decide(**base)["verdict"] == "AI"
+    monkeypatch.setattr(Cfg, "EXPERIMENTAL_CHECKS_DECIDE", False)
+    v = decide(**base)
+    assert v["verdict"] == "REAL" and "Lands on two floors." in v["reasons"]

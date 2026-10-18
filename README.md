@@ -418,6 +418,42 @@ Veo clips are 24 fps and 4, 6 or 8 s long, and stay downloadable for 2 days.
    motion in it), otherwise from the speeds, and only a gain beyond the measurement's
    error fails. With the room's uprights in view, the fall must also speed up along them
    ("Falls straight down").
+8b. **Newer laws** (`checks.py`, `spin.py`, `shadow.py`), all still free of ruler and
+   clock, marked "(new)" in the output until they have seen more clips:
+   - **Steady spin**: nothing twists a ball in the air, so it keeps its spin from one end
+     of a hop to the other. The spin is read from the ball's markings: for each pair of
+     close-ups, the 3D turn that carries one onto the other is fitted on the sphere
+     (every spot of the second looked up where it was in the first). The turn about the
+     line of sight reads to a few tenths of a radian a second on a volleyball; a ball
+     whose readings scatter more than that (faint markings, or tumbling about an axis
+     across the picture, like a small pickleball) is skipped.
+   - **Spin at bounces**: every push at a bounce acts where the ball touches the floor,
+     so none can turn it about that point: its angular momentum about the contact point
+     (m r (v + k r ω), sideways speed v, spin ω, k = 2/3 for a hollow ball, 2/5 for a
+     solid one) is kept by a hard ball that grips and partly lost by a squashy one (its
+     squash bites into spin and sideways speed together), but never grows. A spin kicked
+     up out of nothing, or a sideways shove with no spin to pay for it, fails.
+   - **Rolling**: a ball rolling along the floor turns once per circumference (ω r = v).
+   - **One flat floor**: in positions scaled to the ball's reference distance, every
+     contact of a level camera lands at one height (a tipped camera needs three bounces
+     to tell from a sloped floor).
+   - **No sideways push**: in the air only gravity pulls, and only down, so no hop
+     speeds up or slows down sideways (beyond what drag or spin allow).
+   - **Steady bounces**: one ball on one floor keeps a similar share of its speed at
+     every bounce (a little more as the landings get softer).
+   - **Constant size**: the ball's width changes only as it moves toward or away from
+     the camera, smoothly. A swell of a fifth only warns (a hand in front of it, or a
+     change of light, can fake that); one of more than half fails.
+   - **Shadow follows** and **Ball meets its shadow** (`shadow.py`): light travels in
+     straight lines and arrives at once. Each frame is divided by the still background;
+     the darker patch near where the ball lands is the shadow candidate. A far light puts
+     its centre at the ball's foot point plus a fixed multiple of the height, so a real
+     shadow slides along in step with the ball, and at a bounce the ball touches it. A
+     shadow that never moves is part of the background and can't be seen this way.
+   Hops tracked badly (a catch, the picture's edge) are left out of these, and with a
+   moving camera the ones that need a fixed floor or sideways speed are skipped.
+   `config.EXPERIMENTAL_CHECKS_DECIDE` (default True) says whether a clear failure of
+   one makes the clip AI; set it to False to show them without letting them decide.
 9. **Clocks** (`clocks.py`): capture-rate tags, high-frame-rate timestamps, repeated
    frames, interpolation patterns, and lighting flicker (a hint only). Read once, on the
    main object, and shared: a clip has one speed.
@@ -460,6 +496,8 @@ galileo/
   analyze.py     the pipeline, video in, verdict out
   physics.py     fits, flights, rolling shutter          (David)
   checks.py      scale-free tests                        (David)
+  spin.py        the ball's spin from its markings (3D turn on the sphere)
+  shadow.py      the ball's shadow on the floor, frame by frame
   clocks.py      slow-motion detection                   (David)
   scale.py       rulers and fusion                       (David)
   verdict.py     verdict and reasons                     (David)

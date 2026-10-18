@@ -164,6 +164,13 @@ def cmd_analyze(a):
             print(_obj_line(o))
     if v.get("explanation"):
         print("\n" + v["explanation"])
+    tests = r.get("tests") or []
+    if tests:
+        print("\nChecks:")
+        mark = {"pass": "pass", "warn": "WARN", "fail": "FAIL", "skip": "skip"}
+        for t_ in tests:
+            new = " (new)" if t_.get("experimental") else ""
+            print(f"  {mark.get(t_['status'], t_['status']):4s}  {t_['name']}{new}: {t_['summary']}")
     if v.get("stage") and v["verdict"] == "UNSURE":
         print(f"\nStopped at: {v['stage']}")
     clk = r.get("clock") or {}

@@ -32,6 +32,8 @@ import numpy as np
 
 from . import camera as cam_
 from . import checks, clocks, identify, scene
+from . import shadow as shadow_
+from . import spin as spin_
 from . import config as C
 from . import shape as shp
 from .physics import (_noise_px, drag_factor, drag_path, fit_flights, gravity_direction,
@@ -121,6 +123,8 @@ class _Obj:
     p2: dict | None = None         # the zoom pass, if any
     first_hop: bool = False        # the measured stretch starts at a bounce, not a release
     full_views: dict | None = None  # full-resolution close-ups, for Gemini to name it
+    close_ups: list | None = None  # the ball up close at every tracked point, to read its spin
+    shadow: dict | None = None     # its shadow on the floor at every first-pass point
 
     @property
     def rigid(self) -> bool:
@@ -882,12 +886,22 @@ def _run(path: str, *, dbg: dict | None = None, preset=None,
             else d_ref
         o.view = _view(frames_s, tro, times, fl, size_v, keep_full=use_gemini or use_depth)
         o.p1 = {"f": f, "t": t, "x": x, "y": y, "fl": fl, "d_ref": d_ref, "size": size_v,
-                "scale": sc, "tr": tro, "g2": g2}
+                "scale": sc, "tr": tro, "g2": g2, "d": d, "floor": _floor_lines(t, y, d, fl)}
+        o.close_ups = _close_ups(frames_s, tro.main.dets)
         objs.append(o)
 
     # What only the whole picture gives: the light level, for the flicker clock,
     # and the still background, for the room's straight lines.
     bg1 = background(frames_s) if camera_mode != "upright" else None
+    try:
+        bg_sh = bg1 if bg1 is not None else background(frames_s)
+        for o in objs:
+            dets = o.p1["tr"].main.dets
+            o.shadow = shadow_.observe(frames_s, bg_sh, dets, o.p1["floor"] - geo.oy)
+            o.shadow["sx"] += geo.ox
+            o.shadow["sy"] += geo.oy
+    except Exception as e:  # never lose the measurement over a shadow
+        result["notes"].append(f"Shadow search failed: {e}")
     gray1 = [cv2.cvtColor(im, cv2.COLOR_BGR2GRAY) if im.ndim == 3 else im for im in frames_s]
     bright = [float(np.median(g[::4, ::4])) for g in gray1]
     rs_axis = "x" if info.rotation in (90, 270) else "y"
@@ -917,7 +931,7 @@ def _run(path: str, *, dbg: dict | None = None, preset=None,
                 o.notes.append(f"Tried to zoom in on the {p1['d_ref']:.0f} px object but lost "
                                "it, so it was measured in the first pass.")
                 continue
-            gray_z, times_z, geo_z, tr_z, nums_z, view_z = z
+            gray_z, times_z, geo_z, tr_z, nums_z, view_z, close_z = z
             f2, t2, x2, y2, d2, w02, d_ref2 = _arrays(tr_z, times_z, geo_z)
             fl2 = split_flights(t2, x2, y2, p1["g2"], diam_px=d_ref2)
             # The window ends just after the last flight it was planned for; a hop
@@ -939,6 +953,7 @@ def _run(path: str, *, dbg: dict | None = None, preset=None,
             o.p2 = {"geo": geo_z, "times": times_z, "nums": nums_z, "tr": tr_z,
                     "crop": plan["crop"]}
             o.tr, o.times, o.geo, o.nums, o.gray = tr_z, times_z, geo_z, nums_z, gray_z
+            o.close_ups = close_z
             sh2 = _shape_geometry(tr_z, times_z, t2, x2, y2, fl2, dt_med)
             if sh2.get("frames", 0) >= 3:
                 o.shape = sh2
@@ -1000,7 +1015,10 @@ def _run(path: str, *, dbg: dict | None = None, preset=None,
         result["notes"].append(f"Camera: {camera['why']}.")
 
     # ---- measure each one -----------------------------------------------------------
-    shared = {"info": info, "fps_file": fps_file, "dt_med": dt_med, "rs_axis": rs_axis,
+    moved = bool(stab.get("applied")) and (stab.get("model") == "homography" or bool(cox or coy)
+                                           or (cw, chh) != (Ww, Hw))
+    shared = {"camera_moved": moved,
+              "info": info, "fps_file": fps_file, "dt_med": dt_med, "rs_axis": rs_axis,
               "g_ref": g_ref, "rs_mode": rs_mode, "scale_correction": scale_correction,
               "bright": bright, "camera": camera, "real_time": real_time,
               "fps_native": fps_file * step}
@@ -1591,6 +1609,12 @@ def _measure(o: _Obj, sh: dict, *, clock=None, keep_nums=None, say=None, manual_
         notes.append(f"Left out the first {1000 * launch['trim_s']:.0f} ms of the first "
                      "flight, where the hand was still pushing the ball.")
 
+    try:
+        tests.extend(_more_checks(o, t, x, y, d, jf, tests, rigid, idn, d_ref, dt_med, geo,
+                                  m_fac, moved=bool(sh.get("camera_moved"))))
+    except Exception as e:  # a new law must never cost the measurement
+        notes.append(f"Some of the newer checks failed to run: {e}")
+
     mf = jf.flights[jf.main]
     # Tracking quality is judged on jitter around a smooth path (third
     # differences), not on the parabola fit, so a smooth but non-physical
@@ -1692,6 +1716,170 @@ def _measure(o: _Obj, sh: dict, *, clock=None, keep_nums=None, say=None, manual_
         "ghost": _ghost_payload(jf_obs, times, gdir, scale, k_used, g_ref, geo, t, xs, ys,
                                 vt_plot, lev=lev, m_fac=m_fac),
     })
+    return out
+
+
+# How the mass sits in a ball, as I / (m r^2): a thin shell 2/3, a solid ball
+# 2/5, thick shells (a tennis ball) in between. Sets how much spin the floor's
+# friction gives for a given sideways kick.
+_SHELL = {"ping-pong", "volleyball", "soccer", "basketball", "beach-ball", "playground-ball",
+          "dodgeball", "netball", "water-polo-ball", "handball"}
+_THICK = {"tennis", "pickleball", "wiffle-ball", "racquetball", "squash-ball"}
+_SOLID = {"golf", "baseball", "softball", "billiard", "steel-38mm", "steel-25mm", "marble",
+          "bouncy-ball", "lacrosse-ball", "cricket-ball", "field-hockey-ball", "bowling-ball",
+          "apple", "orange", "lime", "grapefruit", "peach", "plum", "tomato", "cherry-tomato",
+          "onion", "cantaloupe", "honeydew", "coconut", "cabbage", "walnut", "grape", "cherry"}
+
+
+def _inertia(idn) -> float | None:
+    k = (idn or {}).get("key")
+    if k in _SHELL:
+        return 2.0 / 3.0
+    if k in _THICK:
+        return 0.6
+    if k in _SOLID:
+        return 0.4
+    return None
+
+
+def _floor_lines(t, y, d, fl) -> np.ndarray:
+    """Per tracked point, the floor line: where the ball's bottom was at the
+    nearest bounce in time (NaN with no bounce). Picture y runs down."""
+    t, y, d = (np.asarray(v, float) for v in (t, y, d))
+    out = np.full(len(t), np.nan)
+    if len(fl) < 2:
+        return out
+    dt = float(np.median(np.diff(t))) if len(t) > 1 else 1.0
+    tb, yb = [], []
+    for a, b in zip(fl, fl[1:]):
+        if t[b[0]] - t[a[-1]] > 6 * dt or len(a) < 3 or len(b) < 3:
+            continue
+        if not (y[a[-1]] > y[a[-3]] and y[b[2]] < y[b[0]]):      # down, then up again
+            continue
+        near = np.r_[a[-2:], b[:2]]
+        bot = y[near] + 0.5 * d[near]
+        if np.isfinite(bot).any():
+            tb.append(0.5 * (t[a[-1]] + t[b[0]]))
+            yb.append(float(np.nanmax(bot)))
+    if not tb:
+        return out
+    tb, yb = np.asarray(tb), np.asarray(yb)
+    return yb[np.argmin(np.abs(t[:, None] - tb[None, :]), axis=1)]
+
+
+def _close_ups(frames, dets) -> list:
+    """The ball up close at every detection, centred on its outline (the
+    brightness centre wanders with its markings), for reading its spin."""
+    out = []
+    for dt in dets:
+        cx = dt.ax if np.isfinite(dt.ax) else dt.x
+        cy = dt.ay if np.isfinite(dt.ay) else dt.y
+        try:
+            out.append(spin_.close_up(frames[dt.f], cx, cy, dt.d))
+        except Exception:
+            out.append(None)
+    return out
+
+
+def _rolling_segments(t, x, y, d, flights, bounce_pts, dt) -> list:
+    """Stretches where the ball rolls along the floor: outside the flights, its
+    bottom on the floor line of the last bounce, moving at least a width a
+    second, for 10+ points and 0.2+ s."""
+    if not bounce_pts or not flights:
+        return []
+    floor, dd = bounce_pts[-1]["bottom"], bounce_pts[-1]["d"]
+    in_fl = np.zeros(len(t), bool)
+    for idx in flights:
+        in_fl[np.asarray(idx, int)] = True
+    cand = np.flatnonzero(~in_fl & np.isfinite(y) & np.isfinite(d)
+                          & (np.abs(y + 0.5 * d - floor) < 0.15 * dd))
+    runs, run = [], []
+    for i in cand:
+        if run and (i - run[-1] > 2 or t[i] - t[run[-1]] > 3 * dt):
+            runs.append(run)
+            run = []
+        run.append(int(i))
+    if run:
+        runs.append(run)
+    out = []
+    for r in runs:
+        r = np.asarray(r)
+        if len(r) < 10 or t[r[-1]] - t[r[0]] < 0.2:
+            continue
+        v = float(np.polyfit(t[r], x[r], 1)[0])
+        if abs(v) >= dd:
+            out.append(r)
+    return out
+
+
+def _more_checks(o, t, x, y, d, jf, tests, rigid, idn, d_ref, dt_med, geo, m_fac,
+                 moved=False) -> list:
+    """The newer laws (galileo/checks.py): spin, the floor, rolling, sideways
+    pushes, steady bounces, size, and the shadow. t, x, y, d: the tracked
+    points in the level view; the shadow is judged in the first pass's pixels.
+    moved: the camera moved a lot. Then the ball's positions are only as
+    steady as the stabilization, and near and far things slide past each
+    other as it moves, so the laws that need a fixed floor or a sideways
+    speed are left out."""
+    if moved:
+        out = []
+        why = ("The camera moved, so the floor and the ball's sideways speed can't be pinned "
+               "down well enough for this.")
+        for nm in ("Spin at bounces", "One flat floor", "Rolling", "No sideways push",
+                   "Shadow follows", "Ball meets its shadow"):
+            out.append(checks._exp(checks._result(nm, "skip", why)))
+        sp = None
+        if not rigid and o.close_ups is not None and len(o.close_ups) == len(t):
+            sp = spin_.series(o.close_ups, t)
+        clean_idx = [jf.flights[j].idx for j in checks.clean_flights(jf)]
+        bl = next((t_ for t_ in tests if t_["name"] == "Bounce law"), None)
+        pairs = ((bl or {}).get("detail") or {}).get("bounces") or []
+        out.insert(0, checks.spin_steady_check(sp, clean_idx))
+        out.append(checks.steady_bounce_check(pairs, set(checks.clean_flights(jf))))
+        if not rigid:
+            out.append(checks.size_check(t, d, clean_idx))
+        return out
+    out = []
+    bl = next((t_ for t_ in tests if t_["name"] == "Bounce law"), None)
+    pairs = ((bl or {}).get("detail") or {}).get("bounces") or []
+    fl_idx = [fr.idx for fr in jf.flights]
+    clean_idx = [jf.flights[j].idx for j in checks.clean_flights(jf)]
+    sp = None
+    if not rigid and o.close_ups is not None and len(o.close_ups) == len(t):
+        sp = spin_.series(o.close_ups, t)
+    out.append(checks.spin_steady_check(sp, clean_idx))
+    out.append(checks.bounce_spin_check(sp, jf, pairs, 0.5 * d_ref, _inertia(idn)))
+    # Where each bounce lands: the incoming hop's fitted centre at the contact
+    # time (no half-frame error), plus half the width, in the fit's units (the
+    # ball's reference distance); and the actual bottom, for rolling.
+    pts, ok_m = [], np.isfinite(m_fac) & (m_fac > 0)
+    for p in pairs:
+        fr = jf.flights[p["j"]]
+        tb = p["t_bounce"]
+        _, yc = fr.fit.pos(np.array([tb - fr.fit.t0]))
+        q = float(np.interp(tb, t[ok_m], m_fac[ok_m])) if ok_m.sum() >= 2 else 1.0
+        k = int(np.argmin(np.abs(t - tb)))
+        pts.append({"t": float(tb), "bottom": float(yc[0]) + 0.5 * d_ref, "q": q,
+                    "actual": float(y[k] + 0.5 * d[k]), "d": float(d[k])})
+    if not rigid:
+        out.append(checks.floor_check(pts, d_ref, geo.H / 2.0))
+        floor_pts = [{"bottom": p_["actual"], "d": p_["d"]} for p_ in pts
+                     if np.isfinite(p_["actual"]) and np.isfinite(p_["d"])]
+        out.append(checks.rolling_check(sp, t, x, d, _rolling_segments(t, x, y, d, fl_idx,
+                                                                         floor_pts, dt_med)))
+    out.append(checks.sideways_check(jf, t, light=identify.is_light(idn)))
+    out.append(checks.steady_bounce_check(pairs, set(checks.clean_flights(jf))))
+    if not rigid:
+        out.append(checks.size_check(t, d, clean_idx))
+    p1 = o.p1
+    if p1 is not None and not rigid:
+        t1 = np.asarray(p1["t"], float)
+        dt1 = float(np.median(np.diff(t1))) if len(t1) > 1 else dt_med
+        bi = []
+        for p in pairs:
+            k = int(np.argmin(np.abs(t1 - p["t_bounce"])))
+            bi.append(k if abs(t1[k] - p["t_bounce"]) <= 2 * dt1 else None)
+        out.extend(checks.shadow_checks(o.shadow, p1["x"], p1["y"], p1["d"], p1["floor"], bi))
     return out
 
 
@@ -1951,7 +2139,7 @@ def _zoom_pass(path, info, plan, geo, times, tr, tracker, want_gray=True, down=D
     """Decode the object's patch at high resolution and track it there again.
 
     Returns (grey frames or None, times, geometry, track result, frame
-    numbers, colour close-up) or None.
+    numbers, colour close-up, the ball's close-ups for its spin) or None.
     """
     z = plan["z"]
     x0, y0, x1, y1 = plan["crop"]
@@ -2006,8 +2194,9 @@ def _zoom_pass(path, info, plan, geo, times, tr, tracker, want_gray=True, down=D
         view = _view(frames, trz, tz, fl, size)
     gray = ([cv2.cvtColor(im, cv2.COLOR_BGR2GRAY) if im.ndim == 3 else im for im in frames]
             if want_gray else None)
+    close = _close_ups(frames, trz.main.dets)
     del frames
-    return gray, tz, geo_z, trz, nz, view
+    return gray, tz, geo_z, trz, nz, view, close
 
 
 def _unsure(result, why, t_wall, stage=None, **extra):
