@@ -117,7 +117,11 @@ function homePage() {
       <div class="section-heading"><div><span class="eyebrow">02 / THE EXAMPLE COLLECTION</span><h2 id="sample-heading">Know the motion. See the result.</h2></div><span class="hint">Synthetic clips. Real physics checks.</span></div>
       <div class="sample-grid" id="samples">${(STATUS.samples || []).map((sample, i) => `<button class="sample-card ${sample.ai_generated ? 'sample-orange' : ''}" type="button" data-light data-name="${esc(sample.name)}"><span class="sample-top"><span>STUDY / 0${i+1}</span><span class="sample-arrow">↗</span></span><svg class="sample-art" viewBox="0 0 240 80" aria-hidden="true"><path class="sample-baseline" d="M10 66H230"/><path d="M20 14Q120 ${sample.ai_generated ? '8 212 35' : '14 212 61'}"/><circle cx="212" cy="${sample.ai_generated ? '35' : '61'}" r="7"/></svg><span class="sample-copy"><b>${esc(sampleLabel(sample))}</b><small>${sample.ai_generated ? 'Simulated physics anomaly' : 'Simulated natural motion'}</small></span></button>`).join('') || '<p class="hint">No sample clips installed.</p>'}</div>
     </section>
-    <a class="compare-callout" href="#/compare" data-light><span class="compare-callout-icon">${icon('compare')}</span><span><span class="eyebrow">A SECOND PERSPECTIVE</span><b>Two clips. A clearer picture.</b><small>Compare motion and results side by side.</small></span><span class="callout-arrow">↗</span></a>`;
+    <a class="compare-callout" href="#/compare" data-light><span class="compare-callout-icon">${icon('compare')}</span><span><span class="eyebrow">A SECOND PERSPECTIVE</span><b>Two clips. A clearer picture.</b><small>Compare motion and results side by side.</small></span><span class="callout-arrow">↗</span></a>
+    <aside class="proverb-note" aria-labelledby="proverb-title">
+      <div class="proverb-script"><span class="proverb-characters" lang="zh-Hans">以假乱真</span><span class="proverb-pinyin" lang="zh-Latn-pinyin">Yǐ jiǎ luàn zhēn</span></div>
+      <div class="proverb-copy"><span class="proverb-label">A CHINESE PROVERB</span><h2 id="proverb-title">Substitute a Fake for the Real</h2><p>A convincing imitation can blur what is real.<br>A reminder to look closer in the age of AI video.</p></div>
+    </aside>`;
   $('#start-analysis').onclick = () => { $('#analysis-start').scrollIntoView({behavior:matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'}); $('#single-file').focus({preventScroll:true}); };
   const upload = new UploadInput('single', () => { $("#go").disabled = !upload.file; });
   const go = $("#go"), err = $("#err");
