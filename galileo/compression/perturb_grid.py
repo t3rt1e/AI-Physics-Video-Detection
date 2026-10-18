@@ -5,7 +5,7 @@ Apply a grid of perturbations (re-encode, rescale, fps, blur, grain, multi-pass
 evaluation. Requires ffmpeg + ffprobe on PATH.
 
 Usage:
-    python perturb_grid.py --real data/real --fake data/fake --out perturbed --workers 4
+    python perturb_grid.py --real "your_folder" --fake "your_folder" --out perturbed_sink --only kitchen_sink
 
 Output layout:
     perturbed/<perturbation>/<real|fake>/<clip>.<mp4|webm>
