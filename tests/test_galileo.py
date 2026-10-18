@@ -1000,10 +1000,12 @@ def test_bounce_keeps_angular_momentum_about_the_contact(tmp_path):
     assert _test(r, "Steady spin")["status"] == "pass"
     assert r["verdict"]["verdict"] == "REAL"
     # Generated: the spin jumps at each bounce with no sideways push to cause it.
+    # With gravity right and everything else in order, that one failure is
+    # flagged but doesn't decide on its own.
     r = analyze(_spin_clip(tmp_path / "kick.mp4", spin_kick=12.0), preset="volleyball")
     assert _test(r, "Spin at bounces")["status"] == "fail"
-    assert r["verdict"]["verdict"] == "AI"
-    assert r["verdict"]["stage"] == "physics: Spin at bounces failed"
+    assert r["verdict"]["verdict"] == "REAL" and r["verdict"]["confidence"] <= 0.6
+    assert r["verdict"]["lone_failure"] == "Spin at bounces"
 
 
 def _shadow_clip(path, **scene):
@@ -1020,10 +1022,11 @@ def test_ball_meets_its_shadow_at_every_bounce(tmp_path):
     assert _test(r, "Shadow follows")["detail"]["slope_x"] == pytest.approx(0.35, abs=0.08)
     assert _test(r, "Ball meets its shadow")["status"] == "pass"
     assert r["verdict"]["verdict"] == "REAL"
-    # A shadow painted a ball-width and a half to the side never meets the ball.
+    # A shadow painted a ball-width and a half to the side never meets the ball
+    # (on its own, with gravity right, a flag rather than a verdict).
     r = analyze(_shadow_clip(tmp_path / "apart.mp4", shadow_gap=1.6), preset="tennis")
     assert _test(r, "Ball meets its shadow")["status"] == "fail"
-    assert r["verdict"]["verdict"] == "AI"
+    assert r["verdict"]["lone_failure"] == "Ball meets its shadow"
 
 
 def test_floor_sideways_bounciness_and_size_laws():
@@ -1086,11 +1089,106 @@ def test_rolling_ball_turns_once_per_circumference():
 def test_newer_laws_can_be_made_advisory(monkeypatch):
     from galileo import config as Cfg
     from galileo.verdict import decide
-    fail = {"name": "One flat floor", "status": "fail", "summary": "Lands on two floors.",
-            "detail": {}, "experimental": True}
+    fails = [{"name": "One flat floor", "status": "fail", "summary": "Lands on two floors.",
+              "detail": {}, "experimental": True},
+             {"name": "Spin at bounces", "status": "fail", "summary": "Spin from nowhere.",
+              "detail": {}, "experimental": True}]
     base = dict(a_px=3900.0, a_sigma=30.0, scale={"s": 1 / 400.0, "rel_sigma": 0.02},
-                clock=None, tests=[fail], n_points=40, duration=0.4)
-    assert decide(**base)["verdict"] == "AI"
+                clock=None, tests=fails, n_points=40, duration=0.4)
+    assert decide(**base)["verdict"] == "AI"            # two laws broken
     monkeypatch.setattr(Cfg, "EXPERIMENTAL_CHECKS_DECIDE", False)
     v = decide(**base)
     assert v["verdict"] == "REAL" and "Lands on two floors." in v["reasons"]
+
+
+def test_one_failing_law_alone_does_not_make_a_clip_ai():
+    from galileo.verdict import decide
+
+    def chk(name, strong=False):
+        r = {"name": name, "status": "fail", "summary": f"{name} broke.", "detail": {}}
+        if strong:
+            r["strong"] = True
+        return r
+    good = dict(a_px=3920.0, a_sigma=30.0, scale={"s": 1 / 400.0, "rel_sigma": 0.02},
+                clock=None, n_points=40, duration=0.4)              # 9.8 m/s^2
+    v = decide(tests=[chk("Bounce law")], **good)
+    assert v["verdict"] == "REAL" and v["confidence"] <= 0.6
+    assert v["lone_failure"] == "Bounce law" and "Bounce law broke." in v["reasons"]
+    # Two laws failing, or one failing grossly, is still AI...
+    assert decide(tests=[chk("Bounce law"), chk("Constant acceleration")], **good)[
+        "verdict"] == "AI"
+    assert decide(tests=[chk("Bounce law", strong=True)], **good)["verdict"] == "AI"
+    # ...and so is a lone failure when gravity is off too.
+    slow = dict(good, a_px=2400.0)                                   # 6 m/s^2
+    assert decide(tests=[chk("Bounce law")], **slow)["verdict"] == "AI"
+
+
+def test_bounce_restitution_comes_from_times_not_shaky_speeds():
+    # Four bounces at e = 0.8 under one g; the clip ends partway through the
+    # last hop, which is also tracked badly. Every bounce's restitution comes
+    # from times (the peaks either side, or whole hops), not from the stub's
+    # shaky speeds, and lands on 0.8.
+    a = 9.81 * 300.0
+    rng = np.random.default_rng(3)
+    T = np.sqrt(2 * 300.0 / a)
+    hops, tb, v_out = [(0.0, T, 0.0)], T, np.sqrt(2 * a * 300.0)
+    for k in range(4):
+        v_out *= 0.8
+        hops.append((tb, tb + 2 * v_out / a, v_out))
+        tb += 2 * v_out / a
+    ts, ys, idxs = [], [], []
+    for k, (t0, t1, vo) in enumerate(hops):
+        cut = t1 if k < len(hops) - 1 else t0 + 0.7 * (t1 - t0)      # the clip ends mid-hop
+        tt = np.arange(t0 + 1 / 240, cut - 1 / 480, 1 / 240)
+        tau = tt - t0
+        yy = 0.5 * a * tt ** 2 if k == 0 else 300.0 - vo * tau + 0.5 * a * tau ** 2
+        idxs.append(np.arange(len(ts), len(ts) + len(tt)))
+        ts.extend(tt)
+        ys.extend(yy + rng.normal(0, 1.5 if k == len(hops) - 1 else 0.3, len(tt)))
+    t = np.array(ts)
+    y = np.array(ys)
+    x = 320 + rng.normal(0, 0.3, len(ts))
+    jf = fit_flights(t, x, y, np.ones(len(t)), idxs, fps=240, n_px_axis=720)
+    r = checks.bounce_check(t, jf, 1 / 240)
+    assert r["status"] == "pass"
+    rows = r["detail"]["bounces"]
+    assert len(rows) == 4 and all(b["method"] in ("peaks", "hops", "half") for b in rows)
+    for b in rows:
+        assert b["restitution_best"] == pytest.approx(0.8, abs=0.04)
+
+
+def test_a_hand_toss_above_the_floor_is_not_a_bounce():
+    # Drop, bounce off the floor (e = 0.75), then a hand catches it 120 px
+    # above the floor and tosses it up faster than it came: a hand can add
+    # energy, a floor can't, so only the floor bounce is held to the law.
+    a = 9.81 * 300.0
+    rng = np.random.default_rng(5)
+    segs = []                                   # (t0, t1, y0, v0): y down, v down positive
+    T = np.sqrt(2 * 300.0 / a)
+    segs.append((0.0, T, 0.0, 0.0))
+    v1 = 0.75 * a * T
+    t_hand = T + (v1 - np.sqrt(v1 ** 2 - 2 * a * 120.0)) / a   # rising through 120 px up
+    t_turn = t_hand + 2 * (v1 - a * (t_hand - T)) / a         # comes back down to the hand
+    segs.append((T, t_turn, 300.0, -v1))
+    v_hand_in = v1 - a * (t_hand - T)
+    v_toss = 1.4 * v_hand_in
+    segs.append((t_turn, t_turn + 2 * v_toss / a - 1 / 120, 180.0, -v_toss))
+    ts, ys, idxs = [], [], []
+    for t0, t1, y0, v0 in segs:
+        tt = np.arange(t0 + 1 / 240, t1 - 1 / 480, 1 / 240)
+        tau = tt - t0
+        y = y0 + v0 * tau + 0.5 * a * tau ** 2
+        if t0 == T:                             # the hop from the floor: stop at the hand
+            keep = y <= 300.0
+            tt, y = tt[keep], y[keep]
+        idxs.append(np.arange(len(ts), len(ts) + len(tt)))
+        ts.extend(tt)
+        ys.extend(y)
+    t = np.array(ts)
+    y = np.array(ys) + rng.normal(0, 0.3, len(ts))
+    x = 320 + rng.normal(0, 0.3, len(ts))
+    jf = fit_flights(t, x, y, np.ones(len(t)), idxs, fps=240, n_px_axis=720)
+    assert checks.bounce_check(t, jf, 1 / 240)["status"] == "fail"
+    r = checks.bounce_check(t, jf, 1 / 240, diam_px=40.0)
+    assert r["status"] == "pass"
+    assert [b["off_floor"] for b in r["detail"]["bounces"]] == [False, True]

@@ -1569,7 +1569,9 @@ def _measure(o: _Obj, sh: dict, *, clock=None, keep_nums=None, say=None, manual_
     # Mention drag only where it matters (light balls), not for a steel ball's 0.05%.
     drag_on = bool(drag) and max(abs(v_ - 1) for v_ in drag["flights"]) > 0.005
     tests = [checks.parabola_check(t, xs_f, ys_f, w0, jf, drag_corrected=drag_on),
-             checks.bounce_check(t, jf, dt_med)]
+             checks.bounce_check(t, jf, dt_med,
+                                 diam_px=None if sh.get("camera_moved") else d_ref,
+                                 still=not sh.get("camera_moved"))]
     tests.append(checks.equal_falls_check((a_raw, s_raw), []))
     if o.n == 1 and camera and camera.get("fall_vs_room") and camera.get("mode") != "given":
         fv = camera["fall_vs_room"]

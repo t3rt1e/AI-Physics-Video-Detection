@@ -17,6 +17,9 @@ Order of evidence:
 By default (config.ASSUME_REAL_TIME) every clip is taken as playing at the
 speed it was filmed, with no clocks: g inside Earth's interval is REAL, and
 outside it, too slow or too fast, is AI.
+
+Step 2 needs corroboration: one scale-free test failing alone, without a
+gross violation, is weighed as a warning (decide's docstring).
 """
 from __future__ import annotations
 
@@ -35,9 +38,36 @@ def _fmt_g(g, sig):
     return f"{g:.1f} ± {sig:.1f} m/s²"
 
 
-def decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_EARTH,
-           tracking_ok=True, rs_rel=0.0, drag=None, falls=True, light=None,
-           geom_rel=0.0, real_time=C.ASSUME_REAL_TIME) -> dict:
+def decide(*, tests, **kw) -> dict:
+    """The verdict, with one safeguard on top of the evidence order above: a
+    single check failing on its own, with nothing gross about it (see each
+    check's "strong"), doesn't make a clip AI. Real footage trips one law now
+    and then through a slip in measuring (a hop cut short, a squash at the
+    floor, a blurred frame); a generated clip tends to break several, or one
+    grossly, or gets g wrong. So a lone ordinary failure is weighed as a
+    warning: gravity and the other checks decide, the confidence is capped,
+    and the reasons say so. Two failures, or one strong one, still mean AI."""
+    counted = [t for t in tests if C.EXPERIMENTAL_CHECKS_DECIDE or not t.get("experimental")]
+    fails = [t for t in counted if t["status"] == "fail"]
+    if len(fails) != 1 or fails[0].get("strong"):
+        return _decide(tests=tests, **kw)
+    lone = fails[0]
+    view = [dict(t, status="warn") if t is lone else t for t in tests]
+    out = _decide(tests=view, **kw)
+    out["lone_failure"] = lone["name"]
+    line = (f"Only one check failed ({lone['name'].lower()}), and nothing about it is gross: "
+            "one law failing on its own is more often a slip in measuring (a hop cut short, a "
+            "squash at the floor, a blurred frame) than a fake, so it doesn't decide the "
+            "verdict by itself.")
+    out["reasons"] = list(out.get("reasons", [])) + [line]
+    if out["verdict"] in ("REAL", "SLOWMO"):
+        out["confidence"] = float(min(out.get("confidence", 0.0), 0.6))
+    return out
+
+
+def _decide(*, a_px, a_sigma, scale, clock, tests, n_points, duration, g_ref=C.G_EARTH,
+            tracking_ok=True, rs_rel=0.0, drag=None, falls=True, light=None,
+            geom_rel=0.0, real_time=C.ASSUME_REAL_TIME) -> dict:
     """falls: the tracked object moves down a good distance and is still moving
     down at the end of its flight (False for a hand pulling away).
     light: the object's name when air drag rules its fall (a feather, a

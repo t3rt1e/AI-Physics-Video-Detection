@@ -411,13 +411,19 @@ Veo clips are 24 fps and 4, 6 or 8 s long, and stay downloadable for 2 days.
    bending to absorb drag. Rising and falling hops barely need it; a long first drop
    needs the most.
 8. **Checks** (`checks.py`): tests that need neither ruler nor clock. Only a clear,
-   significant change fails the constant-acceleration check, and hops are compared for
-   "same g" only when both were measured well (at least 0.15 s each). A bounce's
-   restitution comes from the hops' times when both hops are whole (a hop lasts 2v/g, so
-   the ratio of two hops' times is the bounce's restitution, with no scale or camera
-   motion in it), otherwise from the speeds, and only a gain beyond the measurement's
-   error fails. With the room's uprights in view, the fall must also speed up along them
-   ("Falls straight down").
+   significant change fails the constant-acceleration check. The bounce law reads each
+   bounce's restitution from times, never trusting a short hop's speeds if it can help
+   it: a free hop's speed is g times the time from its peak, so the restitution is
+   (time from the bounce up to the next peak) / (time down from the last peak), or, with
+   a moving camera (which shifts where a hop seems to peak but not when the ball hits
+   the floor), the ratio of whole hops bounce to bounce. The fits' speeds at the contact
+   come last: a short hop's fit can read its acceleration 15 to 20% off, which turns a
+   real 0.84 bounce into 1.1, so their error bar includes that. Only a gain beyond the
+   measurement's error fails; a turnaround well above the floor the others land on (a
+   hand catching and tossing it) isn't tested, since a hand can add energy. Hops are
+   compared for "same g" only when both are clean (0.2 s and 15 points or more, tracked
+   about as tightly as the rest). With the room's uprights in view, the fall must also
+   speed up along them ("Falls straight down").
 8b. **Newer laws** (`checks.py`, `spin.py`, `shadow.py`), all still free of ruler and
    clock, marked "(new)" in the output until they have seen more clips:
    - **Steady spin**: nothing twists a ball in the air, so it keeps its spin from one end
@@ -452,8 +458,9 @@ Veo clips are 24 fps and 4, 6 or 8 s long, and stay downloadable for 2 days.
      shadow that never moves is part of the background and can't be seen this way.
    Hops tracked badly (a catch, the picture's edge) are left out of these, and with a
    moving camera the ones that need a fixed floor or sideways speed are skipped.
-   `config.EXPERIMENTAL_CHECKS_DECIDE` (default True) says whether a clear failure of
-   one makes the clip AI; set it to False to show them without letting them decide.
+   `config.EXPERIMENTAL_CHECKS_DECIDE` (default True) says whether their failures count
+   toward the verdict (alongside another failure, since one failing alone is only a
+   warning; see Verdict); set it to False to show them without letting them count.
 9. **Clocks** (`clocks.py`): capture-rate tags, high-frame-rate timestamps, repeated
    frames, interpolation patterns, and lighting flicker (a hint only). Read once, on the
    main object, and shared: a clip has one speed.
@@ -467,7 +474,13 @@ Veo clips are 24 fps and 4, 6 or 8 s long, and stay downloadable for 2 days.
    `--slowmo`, a clock that explains a low g makes it real slow motion, and too fast
    can't be called (the footage may be sped up). With several objects, the main one decides; another stands in when the main
    one can't be measured and Galileo knows what the other one is, and the rest add their
-   numbers to the reasons (lowering the confidence when they disagree). Other objects
+   numbers to the reasons (lowering the confidence when they disagree). One check
+   failing on its own, with nothing gross about it, doesn't make a clip AI: real footage
+   trips one law now and then through a slip in measuring, while a generated clip tends
+   to break several, break one grossly (a bounce gaining 25%+ by its hop times, gravity
+   changing 2.5x between hops, the acceleration doubling within a fall), or get g wrong.
+   So a lone ordinary failure is weighed as a warning: gravity and the other checks
+   decide, the confidence is capped at 60%, and the reasons say so. Other objects
    that don't clearly speed up on the way down (a ball rolling across the floor, one
    carried in a hand) are dropped however sure Galileo is of what they are, unless you
    named them. When the ruler is Gemini's guess and a look-alike of another size would

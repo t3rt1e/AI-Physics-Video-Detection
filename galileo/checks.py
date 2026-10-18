@@ -60,9 +60,11 @@ def parabola_check(t, x, y, w0, jf: JointFit, drag_corrected: bool = False) -> d
     wlo, whi = C.PARABOLA_RATIO_WARN
     pct = (ratio - 1.0) * 100.0
     if (ratio < lo or ratio > hi) and abs(z) > 4:
-        return _result(name, "fail",
-                       f"Acceleration changes by {pct:+.0f}% between the first and second half "
-                       "of the fall. Real gravity is constant.", **detail)
+        r = _result(name, "fail",
+                    f"Acceleration changes by {pct:+.0f}% between the first and second half "
+                    "of the fall. Real gravity is constant.", **detail)
+        r["strong"] = bool((ratio < 0.5 or ratio > 2.0) and abs(z) > 8)
+        return r
     if (ratio < wlo or ratio > whi) and abs(z) > 3:
         why = ("lens distortion, or a sign of generated motion" if drag_corrected else
                "air drag, lens distortion, or a sign of generated motion")
@@ -86,12 +88,60 @@ def _v_sigma(fit, g, tau) -> float:
     return float(np.sqrt(max(var, 0.0)))
 
 
-def bounce_check(t, jf: JointFit, frame_dt: float) -> dict:
-    """Bounce law: same gravity every hop, and hops never gain energy.
+def _apex(fit, g, t_lo, t_hi):
+    """When a hop peaks (from its fit along gravity), its standard error, and
+    whether that is inside the stretch tracked (give or take a quarter of it):
+    beyond that it is guesswork."""
+    pu = _u_poly(fit, g)
+    if len(pu) < 3 or pu[2] <= 0:
+        return float("nan"), float("inf"), False
+    tau = -pu[1] / (2.0 * pu[2])
+    C2 = g[0] ** 2 * fit.cov_x[1:3, 1:3] + g[1] ** 2 * fit.cov_y[1:3, 1:3]
+    J = np.array([-1.0 / (2.0 * pu[2]), pu[1] / (2.0 * pu[2] ** 2)])
+    s = float(np.sqrt(max(float(J @ C2 @ J), 0.0)))
+    t_ap = float(fit.t0 + tau)
+    span = max(t_hi - t_lo, 1e-9)
+    inside = (t_lo - 0.25 * span) <= t_ap <= (t_hi + 0.25 * span)
+    return t_ap, s, bool(inside)
 
+
+def bounce_check(t, jf: JointFit, frame_dt: float, diam_px: float | None = None,
+                 still: bool = True) -> dict:
+    """Bounce law: hops never gain energy, and every hop shares one g.
+
+    A bounce's restitution (speed out / speed in) is read the sturdiest way
+    the hops allow. A free hop's height and time go together (speed = g x
+    time from the top), so it is a ratio of times:
+      * "peaks": both hops' peaks: speed in = g x the fall from the peak
+        before, speed out = g x the rise to the peak after, so (t_peak after
+        - t_bounce) / (t_bounce - t_peak before), whatever the other
+        contacts did;
+      * "hops": both hops whole, from bounce to bounce on one floor:
+        T_out / T_in (a hop lasts 2v/g);
+      * "half": one whole hop and the other's peak: T_out / 2(t_bounce -
+        t_peak before), or 2(t_peak after - t_bounce) / T_in;
+      * "speeds": the fits' speeds at the contact, last. A short hop's fit can
+        read its acceleration 15 to 20% off, and these speeds carry that
+        straight into the restitution (a real 0.84 bounce read as 0.97), so
+        their error bar includes it.
+    Only a gain beyond the measurement's error fails. A gross one (25%+ by
+    times, which no tracking slip produces) is marked strong.
+
+    "Same g" compares neighbouring hops that are clean (a fit about as tight
+    as the others', 0.2 s and 15 points or more): a hop ended by a catch, or
+    cut short by the edge of the picture, says nothing about gravity.
     Flights left out of the measurement (a thrown first flight) still count
-    for energy, but not for "same gravity": their acceleration is the
-    throw's, not gravity's.
+    for energy, but not for "same g".
+
+    diam_px: the ball's width in the fit's pixels, with a still camera. Then a
+    "bounce" that turns the ball round well above the floor the others land on
+    (a hand catching it and tossing it up again) isn't a bounce off the floor,
+    and its energy isn't tested: a hand can add energy, a floor can't.
+    still: the camera didn't move. A moving camera shifts where a hop seems to
+    peak (it moves up or down under the ball), but not when the ball hits the
+    floor, so then only bounce-to-bounce times and speeds are used. Peaks are
+    only read off clean hops (a fit as tight as the others', and the main
+    fall's acceleration to 25%).
     """
     name = "Bounce law"
     fl = jf.flights
@@ -99,6 +149,18 @@ def bounce_check(t, jf: JointFit, frame_dt: float) -> dict:
         return _result(name, "skip", "No bounces to test.")
     g = jf.gdir
     excluded = set(getattr(jf, "excluded", ()) or ())
+    rms_med = float(np.median([f.fit.rms for f in fl]))
+    s_t = 0.5 * frame_dt                       # a bounce's time is good to about half a frame
+
+    def clean(h):
+        return (len(h.idx) >= 15 and t[h.idx[-1]] - t[h.idx[0]] >= 0.2
+                and h.fit.rms <= max(3.0 * rms_med, 1.5) and np.isfinite(h.a_sigma))
+    a_main = fl[jf.main].a_along
+
+    def steady(h):
+        """A hop whose peak can be trusted: tracked tightly, falling like the rest."""
+        return (len(h.idx) >= 10 and h.fit.rms <= max(3.0 * rms_med, 1.5) and a_main > 0
+                and h.a_along > 0 and abs(h.a_along / a_main - 1.0) <= 0.25)
     pairs = []
     for j, (a, b) in enumerate(zip(fl, fl[1:])):
         gap = t[b.idx[0]] - t[a.idx[-1]]
@@ -124,18 +186,24 @@ def bounce_check(t, jf: JointFit, frame_dt: float) -> dict:
         if va < 0.25 * v_max:
             continue
         e = -vb / va
-        # How well the two fits pin the speeds down at the contact: a short
-        # low hop, or a camera that moves, measures them loosely.
         e_sigma = abs(e) * float(np.hypot(_v_sigma(a.fit, g, tb - ta0) / va,
                                           _v_sigma(b.fit, g, tb - tb0) / vb))
-        # Same g on both hops: only between hops measured well enough to say
-        # (a stub of a hop, cut off by the end of the clip, can't).
+        # The speeds carry each hop's own acceleration: a mismatch between the
+        # two fits shows up one for one in their ratio.
+        mis = abs(np.log(b.a_along / a.a_along)) if a.a_along > 0 and b.a_along > 0 else 0.5
+        e_sig_eff = float(np.hypot(e_sigma, abs(e) * (0.05 + mis)))
+        ap_a = _apex(a.fit, g, t[a.idx[0]], t[a.idx[-1]]) if still and steady(a) else (
+            float("nan"), float("inf"), False)
+        ap_b = _apex(b.fit, g, t[b.idx[0]], t[b.idx[-1]]) if still and steady(b) else (
+            float("nan"), float("inf"), False)
         a_big = max(abs(a.a_along), abs(b.a_along))
-        precise = all(np.isfinite(h.a_sigma) and h.a_sigma < 0.1 * a_big
-                      and t[h.idx[-1]] - t[h.idx[0]] >= 0.15 for h in (a, b))
+        precise = all(h.a_sigma < 0.1 * a_big and clean(h) for h in (a, b))
         compare = j not in excluded and (j + 1) not in excluded and a.a_along != 0 and precise
         pairs.append({"j": j, "t_bounce": float(tb), "v_in": float(va), "v_out": float(vb),
-                      "restitution": float(e), "restitution_sigma": e_sigma,
+                      "contact": float(np.polyval(pa[::-1], tb - ta0)),
+                      "restitution": float(e), "restitution_sigma": e_sig_eff,
+                      "peak_before": ap_a[0] if ap_a[2] else None, "peak_before_sigma": ap_a[1],
+                      "peak_after": ap_b[0] if ap_b[2] else None, "peak_after_sigma": ap_b[1],
                       "a_ratio": float(b.a_along / a.a_along) if compare else float("nan"),
                       "a_ratio_z": float((b.a_along - a.a_along) /
                                          max(np.hypot(a.a_sigma, b.a_sigma), 1e-9))
@@ -143,44 +211,80 @@ def bounce_check(t, jf: JointFit, frame_dt: float) -> dict:
                       "n_after": int(len(b.idx))})
     if not pairs:
         return _result(name, "skip", "Bounces found but the hops around them weren't tracked.")
-    # Between two bounces a hop lasts 2v/g, so the time of the hop after a
-    # bounce over the time of the hop before it is that bounce's restitution,
-    # with no scale, distance or camera motion in it: preferred whenever both
-    # hops are whole. Each bounce time is good to about half a frame.
     by_j = {p["j"]: p for p in pairs}
-    s_t = 0.5 * frame_dt * np.sqrt(2.0)
+
+    def level(q, r):
+        """Two contacts on the same floor (hop times assume it)."""
+        return not diam_px or abs(q["contact"] - r["contact"]) <= 0.5 * diam_px
     for p in pairs:
         prev, nxt = by_j.get(p["j"] - 1), by_j.get(p["j"] + 1)
-        if prev is None or nxt is None:
-            continue
-        t_in, t_out = p["t_bounce"] - prev["t_bounce"], nxt["t_bounce"] - p["t_bounce"]
-        if t_in > 0 and t_out > 0:
+        tb = p["t_bounce"]
+        t_in = tb - prev["t_bounce"] if prev and level(prev, p) else None
+        t_out = nxt["t_bounce"] - tb if nxt and level(nxt, p) else None
+        pb_, pa_ = p["peak_before"], p["peak_after"]
+        if t_in and t_out and t_in > 0 and t_out > 0:
             e_t = t_out / t_in
             p["restitution_t"] = float(e_t)
-            p["restitution_t_sigma"] = float(e_t * np.hypot(s_t / t_in, s_t / t_out))
+            p["restitution_t_sigma"] = float(e_t * np.hypot(np.sqrt(2) * s_t / t_in,
+                                                            np.sqrt(2) * s_t / t_out))
+        best = None
+        if pa_ is not None and pb_ is not None and pa_ > tb > pb_ and \
+                max(p["peak_after_sigma"], p["peak_before_sigma"]) < 3 * frame_dt:
+            # The peaks on both sides: speed in = g x (fall from the peak before),
+            # speed out = g x (rise to the peak after), wherever the other
+            # contacts were.
+            up, down = pa_ - tb, tb - pb_
+            e_p = up / down
+            best = ("peaks", e_p, e_p * float(np.hypot(np.hypot(p["peak_after_sigma"], s_t) / up,
+                                                       np.hypot(p["peak_before_sigma"], s_t) / down)))
+        elif "restitution_t" in p:
+            best = ("hops", p["restitution_t"], p["restitution_t_sigma"])
+        elif t_in and t_in > 0 and pa_ is not None and pa_ > tb:
+            up = pa_ - tb
+            e_h = up / (0.5 * t_in)
+            best = ("half", e_h, e_h * float(np.hypot(np.hypot(p["peak_after_sigma"], s_t) / up,
+                                                      np.sqrt(2) * s_t / t_in)))
+        elif t_out and t_out > 0 and pb_ is not None and pb_ < tb:
+            down = tb - pb_
+            e_h = (0.5 * t_out) / down
+            best = ("half", e_h, e_h * float(np.hypot(np.hypot(p["peak_before_sigma"], s_t) / down,
+                                                      np.sqrt(2) * s_t / t_out)))
+        else:
+            best = ("speeds", p["restitution"], p["restitution_sigma"])
+        p["method"], p["restitution_best"], p["restitution_best_sigma"] = \
+            best[0], float(best[1]), float(best[2])
 
     def _e(p):
-        if "restitution_t" in p:
-            return p["restitution_t"], p["restitution_t_sigma"]
-        return p["restitution"], p["restitution_sigma"]
-    es = [_e(p)[0] for p in pairs if np.isfinite(_e(p)[0])]
+        return p["restitution_best"], p["restitution_best_sigma"]
     detail = {"bounces": pairs}
+    floor_u = max(p["contact"] for p in pairs)            # picture y runs down: the lowest
+    for p in pairs:
+        p["off_floor"] = bool(diam_px and floor_u - p["contact"] > 1.0 * diam_px)
     # Gaining energy, by more than the measurement allows.
-    gain = [e for e, s_e in map(_e, pairs) if np.isfinite(e)
-            and e > C.RESTITUTION_FAIL and e - 1.0 > 3.0 * s_e]
+    gain = [p for p in pairs if np.isfinite(_e(p)[0]) and _e(p)[0] > C.RESTITUTION_FAIL
+            and _e(p)[0] - 1.0 > 3.0 * _e(p)[1] and not p["off_floor"]]
     if gain:
-        return _result(name, "fail",
-                       f"The ball leaves the floor faster than it arrived (restitution "
-                       f"{max(gain):.2f} > 1). Real bounces lose energy; this looks reversed "
-                       "or generated.", **detail)
-    lo, hi = C.PARABOLA_RATIO_FAIL
-    bad = [p for p in pairs if p["n_after"] >= 8 and np.isfinite(p["a_ratio"])
-           and (p["a_ratio"] < lo or p["a_ratio"] > hi) and abs(p["a_ratio_z"]) > 4]
+        worst = max(gain, key=lambda p: _e(p)[0])
+        strong = any(p["method"] in ("hops", "peaks") and _e(p)[0] >= 1.25
+                     and _e(p)[0] - 1.0 > 5.0 * _e(p)[1] for p in gain)
+        r = _result(name, "fail",
+                    f"The ball leaves the floor faster than it arrived (restitution "
+                    f"{_e(worst)[0]:.2f} > 1, from the {worst['method']}). Real bounces lose "
+                    "energy; this looks reversed or generated.", **detail)
+        r["strong"] = bool(strong)
+        return r
+    lo, hi = 0.55, 1.8
+    bad = [p for p in pairs if np.isfinite(p["a_ratio"])
+           and (p["a_ratio"] < lo or p["a_ratio"] > hi) and abs(p["a_ratio_z"]) > 5]
     if bad:
-        r = bad[0]["a_ratio"]
-        return _result(name, "fail",
-                       f"Gravity changes between hops (next hop accelerates {r:.2f}x as hard). "
-                       "Every hop should share one g.", **detail)
+        worst = max(bad, key=lambda p: abs(np.log(p["a_ratio"])))
+        r_ = worst["a_ratio"]
+        res = _result(name, "fail",
+                      f"Gravity changes between hops (next hop accelerates {r_:.2f}x as hard). "
+                      "Every hop should share one g.", **detail)
+        res["strong"] = bool((r_ < 0.4 or r_ > 2.5) and abs(worst["a_ratio_z"]) > 8)
+        return res
+    es = [_e(p)[0] for p in pairs if np.isfinite(_e(p)[0])]
     if es:
         # Quote the bounces measured well; a loose one (a stub of a hop) can
         # read over 1 within its error.
@@ -614,6 +718,8 @@ def steady_bounce_check(bounces: list, clean=None) -> dict:
     name = "Steady bounces"
 
     def _e(p):
+        if "restitution_best" in p:
+            return p["restitution_best"], p["restitution_best_sigma"]
         if "restitution_t" in p:
             return p["restitution_t"], p["restitution_t_sigma"]
         return p["restitution"], p["restitution_sigma"]

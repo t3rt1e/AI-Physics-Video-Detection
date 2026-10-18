@@ -82,8 +82,9 @@ MAX_SPREAD = 0.35
 ASSUME_REAL_TIME = True
 
 # The newer laws (spin, shadows, one flat floor, no sideways push, steady
-# bounces, constant size: checks.py, marked "experimental"). True: a clear
-# failure of one makes the clip AI, like the older laws. False: they are
+# bounces, constant size: checks.py, marked "experimental"). True: their
+# failures count like the older laws' (one failing alone, with gravity in
+# order, is only a warning either way: verdict.decide). False: they are
 # shown in the checks table and the reasons, but can't change the verdict.
 EXPERIMENTAL_CHECKS_DECIDE = True
 
